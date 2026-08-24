@@ -2,6 +2,7 @@ import os
 import json
 import math
 import time
+import re
 import warnings
 from datetime import datetime, timedelta
 
@@ -33,7 +34,7 @@ if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = "TSLA"
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈 (주가, 기술지표, 옵션체인, 매크로 등)
+# 1. RAG 데이터 수집 모듈
 # -------------------------------------------------------------
 def fetch_stock_technical_data(ticker: str):
     stock = yf.Ticker(ticker)
@@ -78,7 +79,6 @@ def fetch_stock_technical_data(ticker: str):
     return data, last_date
 
 def fetch_nearest_options_data(ticker: str):
-    """가장 빠른 만기일 옵션 체인에서 Max Open Interest 및 Max Volume 콜/풋 행사가 추출"""
     try:
         stock = yf.Ticker(ticker)
         expirations = stock.options
@@ -93,15 +93,12 @@ def fetch_nearest_options_data(ticker: str):
         if calls.empty or puts.empty:
             return None
             
-        # 1. 콜옵션 Max OI / Max Volume
         call_max_oi_row = calls.loc[calls['openInterest'].idxmax()] if calls['openInterest'].notnull().any() and calls['openInterest'].max() > 0 else calls.iloc[0]
         call_max_vol_row = calls.loc[calls['volume'].idxmax()] if calls['volume'].notnull().any() and calls['volume'].max() > 0 else calls.iloc[0]
         
-        # 2. 풋옵션 Max OI / Max Volume
         put_max_oi_row = puts.loc[puts['openInterest'].idxmax()] if puts['openInterest'].notnull().any() and puts['openInterest'].max() > 0 else puts.iloc[0]
         put_max_vol_row = puts.loc[puts['volume'].idxmax()] if puts['volume'].notnull().any() and puts['volume'].max() > 0 else puts.iloc[0]
         
-        # 3. Put / Call Volume Ratio 계산
         tot_call_vol = calls['volume'].sum() if calls['volume'].notnull().any() else 0
         tot_put_vol = puts['volume'].sum() if puts['volume'].notnull().any() else 0
         pc_ratio = round(tot_put_vol / tot_call_vol, 2) if tot_call_vol > 0 else "N/A"
@@ -366,26 +363,44 @@ def extract_clean_text(content):
         return "\n".join([p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in content])
     return str(content)
 
-def parse_trading_scenario(text):
+def parse_full_trading_scenario(text):
+    """AI 응답 텍스트에서 액션(매수/매도/홀딩), 분할매수, 익절가, 매도가, 손절가 정밀 파싱"""
+    action = "홀딩"  # 기본값
     buy_band = "분석 리포트 참조"
-    target_band = "분석 리포트 참조"
+    take_profit = "분석 리포트 참조"
+    sell_target = "분석 리포트 참조"
     stop_loss = "분석 리포트 참조"
     
+    # 1. 투자 의견 (매수/매도/홀딩) 판정
+    if "적극매수" in text or "분할매수" in text or "매수 (" in text or "매수의견" in text:
+        action = "매수"
+    elif "비중축소" in text or "매도" in text or "전량매도" in text:
+        action = "매도"
+    elif "관망" in text or "보유" in text or "홀딩" in text:
+        action = "홀딩"
+
+    # 2. 가격대 밴드 파싱
     for line in text.split("\n"):
-        if "분할 매수" in line or "매수 밴드" in line or "매수가" in line:
-            parts = line.split(":")
+        line_clean = line.replace("*", "").replace("-", "").strip()
+        if "분할 매수" in line_clean or "매수 밴드" in line_clean:
+            parts = line_clean.split(":")
             if len(parts) > 1:
                 buy_band = parts[1].strip()
-        elif "목표가" in line or "익절" in line:
-            parts = line.split(":")
+        elif "목표가" in line_clean or "익절" in line_clean:
+            parts = line_clean.split(":")
             if len(parts) > 1:
-                target_band = parts[1].strip()
-        elif "손절" in line or "Stop-loss" in line:
-            parts = line.split(":")
+                take_profit = parts[1].strip()
+                sell_target = parts[1].strip()
+        elif "매도가" in line_clean:
+            parts = line_clean.split(":")
+            if len(parts) > 1:
+                sell_target = parts[1].strip()
+        elif "손절" in line_clean or "Stop-loss" in line_clean:
+            parts = line_clean.split(":")
             if len(parts) > 1:
                 stop_loss = parts[1].strip()
                 
-    return buy_band, target_band, stop_loss
+    return action, buy_band, take_profit, sell_target, stop_loss
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
@@ -418,7 +433,7 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
         return []
 
 # -------------------------------------------------------------
-# 2. 사이드바 UI (종목 입력 + 보유 정보 + 히스토리 바)
+# 2. 사이드바 UI (종목 입력 + 보유 정보 + 매수/매도/홀딩 히스토리 바)
 # -------------------------------------------------------------
 with st.sidebar:
     st.markdown("### ⚡ **AI Stock Analyst**")
@@ -441,29 +456,65 @@ with st.sidebar:
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.divider()
 
-    # --- 📋 검색 종목 매매 시나리오 히스토리 바 ---
-    st.markdown("#### 📌 **검색 종목 트레이딩 히스토리**")
+    # --- 📋 [개선] 매수/매도/홀딩 분류형 트레이딩 히스토리 바 ---
+    st.markdown("#### 📌 **종목별 트레이딩 히스토리**")
     
     if st.session_state.history:
-        for t_code, data in list(st.session_state.history.items())[::-1]:
-            with st.expander(f"🔹 **{t_code}** (${data['price']})", expanded=False):
+        tab_all, tab_buy, tab_sell, tab_hold = st.tabs(["전체", "🟢매수", "🔴매도", "🟡홀딩"])
+        
+        def render_history_card(t_code, data):
+            action_badge = "🟢 매수" if data['action'] == "매수" else ("🔴 매도" if data['action'] == "매도" else "🟡 홀딩")
+            with st.expander(f"**{t_code}** (${data['price']}) | {action_badge}", expanded=False):
                 st.markdown(f"- **현재가:** `${data['price']}`")
                 if data.get('my_avg', 0) > 0:
                     st.markdown(f"- **💼 내 평단:** `${data['my_avg']}` ({data.get('my_return', 'N/A')})")
-                st.markdown(f"- **🎯 목표가:** `{data['target']}`")
-                st.markdown(f"- **📥 매수밴드:** `{data['buy_band']}`")
+                st.markdown(f"- **🎯 익절/목표가:** `{data['take_profit']}`")
+                st.markdown(f"- **📤 매도가 밴드:** `{data['sell_target']}`")
+                st.markdown(f"- **📥 분할매수 밴드:** `{data['buy_band']}`")
                 st.markdown(f"- **🛑 손절선:** `{data['stop_loss']}`")
                 st.caption(f"분석 시각: {data['time']}")
-                if st.button(f"'{t_code}' 다시 분석", key=f"btn_re_{t_code}", use_container_width=True):
+                if st.button(f"'{t_code}' 다시 분석", key=f"btn_re_{t_code}_{data['action']}", use_container_width=True):
                     st.session_state.selected_ticker = t_code
                     st.rerun()
+
+        # 1. 전체 탭
+        with tab_all:
+            for t_code, data in list(st.session_state.history.items())[::-1]:
+                render_history_card(t_code, data)
+                
+        # 2. 매수 탭
+        with tab_buy:
+            buy_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "매수"]
+            if buy_items:
+                for t_code, data in buy_items:
+                    render_history_card(t_code, data)
+            else:
+                st.caption("매수 판정 종목이 없습니다.")
+
+        # 3. 매도 탭
+        with tab_sell:
+            sell_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "매도"]
+            if sell_items:
+                for t_code, data in sell_items:
+                    render_history_card(t_code, data)
+            else:
+                st.caption("매도 판정 종목이 없습니다.")
+
+        # 4. 홀딩 탭
+        with tab_hold:
+            hold_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "홀딩"]
+            if hold_items:
+                for t_code, data in hold_items:
+                    render_history_card(t_code, data)
+            else:
+                st.caption("홀딩/관망 판정 종목이 없습니다.")
                     
         st.write("")
         if st.button("🗑️ 히스토리 전체 삭제", use_container_width=True):
             st.session_state.history = {}
             st.rerun()
     else:
-        st.caption("분석을 실행하면 종목별 목표가 밴드와 손절선 히스토리가 이곳에 자동 기록됩니다.")
+        st.caption("분석을 실행하면 종목별 매수/매도/홀딩 판정 및 목표가/손절가 밴드가 이곳에 자동 기록됩니다.")
 
 # -------------------------------------------------------------
 # 3. 메인 분석 화면
@@ -541,7 +592,7 @@ if analyze_btn:
                 r2_c3.metric("미 10년물 금리 / 달러", f"{macro_data.get('us_10y_yield', {}).get('value', 'N/A')} / {macro_data.get('dollar_index', {}).get('value', 'N/A')}")
                 r2_c4.metric("금($/oz) / 비트코인($)", f"${macro_data.get('gold', {}).get('value', 'N/A')} / ${macro_data.get('bitcoin', {}).get('value', 'N/A'):,}" if isinstance(macro_data.get('bitcoin', {}).get('value'), (int, float)) else f"${macro_data.get('gold', {}).get('value', 'N/A')} / N/A")
 
-            # 📌 [신규] 성장주 모델 상단: 가장 빠른 만기일 옵션 체인 스마트머니 포지션 카드
+            # 📌 옵션 체인 스마트머니 포지션 카드
             with st.container(border=True):
                 if options_data:
                     exp_date = options_data['expiration_date']
@@ -549,8 +600,6 @@ if analyze_btn:
                     st.markdown(f"##### 🎯 **가장 빠른 만기 옵션 체인 스마트머니 포지션** `만기일: {exp_date}` `P/C Ratio: {pc_rat}`")
                     
                     op_c1, op_c2, op_c3, op_c4 = st.columns(4)
-                    
-                    # 콜옵션 Max OI (최대 미결제약정 - 강력한 저항선)
                     c_oi = options_data['call_max_oi']
                     diff_c_oi = round(((c_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_oi['strike'], (int, float)) else None
                     op_c1.metric(
@@ -559,7 +608,6 @@ if analyze_btn:
                         f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,}계약 / 프리미엄: ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}"
                     )
                     
-                    # 콜옵션 Max Volume (당일 최대 거래량 - 상방 수급 집중)
                     c_vol = options_data['call_max_vol']
                     diff_c_vol = round(((c_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_vol['strike'], (int, float)) else None
                     op_c2.metric(
@@ -568,7 +616,6 @@ if analyze_btn:
                         f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,}계약 / 프리미엄: ${c_vol['price']})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}"
                     )
                     
-                    # 풋옵션 Max OI (최대 미결제약정 - 강력한 지지선)
                     p_oi = options_data['put_max_oi']
                     diff_p_oi = round(((p_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_oi['strike'], (int, float)) else None
                     op_c3.metric(
@@ -577,7 +624,6 @@ if analyze_btn:
                         f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,}계약 / 프리미엄: ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}"
                     )
                     
-                    # 풋옵션 Max Volume (당일 최대 거래량 - 하방 헤지 집중)
                     p_vol = options_data['put_max_vol']
                     diff_p_vol = round(((p_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_vol['strike'], (int, float)) else None
                     op_c4.metric(
@@ -631,7 +677,7 @@ if analyze_btn:
 
             st.caption(f"🕒 기준일자: 주가/재무제표 ({stock_date}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
 
-            # 4. Gemini 3.6 Flash 심층 분석 (옵션 포지션 지표 포함)
+            # 4. Gemini 3.6 Flash 심층 분석
             user_position_text = (
                 f"사용자 현재 보유 정보: 평단가 ${user_avg_price}, 보유 수량 {user_shares}주 (현재 수익률: {my_return_str})"
                 if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
@@ -696,6 +742,7 @@ if analyze_btn:
 - 매매 시나리오:
   * 분할 매수 밴드: [구체적 달러 가격대 제시]
   * 목표가/익절 라인: [1차 및 2차 구체적 달러 가격대 제시]
+  * 매도가 밴드: [차익실현 또는 비중축소 구체적 달러 가격대 제시]
   * 손절(Stop-loss) 기준선: [구체적 달러 가격대 제시]
 """
             prompt = PromptTemplate(
@@ -733,14 +780,16 @@ if analyze_btn:
             if not response_content:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. 잠시 후 다시 [분석 실행]을 눌러주세요."
 
-            # 히스토리 저장
-            buy_b, tgt_b, sl_b = parse_trading_scenario(response_content)
+            # 📌 [핵심 개선] 매수/매도/홀딩 및 4대 밴드(익절/매도/분할매수/손절) 정밀 파싱 후 히스토리 즉시 기록
+            act, buy_b, tp_b, sell_b, sl_b = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
+                "action": act,
                 "price": curr_p,
                 "my_avg": user_avg_price if is_holding else 0,
                 "my_return": my_return_str if is_holding else "미보유",
                 "buy_band": buy_b,
-                "target": tgt_b,
+                "take_profit": tp_b,
+                "sell_target": sell_b,
                 "stop_loss": sl_b,
                 "time": datetime.now().strftime("%m-%d %H:%M")
             }
