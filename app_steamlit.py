@@ -1,6 +1,7 @@
 import os
 import json
 import math
+import time
 import warnings
 from datetime import datetime, timedelta
 
@@ -25,7 +26,7 @@ st.set_page_config(
 )
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 및 밸류에이션 계산 모듈
+# 1. RAG 데이터 수집 모듈
 # -------------------------------------------------------------
 def fetch_stock_technical_data(ticker: str):
     stock = yf.Ticker(ticker)
@@ -73,9 +74,7 @@ def fetch_stock_technical_data(ticker: str):
     return data, last_date
 
 def fetch_macro_indicators():
-    """6대 자산군(현금/달러, 채권, 주식, 코인, 금, 원유) 실시간 거시 데이터 수집"""
     macro_data = {}
-    # 1. 미 국채 10년물 (FRED)
     try:
         end = datetime.now()
         start = end - timedelta(days=30)
@@ -88,7 +87,6 @@ def fetch_macro_indicators():
     except Exception:
         macro_data["us_10y_yield"] = {"value": "N/A", "date": "N/A"}
         
-    # 2. 글로벌 자산군 (달러, VIX, 원유, 금, 비트코인)
     asset_tickers = [
         ("vix", "^VIX"),
         ("dollar_index", "DX-Y.NYB"),
@@ -268,35 +266,6 @@ def extract_clean_text(content):
         return "\n".join([p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in content])
     return str(content)
 
-def summarize_news_with_gemini(news_list, api_key):
-    if not news_list or not api_key:
-        return news_list
-        
-    try:
-        prompt_items = []
-        for i, n in enumerate(news_list):
-            prompt_items.append(f"{i+1}. {n['title']} (요약: {n.get('raw_summary', '')})")
-            
-        prompt_text = (
-            "아래 영문 주식 기사 목록을 읽고 핵심 내용을 한국어로 1문장씩 요약해줘.\n"
-            "각 줄에 번호 없이 요약문만 하나씩 줄바꿈으로 출력해줘:\n\n"
-            + "\n".join(prompt_items)
-        )
-        
-        llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
-        res = llm.invoke(prompt_text)
-        raw_text = extract_clean_text(res.content).strip()
-        lines = [line.strip().lstrip("0123456789.- ") for line in raw_text.split("\n") if line.strip()]
-        
-        for i, line in enumerate(lines):
-            if i < len(news_list):
-                news_list[i]["ko_summary"] = line
-    except Exception:
-        for n in news_list:
-            n["ko_summary"] = n["title"]
-            
-    return news_list
-
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
         stock = yf.Ticker(ticker)
@@ -351,18 +320,17 @@ if analyze_btn:
     if not api_key:
         st.error("GEMINI_API_KEY가 설정되지 않았습니다. Streamlit Secrets에 등록하세요.")
     else:
-        with st.spinner(f"🔍 [{ticker_input}] 실시간 매크로/자산군 지표 수집 및 정밀 분석 중..."):
+        with st.spinner(f"🔍 [{ticker_input}] 실시간 매크로/자산군 지표 수집 및 Gemini 분석 중..."):
             tech_data, stock_date = fetch_stock_technical_data(ticker_input)
             macro_data = fetch_macro_indicators()
             fund_data = fetch_fundamentals_and_valuation(ticker_input)
             sector_data = fetch_sector_performance()
-            raw_news_data = fetch_news(ticker_input, limit=5)
-            news_data = summarize_news_with_gemini(raw_news_data, api_key)
+            news_data = fetch_news(ticker_input, limit=5)
             analyst_data = fetch_recent_upgrades_downgrades(ticker_input, months=2)
             
             curr_p = tech_data.get('current_price', 0)
             
-            # 1. 상단 핵심 메트릭 (재무 + 기술적/수급 + 6대 자산군 지표)
+            # 1. 상단 핵심 메트릭
             with st.container(border=True):
                 st.markdown("**🏢 핵심 시장 및 재무 지표**")
                 r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
@@ -426,7 +394,7 @@ if analyze_btn:
 
             st.caption(f"🕒 기준일자: 주가/재무제표 ({stock_date}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
 
-            # 4. Gemini AI 분석 리포트
+            # 4. Gemini AI 분석 (단일 호출 + 재시도 핸들링)
             template = """
 [RAG 주입 데이터]
 1. 기술적/수급 데이터 ({ticker}) (기준일: {stock_date}):
@@ -441,7 +409,7 @@ if analyze_btn:
 4. 펀더멘털 및 6대 밸류에이션:
 {fund_json}
 
-5. 최신 주요 기사 (한국어 요약):
+5. 최신 주요 기사:
 {news_json}
 
 6. 최근 2개월 증권가 투자의견 변동:
@@ -486,20 +454,40 @@ if analyze_btn:
             llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
             chain = prompt | llm
             
-            response = chain.invoke({
-                "ticker": ticker_input,
-                "stock_date": stock_date,
-                "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
-                "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
-                "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
-                "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
-                "news_json": json.dumps([n.get('ko_summary', n['title']) for n in news_data], indent=2, ensure_ascii=False),
-                "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
-            })
-            
+            response_content = None
+            try:
+                response = chain.invoke({
+                    "ticker": ticker_input,
+                    "stock_date": stock_date,
+                    "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
+                    "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
+                    "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
+                    "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
+                    "news_json": json.dumps([{"title": n["title"], "summary": n.get("raw_summary", "")} for n in news_data], indent=2, ensure_ascii=False),
+                    "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
+                })
+                response_content = extract_clean_text(response.content)
+            except Exception as e:
+                # Rate Limit 발생 시 4초 대기 후 1회 자동 재시도
+                time.sleep(4)
+                try:
+                    response = chain.invoke({
+                        "ticker": ticker_input,
+                        "stock_date": stock_date,
+                        "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
+                        "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
+                        "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
+                        "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
+                        "news_json": json.dumps([{"title": n["title"], "summary": n.get("raw_summary", "")} for n in news_data], indent=2, ensure_ascii=False),
+                        "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
+                    })
+                    response_content = extract_clean_text(response.content)
+                except Exception:
+                    response_content = "⚠️ Gemini API 분당 요청 한도(Rate Limit)에 도달했습니다. 10~20초 후 다시 [분석 실행] 버튼을 눌러주세요."
+
             with st.container(border=True):
                 st.markdown("### 📝 **AI 종합 분석 브리핑**")
-                st.markdown(extract_clean_text(response.content))
+                st.markdown(response_content)
             
             st.write("")
 
@@ -508,12 +496,13 @@ if analyze_btn:
             
             with col_left:
                 with st.container(border=True):
-                    st.markdown("##### 📰 **최신 주요 뉴스 (AI 한국어 요약 & 원문 링크)**")
+                    st.markdown("##### 📰 **최신 주요 뉴스 및 기사 링크**")
                     if news_data:
                         for item in news_data:
-                            summary_text = item.get("ko_summary", item["title"])
-                            st.markdown(f"**💡 {summary_text}**")
-                            st.markdown(f"[{item['title']}]({item['link']})  \n*{item['publisher']} ({item['date']})*")
+                            st.markdown(f"**[{item['title']}]({item['link']})**")
+                            if item.get("raw_summary"):
+                                st.caption(f"요약: {item['raw_summary'][:150]}...")
+                            st.caption(f"출처: {item['publisher']} | {item['date']}")
                             st.divider()
                     else:
                         st.info("수집된 최신 뉴스가 없습니다.")
