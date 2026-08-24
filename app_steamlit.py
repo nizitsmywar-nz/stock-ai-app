@@ -56,8 +56,6 @@ def fetch_stock_technical_data(ticker: str):
     last_date = df.index[-1].strftime("%Y-%m-%d")
     
     data = {
-        "ticker": ticker,
-        "data_date": last_date,
         "current_price": round(float(latest['Close']), 2),
         "sma_20": round(float(latest['SMA_20']), 2) if pd.notnull(latest['SMA_20']) else "N/A",
         "sma_60": round(float(latest['SMA_60']), 2) if pd.notnull(latest['SMA_60']) else "N/A",
@@ -68,8 +66,7 @@ def fetch_stock_technical_data(ticker: str):
         "macd_signal": round(float(latest['MACD_Signal']), 2) if pd.notnull(latest['MACD_Signal']) else "N/A",
         "macd_hist": round(float(latest['MACD_Hist']), 2) if pd.notnull(latest['MACD_Hist']) else "N/A",
         "bb_upper": round(float(latest['BB_High']), 2) if pd.notnull(latest['BB_High']) else "N/A",
-        "bb_lower": round(float(latest['BB_Low']), 2) if pd.notnull(latest['BB_Low']) else "N/A",
-        "recent_volume_trend": "상승" if latest['Volume'] > df['Volume'].tail(5).mean() else "하락"
+        "bb_lower": round(float(latest['BB_Low']), 2) if pd.notnull(latest['BB_Low']) else "N/A"
     }
     return data, last_date
 
@@ -208,17 +205,15 @@ def fetch_sector_performance():
             hist = yf.Ticker(etf).history(period="5d")
             if len(hist) >= 2:
                 pct = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
-                summary[etf] = {
-                    "change_5d": f"{pct:+.2f}%",
-                    "date": hist.index[-1].strftime("%Y-%m-%d")
-                }
+                summary[etf] = f"{pct:+.2f}%"
             else:
-                summary[etf] = {"change_5d": "N/A", "date": "N/A"}
+                summary[etf] = "N/A"
         except Exception:
-            summary[etf] = {"change_5d": "N/A", "date": "N/A"}
+            summary[etf] = "N/A"
     return summary
 
 def fetch_news(ticker: str, limit: int = 5):
+    """기사 제목, 요약 본문, 출처, 링크를 모두 상세히 수집 (정보 손실 제로)"""
     try:
         stock = yf.Ticker(ticker)
         raw_news = stock.news
@@ -236,9 +231,7 @@ def fetch_news(ticker: str, limit: int = 5):
                 link = click_url.get("url", "") if isinstance(click_url, dict) else click_url
                 if not link:
                     link = content.get("canonicalUrl", {}).get("url", "")
-                pub_date = content.get("pubDate", "최근")
-                if "T" in str(pub_date):
-                    pub_date = str(pub_date).split("T")[0]
+                pub_date = str(content.get("pubDate", "최근"))[:10]
             else:
                 title = n.get("title", "")
                 summary = ""
@@ -250,7 +243,7 @@ def fetch_news(ticker: str, limit: int = 5):
             if title:
                 articles.append({
                     "title": title,
-                    "raw_summary": summary,
+                    "summary": summary,
                     "publisher": publisher,
                     "date": pub_date,
                     "link": link or f"https://finance.yahoo.com/quote/{ticker}"
@@ -281,16 +274,15 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
             upgrades['Date'] = pd.to_datetime(upgrades['Date'])
             filtered = upgrades[upgrades['Date'] >= cutoff_date]
         else:
-            filtered = upgrades.head(7)
+            filtered = upgrades.head(5)
             
         records = []
-        for idx, row in filtered.head(7).iterrows():
+        for idx, row in filtered.head(5).iterrows():
             date_str = idx.strftime("%Y-%m-%d") if isinstance(idx, pd.Timestamp) else str(idx)[:10]
             records.append({
                 "date": date_str,
                 "firm": row.get("Firm", "N/A"),
                 "to_grade": row.get("ToGrade", "N/A"),
-                "from_grade": row.get("FromGrade", "N/A"),
                 "action": row.get("Action", "N/A")
             })
         return records
@@ -320,7 +312,7 @@ if analyze_btn:
     if not api_key:
         st.error("GEMINI_API_KEY가 설정되지 않았습니다. Streamlit Secrets에 등록하세요.")
     else:
-        with st.spinner(f"🔍 [{ticker_input}] 실시간 매크로/자산군 지표 수집 및 Gemini 분석 중..."):
+        with st.spinner(f"🔍 [{ticker_input}] 실시간 RAG 데이터 및 전체 기사 본문 수집 중..."):
             tech_data, stock_date = fetch_stock_technical_data(ticker_input)
             macro_data = fetch_macro_indicators()
             fund_data = fetch_fundamentals_and_valuation(ticker_input)
@@ -394,22 +386,22 @@ if analyze_btn:
 
             st.caption(f"🕒 기준일자: 주가/재무제표 ({stock_date}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
 
-            # 4. Gemini AI 분석 (단일 호출 + 재시도 핸들링)
+            # 4. Gemini 3.6 Flash 단일 심층 분석 (뉴스 전문 포함)
             template = """
-[RAG 주입 데이터]
+[RAG 심층 주입 데이터]
 1. 기술적/수급 데이터 ({ticker}) (기준일: {stock_date}):
 {tech_json}
 
-2. 매크로/6대 자산 지표 (국채금리, 달러, VIX, 금, 비트코인, 원유):
+2. 매크로 및 6대 자산 실시간 지표:
 {macro_json}
 
 3. 주요 섹터 5일 등락률:
 {sector_json}
 
-4. 펀더멘털 및 6대 밸류에이션:
+4. 펀더멘털 및 6대 밸류에이션(성장 모델 + 가치 모델):
 {fund_json}
 
-5. 최신 주요 기사:
+5. 최신 주요 기사 (원문 헤드라인 및 세부 요약 내용):
 {news_json}
 
 6. 최근 2개월 증권가 투자의견 변동:
@@ -418,7 +410,7 @@ if analyze_btn:
 ---
 
 [지시사항]
-위 데이터를 바탕으로 객관적이고 예리한 분석을 수행할 것:
+위 RAG 주입 데이터를 바탕으로 최고 수준의 금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
 - 경기 국면 (회복 / 활황 / 둔화 / 침체 판정)
@@ -437,12 +429,12 @@ if analyze_btn:
 - 자금 순환매(Rotation) 방향
 
 3. 밸류에이션 및 적정주가 종합 평가 ({ticker})
-- 전통 가치모델과 성장주 모델 간의 괴리 원인 분석
+- 전통 가치모델(그레이엄, 린치, ROE-PBR)과 성장주 모델(PEG, PSR, DCF, IB목표가) 간의 괴리 원인 분석
 - 해당 종목의 비즈니스 특성에 비추어 볼 때 가장 유효한 적정주가 밴드 제시
 - PER/PBR/PSR/ROE 관점에서의 고평가/저평가 종합 판정
 
 4. 종목 종합 평가 ({ticker})
-- 기술적 분석: 이평선 배열, MACD 모멘텀(히스토그램), MFI 수급 상태, 지지/저항선
+- 기술적 분석: 이평선 배열, MACD 모멘텀(히스토그램), MFI 자금 수급 상태, 지지/저항선
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 리스크
 - 종합 평점 및 최종 투자 의견 (적극매수 / 분할매수 / 관망 / 비중축소)
 - 매매 시나리오: 분할 매수 밴드, 목표가/익절 라인, 손절(Stop-loss) 기준선
@@ -454,54 +446,48 @@ if analyze_btn:
             llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
             chain = prompt | llm
             
+            payload = {
+                "ticker": ticker_input,
+                "stock_date": stock_date,
+                "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
+                "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
+                "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
+                "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
+                "news_json": json.dumps(news_data, indent=2, ensure_ascii=False),
+                "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
+            }
+            
             response_content = None
-            try:
-                response = chain.invoke({
-                    "ticker": ticker_input,
-                    "stock_date": stock_date,
-                    "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
-                    "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
-                    "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
-                    "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
-                    "news_json": json.dumps([{"title": n["title"], "summary": n.get("raw_summary", "")} for n in news_data], indent=2, ensure_ascii=False),
-                    "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
-                })
-                response_content = extract_clean_text(response.content)
-            except Exception as e:
-                # Rate Limit 발생 시 4초 대기 후 1회 자동 재시도
-                time.sleep(4)
+            for delay in [0, 5, 10]:
+                if delay > 0:
+                    time.sleep(delay)
                 try:
-                    response = chain.invoke({
-                        "ticker": ticker_input,
-                        "stock_date": stock_date,
-                        "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
-                        "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
-                        "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
-                        "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
-                        "news_json": json.dumps([{"title": n["title"], "summary": n.get("raw_summary", "")} for n in news_data], indent=2, ensure_ascii=False),
-                        "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
-                    })
-                    response_content = extract_clean_text(response.content)
+                    res = chain.invoke(payload)
+                    response_content = extract_clean_text(res.content)
+                    break
                 except Exception:
-                    response_content = "⚠️ Gemini API 분당 요청 한도(Rate Limit)에 도달했습니다. 10~20초 후 다시 [분석 실행] 버튼을 눌러주세요."
+                    continue
+                    
+            if not response_content:
+                response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. 잠시 후 다시 [분석 실행]을 눌러주세요."
 
             with st.container(border=True):
-                st.markdown("### 📝 **AI 종합 분석 브리핑**")
+                st.markdown("### 📝 **Gemini 3.6 Flash 종합 분석 브리핑**")
                 st.markdown(response_content)
             
             st.write("")
 
-            # 5. 하단 뉴스 및 증권가 투자의견
+            # 5. 하단 뉴스 (원문 요약 포함) 및 증권가 투자의견
             col_left, col_right = st.columns([1.1, 0.9])
             
             with col_left:
                 with st.container(border=True):
-                    st.markdown("##### 📰 **최신 주요 뉴스 및 기사 링크**")
+                    st.markdown("##### 📰 **최신 주요 뉴스 및 기사 원문**")
                     if news_data:
                         for item in news_data:
                             st.markdown(f"**[{item['title']}]({item['link']})**")
-                            if item.get("raw_summary"):
-                                st.caption(f"요약: {item['raw_summary'][:150]}...")
+                            if item.get("summary"):
+                                st.markdown(f"> *{item['summary']}*")
                             st.caption(f"출처: {item['publisher']} | {item['date']}")
                             st.divider()
                     else:
@@ -512,7 +498,7 @@ if analyze_btn:
                     st.markdown("##### 🏛️ **최근 2개월 증권가 투자의견 변동**")
                     if analyst_data:
                         df_analyst = pd.DataFrame(analyst_data)
-                        df_analyst.columns = ["일자", "증권사", "투자의견", "이전의견", "액션"]
+                        df_analyst.columns = ["일자", "증권사", "투자의견", "액션"]
                         st.dataframe(df_analyst, use_container_width=True, hide_index=True)
                     else:
                         st.info("최근 2개월간 등록된 투자의견 변동 내역이 없습니다.")
