@@ -268,7 +268,7 @@ def summarize_news_with_gemini(news_list, api_key):
             prompt_items.append(f"{i+1}. {n['title']} (요약: {n.get('raw_summary', '')})")
             
         prompt_text = (
-            "아래 영문 주식 기사 목록을 읽고 핵심 내용을 한국어로 1문장씩 요약해줘.\n"
+            "아래 영문 주식 기사 목록을 읽고 핵심 내용을 투자자가 바로 이해할 수 있도록 한국어로 1문장씩 요약해줘.\n"
             "각 줄에 번호 없이 요약문만 하나씩 줄바꿈으로 출력해줘:\n\n"
             + "\n".join(prompt_items)
         )
@@ -326,7 +326,7 @@ with st.sidebar:
     ticker_input = st.text_input("종목 티커 (Ticker)", value="TSLA").upper()
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.markdown("---")
-    st.caption("• **가치 모델:** 그레이엄, 린치, ROE-PBR\n• **성장주 모델:** PEG 1.5, 타깃 PSR, DCF\n• **추론 엔진:** Gemini 3.6 Flash")
+    st.caption("• **가치 모델:** 그레이엄, 린치, ROE-PBR\n• **성장주 모델:** PEG 1.5, 타깃 PSR, DCF\n• **기술/수급:** MACD, MFI, RSI\n• **추론 엔진:** Gemini 3.6 Flash")
 
 st.header(f"📊 {ticker_input} 종합 밸류에이션 & 투자전략 리포트")
 
@@ -352,16 +352,27 @@ if analyze_btn:
             
             curr_p = tech_data.get('current_price', 0)
             
-            # 1. 상단 핵심 메트릭 (Native Streamlit Components)
+            # 1. 상단 핵심 메트릭 (재무 + 기술적/수급 지표 완벽 복원)
             with st.container(border=True):
                 st.markdown("**🏢 핵심 시장 및 재무 지표**")
-                m1, m2, m3, m4, m5, m6 = st.columns(6)
-                m1.metric("현재 주가", f"${curr_p}")
-                m2.metric("시가총액", str(fund_data.get('market_cap_fmt', 'N/A')))
-                m3.metric("PER (선행/후행)", f"{fund_data.get('forward_pe', 'N/A')} / {fund_data.get('trailing_pe', 'N/A')}")
-                m4.metric("PBR / PSR", f"{fund_data.get('pbr', 'N/A')} / {fund_data.get('ps_ratio', 'N/A')}")
-                m5.metric("ROE / RSI", f"{fund_data.get('roe', 'N/A')} / {tech_data.get('rsi_14', 'N/A')}")
-                m6.metric("미 10년물 금리", str(macro_data.get('us_10y_yield', {}).get('value', 'N/A')))
+                r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
+                r1_c1.metric("현재 주가", f"${curr_p}")
+                r1_c2.metric("시가총액", str(fund_data.get('market_cap_fmt', 'N/A')))
+                r1_c3.metric("PER (선행/후행)", f"{fund_data.get('forward_pe', 'N/A')} / {fund_data.get('trailing_pe', 'N/A')}")
+                r1_c4.metric("PBR / PSR", f"{fund_data.get('pbr', 'N/A')} / {fund_data.get('ps_ratio', 'N/A')}")
+                
+                st.divider()
+                
+                st.markdown("**📈 기술적 모멘텀 및 거시 지표 (MACD / 수급 / 변동성)**")
+                r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
+                r2_c1.metric(
+                    "MACD (Signal)", 
+                    f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", 
+                    f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None
+                )
+                r2_c2.metric("RSI (14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
+                r2_c3.metric("ROE (자기자본수익률)", str(fund_data.get('roe', 'N/A')))
+                r2_c4.metric("미 10년물 금리 / VIX", f"{macro_data.get('us_10y_yield', {}).get('value', 'N/A')} / {macro_data.get('vix', {}).get('value', 'N/A')}")
 
             # 2. 성장주 3대 밸류에이션 모델
             with st.container(border=True):
@@ -446,7 +457,7 @@ if analyze_btn:
 - PER/PBR/PSR/ROE 관점에서의 고평가/저평가 종합 판정
 
 4. 종목 종합 평가 ({ticker})
-- 기술적 분석: 이평선 배열, MACD 모멘텀, MFI 수급 상태, 지지/저항선
+- 기술적 분석: 이평선 배열, MACD 모멘텀(히스토그램), MFI 자금 수급 상태, 지지/저항선
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 리스크
 - 종합 평점 및 최종 투자 의견 (적극매수 / 분할매수 / 관망 / 비중축소)
 - 매매 시나리오: 분할 매수 밴드, 목표가/익절 라인, 손절(Stop-loss) 기준선
