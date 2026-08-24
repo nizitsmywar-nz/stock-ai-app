@@ -1,5 +1,6 @@
 import os
 import json
+import math
 import warnings
 from datetime import datetime, timedelta
 
@@ -16,15 +17,14 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 warnings.filterwarnings("ignore")
 load_dotenv()
 
-# --- 페이지 설정 ---
 st.set_page_config(
-    page_title="AI 주식 분석 대시보드 Pro",
+    page_title="AI 주식 종합 분석기 Pro",
     page_icon="📈",
     layout="wide"
 )
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈 (확장 지표 + 뉴스 + 애널리스트 의견)
+# 1. RAG 데이터 수집 및 적정주가 계산 모듈
 # -------------------------------------------------------------
 def fetch_stock_technical_data(ticker: str):
     stock = yf.Ticker(ticker)
@@ -32,19 +32,15 @@ def fetch_stock_technical_data(ticker: str):
     if df.empty:
         return {}, "N/A"
     
-    # 이동평균선
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_60'] = df['Close'].rolling(window=60).mean()
     df['SMA_120'] = df['Close'].rolling(window=120).mean()
-    
-    # 보조지표 (RSI, MACD, MFI, 볼린저밴드)
     df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
     macd = ta.trend.MACD(df['Close'])
     df['MACD'] = macd.macd()
     df['MACD_Signal'] = macd.macd_signal()
     df['MACD_Hist'] = macd.macd_diff()
     
-    # 자금흐름지수 MFI (Money Flow Index)
     try:
         df['MFI'] = ta.volume.money_flow_index(df['High'], df['Low'], df['Close'], df['Volume'], window=14)
     except Exception:
@@ -77,8 +73,6 @@ def fetch_stock_technical_data(ticker: str):
 
 def fetch_macro_indicators():
     macro_data = {}
-    
-    # 1. FRED 국채 금리
     try:
         end = datetime.now()
         start = end - timedelta(days=30)
@@ -91,7 +85,6 @@ def fetch_macro_indicators():
     except Exception:
         macro_data["us_10y_yield"] = {"value": "N/A", "date": "N/A"}
         
-    # 2. VIX, 유가, 달러
     for name, ticker in [("vix", "^VIX"), ("wti_oil", "CL=F"), ("dollar_index", "DX-Y.NYB")]:
         try:
             hist = yf.Ticker(ticker).history(period="5d")
@@ -106,18 +99,71 @@ def fetch_macro_indicators():
             macro_data[name] = {"value": "N/A", "date": "N/A"}
     return macro_data
 
-def fetch_fundamentals(ticker: str):
+def format_market_cap(market_cap):
+    if not market_cap or market_cap == "N/A":
+        return "N/A"
+    if market_cap >= 1e12:
+        return f"${market_cap / 1e12:.2f}T (조 달러)"
+    elif market_cap >= 1e9:
+        return f"${market_cap / 1e9:.2f}B (십억 달러)"
+    elif market_cap >= 1e6:
+        return f"${market_cap / 1e6:.2f}M (백만 달러)"
+    return f"${market_cap:,.0f}"
+
+def fetch_fundamentals_and_valuation(ticker: str):
     try:
         stock = yf.Ticker(ticker)
         info = stock.info
+        
+        market_cap = info.get("marketCap", "N/A")
+        trailing_pe = info.get("trailingPE", "N/A")
+        forward_pe = info.get("forwardPE", "N/A")
+        pbr = info.get("priceToBook", "N/A")
+        roe_raw = info.get("returnOnEquity", None)
+        roe_pct = round(roe_raw * 100, 2) if roe_raw is not None else "N/A"
+        eps = info.get("trailingEps", None)
+        bps = info.get("bookValue", None)
+        target_mean_price = info.get("targetMeanPrice", "N/A")
+        
+        # --- 3대 적정주가 계산 ---
+        fair_values = {}
+        
+        # 1. 벤저민 그레이엄 공식 (EPS > 0, BPS > 0 일 때)
+        if eps and bps and eps > 0 and bps > 0:
+            graham_num = math.sqrt(22.5 * eps * bps)
+            fair_values["graham_number"] = round(graham_num, 2)
+        else:
+            fair_values["graham_number"] = "산출불가 (적자/자본잠식)"
+            
+        # 2. 피터 린치 적정주가 (EPS * min(ROE, 30))
+        if eps and eps > 0 and roe_raw and roe_raw > 0:
+            growth_rate = min(roe_raw * 100, 30.0)  # 상한선 30%
+            lynch_val = eps * growth_rate
+            fair_values["peter_lynch"] = round(lynch_val, 2)
+        else:
+            fair_values["peter_lynch"] = "산출불가"
+
+        # 3. ROE-PBR 모델 (BPS * (ROE / 0.10))
+        if bps and bps > 0 and roe_raw and roe_raw > 0:
+            roe_pbr_val = bps * (roe_raw / 0.10)
+            fair_values["roe_pbr_model"] = round(roe_pbr_val, 2)
+        else:
+            fair_values["roe_pbr_model"] = "산출불가"
+
         return {
-            "trailing_pe": info.get("trailingPE", "N/A"),
-            "forward_pe": info.get("forwardPE", "N/A"),
-            "price_to_book": info.get("priceToBook", "N/A"),
-            "roe": info.get("returnOnEquity", "N/A"),
+            "market_cap_raw": market_cap,
+            "market_cap_fmt": format_market_cap(market_cap),
+            "trailing_pe": trailing_pe,
+            "forward_pe": forward_pe,
+            "pbr": pbr,
+            "roe": f"{roe_pct}%" if roe_pct != "N/A" else "N/A",
+            "roe_val": roe_pct,
+            "eps": eps if eps else "N/A",
+            "bps": bps if bps else "N/A",
             "operating_margins": info.get("operatingMargins", "N/A"),
-            "target_mean_price": info.get("targetMeanPrice", "N/A"),
-            "recommendation_key": info.get("recommendationKey", "N/A")
+            "target_mean_price": target_mean_price,
+            "recommendation_key": info.get("recommendationKey", "N/A"),
+            "fair_values": fair_values
         }
     except Exception:
         return {}
@@ -141,47 +187,59 @@ def fetch_sector_performance():
     return summary
 
 def fetch_news(ticker: str, limit: int = 5):
-    """최신 종목 관련 주요 뉴스 기사 및 링크 수집"""
     try:
         stock = yf.Ticker(ticker)
-        news_list = stock.news
-        articles = []
-        for n in news_list[:limit]:
-            title = n.get("title", "")
-            publisher = n.get("publisher", "")
-            link = n.get("link", "")
-            pub_time = n.get("providerPublishTime", None)
-            pub_date = datetime.fromtimestamp(pub_time).strftime("%Y-%m-%d %H:%M") if pub_time else "최근"
+        raw_news = stock.news
+        if not raw_news:
+            return []
             
-            articles.append({
-                "title": title,
-                "publisher": publisher,
-                "date": pub_date,
-                "link": link
-            })
+        articles = []
+        for n in raw_news[:limit]:
+            content = n.get("content", {})
+            if isinstance(content, dict) and content:
+                title = content.get("title", "")
+                publisher = content.get("provider", {}).get("displayName", "Yahoo Finance")
+                click_url = content.get("clickThroughUrl", {})
+                link = click_url.get("url", "") if isinstance(click_url, dict) else click_url
+                if not link:
+                    link = content.get("canonicalUrl", {}).get("url", "")
+                pub_date = content.get("pubDate", "최근")
+                if "T" in str(pub_date):
+                    pub_date = str(pub_date).split("T")[0]
+            else:
+                title = n.get("title", "")
+                publisher = n.get("publisher", "Yahoo Finance")
+                link = n.get("link", "")
+                pub_time = n.get("providerPublishTime", None)
+                pub_date = datetime.fromtimestamp(pub_time).strftime("%Y-%m-%d") if pub_time else "최근"
+            
+            if title:
+                articles.append({
+                    "title": title,
+                    "publisher": publisher,
+                    "date": pub_date,
+                    "link": link or f"https://finance.yahoo.com/quote/{ticker}"
+                })
         return articles
     except Exception:
         return []
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
-    """최근 2개월간 증권사(IB) 투자의견 및 목표주가 변동 히스토리"""
     try:
         stock = yf.Ticker(ticker)
         upgrades = stock.upgrades_downgrades
         if upgrades is None or upgrades.empty:
             return []
         
-        # 날짜 필터링 (최근 60일)
         cutoff_date = datetime.now() - timedelta(days=months * 30)
         
-        # 인덱스가 DatetimeIndex인 경우 처리
         if isinstance(upgrades.index, pd.DatetimeIndex):
             filtered = upgrades[upgrades.index >= cutoff_date.strftime("%Y-%m-%d")]
         elif 'Date' in upgrades.columns:
             upgrades['Date'] = pd.to_datetime(upgrades['Date'])
             filtered = upgrades[upgrades['Date'] >= cutoff_date]
         else:
-            filtered = upgrades.head(5)
+            filtered = upgrades.head(7)
             
         records = []
         for idx, row in filtered.head(7).iterrows():
@@ -205,10 +263,10 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 2. UI 및 메인 실행부
+# 2. UI 및 메인 실행
 # -------------------------------------------------------------
-st.title("📈 AI 주식 종합 분석 대시보드")
-st.caption("실시간 주가·기술적 지표·거시경제·뉴스·증권가 컨센서스 기반 Gemini 분석 보고서")
+st.title("📈 AI 주식 종합 분석 및 밸류에이션 대시보드")
+st.caption("실시간 주가·기술적 지표·밸류에이션·적정주가 산출·뉴스·증권가 컨센서스 기반 Gemini 분석")
 
 with st.sidebar:
     st.header("⚙️ 종목 검색")
@@ -216,32 +274,62 @@ with st.sidebar:
     analyze_btn = st.button("분석 실행", type="primary", use_container_width=True)
 
 if analyze_btn:
-    with st.spinner(f"[{ticker_input}] 실시간 시장 지표 수집 및 분석 중..."):
+    with st.spinner(f"[{ticker_input}] 펀더멘털 지표 수집 및 적정주가 계산 중..."):
         tech_data, stock_date = fetch_stock_technical_data(ticker_input)
         macro_data = fetch_macro_indicators()
-        fund_data = fetch_fundamentals(ticker_input)
+        fund_data = fetch_fundamentals_and_valuation(ticker_input)
         sector_data = fetch_sector_performance()
         news_data = fetch_news(ticker_input, limit=5)
         analyst_data = fetch_recent_upgrades_downgrades(ticker_input, months=2)
         
-        # 1. 상단 핵심 지표 메트릭 (MFI 및 MACD 반영)
-        c1, c2, c3, c4, c5 = st.columns(5)
+        # 1. 상단 핵심 펀더멘털 및 기술 지표 카드 (시총, PER, PBR, ROE, 현재가)
+        st.subheader(f"🏢 [{ticker_input}] 핵심 재무 및 기술 지표")
+        c1, c2, c3, c4, c5, c6 = st.columns(6)
         c1.metric("현재가", f"${tech_data.get('current_price', 'N/A')}")
-        c2.metric("RSI(14)", tech_data.get('rsi_14', 'N/A'))
-        c3.metric("MFI 수급(14)", tech_data.get('mfi_14', 'N/A'))
-        c4.metric("미 10년물 금리", macro_data.get('us_10y_yield', {}).get('value', 'N/A'))
-        c5.metric("VIX 변동성", macro_data.get('vix', {}).get('value', 'N/A'))
+        c2.metric("시가총액", fund_data.get('market_cap_fmt', 'N/A'))
+        c3.metric("PER (Trailing)", f"{fund_data.get('trailing_pe', 'N/A')}배")
+        c4.metric("PBR", f"{fund_data.get('pbr', 'N/A')}배")
+        c5.metric("ROE", fund_data.get('roe', 'N/A'))
+        c6.metric("RSI(14) / MFI", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
+        
+        # 2. 산출된 적정 주가 모델 비교 카드
+        st.write("")
+        st.subheader("🎯 모델별 적정주가 (Fair Value) 산출")
+        f1, f2, f3, f4 = st.columns(4)
+        
+        curr_p = tech_data.get('current_price', 0)
+        fair = fund_data.get('fair_values', {})
+        
+        # 증권가 평균 목표가
+        target_p = fund_data.get('target_mean_price', 'N/A')
+        diff_target = round(((target_p - curr_p) / curr_p) * 100, 1) if isinstance(target_p, (int, float)) and curr_p else None
+        f1.metric("IB 목표주가 컨센서스", f"${target_p}", f"{diff_target:+.1f}%" if diff_target is not None else None)
+        
+        # 그레이엄 적정가
+        graham_p = fair.get('graham_number', 'N/A')
+        diff_graham = round(((graham_p - curr_p) / curr_p) * 100, 1) if isinstance(graham_p, (int, float)) and curr_p else None
+        f2.metric("그레이엄 공식 (자산/수익)", f"${graham_p}" if isinstance(graham_p, (int, float)) else str(graham_p), f"{diff_graham:+.1f}%" if diff_graham is not None else None)
+        
+        # 피터 린치 적정가
+        lynch_p = fair.get('peter_lynch', 'N/A')
+        diff_lynch = round(((lynch_p - curr_p) / curr_p) * 100, 1) if isinstance(lynch_p, (int, float)) and curr_p else None
+        f3.metric("피터 린치 모델 (성장가치)", f"${lynch_p}" if isinstance(lynch_p, (int, float)) else str(lynch_p), f"{diff_lynch:+.1f}%" if diff_lynch is not None else None)
+        
+        # ROE-PBR 모델
+        roe_pbr_p = fair.get('roe_pbr_model', 'N/A')
+        diff_roe_pbr = round(((roe_pbr_p - curr_p) / curr_p) * 100, 1) if isinstance(roe_pbr_p, (int, float)) and curr_p else None
+        f4.metric("ROE-PBR 자본가치 모델", f"${roe_pbr_p}" if isinstance(roe_pbr_p, (int, float)) else str(roe_pbr_p), f"{diff_roe_pbr:+.1f}%" if diff_roe_pbr is not None else None)
         
         st.divider()
         
-        # 2. 데이터 기준일 정보 표시
-        with st.expander("🕒 분석 데이터 수집 기준일자 (최신 여부 검증)", expanded=False):
-            d_c1, d_c2, d_c3 = st.columns(3)
-            d_c1.write(f"- **주가/기술지표 기준일:** {stock_date}")
-            d_c2.write(f"- **미 국채 10년물 기준일:** {macro_data.get('us_10y_yield', {}).get('date', 'N/A')}")
-            d_c3.write(f"- **VIX / 유가 기준일:** {macro_data.get('vix', {}).get('date', 'N/A')}")
+        # 3. 데이터 기준일 정보
+        with st.expander("🕒 데이터 수집 기준일자", expanded=False):
+            d1, d2, d3 = st.columns(3)
+            d1.write(f"- **주가/재무제표 기준일:** {stock_date}")
+            d2.write(f"- **미 국채 10년물 기준일:** {macro_data.get('us_10y_yield', {}).get('date', 'N/A')}")
+            d3.write(f"- **VIX / 유가 기준일:** {macro_data.get('vix', {}).get('date', 'N/A')}")
         
-        # 3. Gemini AI 분석 리포트 생성
+        # 4. Gemini AI 분석
         api_key = os.getenv("GEMINI_API_KEY")
         if not api_key:
             try:
@@ -263,7 +351,7 @@ if analyze_btn:
 3. 주요 섹터 5일 등락률:
 {sector_json}
 
-4. 펀더멘털/밸류에이션:
+4. 펀더멘털, 밸류에이션 및 산출된 모델별 적정주가:
 {fund_json}
 
 5. 최신 주요 기사 헤드라인:
@@ -275,7 +363,7 @@ if analyze_btn:
 ---
 
 [지시사항]
-위 [RAG 주입 데이터]를 기반으로 아래 항목을 사실 위주로 날카롭게 분석할 것:
+위 [RAG 주입 데이터]를 기반으로 아래 항목을 정밀하게 분석할 것:
 
 1. 거시환경 및 시장 국면
 - 경기 국면 (회복 / 활황 / 둔화 / 침체 판정)
@@ -286,9 +374,12 @@ if analyze_btn:
 - 상대적 강세 섹터 및 약세 섹터 요약
 - 자금 순환매(Rotation) 방향
 
-3. 종목 종합 평가 ({ticker})
-- 기술적 분석: 이평선 배열, MACD 모멘텀(히스토그램), MFI 자금 유입 상태, 지지/저항선, 과매수/과매도 여부
-- 최근 증권가 컨센서스 평가: 상향/하향 추세 및 시장의 기대치 요약
+3. 밸류에이션 및 적정주가 평가 ({ticker})
+- 현재 주가 대비 산출된 모델별(그레이엄, 린치, ROE-PBR) 적정주가 및 목표주가 괴리율 평가
+- PER/PBR/ROE 관점에서의 고평가/저평가 종합 판정
+
+4. 종목 종합 평가 ({ticker})
+- 기술적 분석: 이평선 배열, MACD 모멘텀, MFI 수급 상태, 지지/저항선
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 리스크
 - 종합 평점 및 최종 투자 의견 (적극매수 / 분할매수 / 관망 / 비중축소)
 - 매매 시나리오: 분할 매수 밴드, 목표가/익절 라인, 손절(Stop-loss) 기준선
@@ -315,14 +406,14 @@ if analyze_btn:
             
         st.divider()
 
-        # 4. 하단 부가 섹션 (최신 뉴스 링크 & 증권가 의견 표)
+        # 하단 뉴스 및 증권가 의견
         col_left, col_right = st.columns(2)
         
         with col_left:
             st.subheader("📰 최신 주요 뉴스 및 링크")
             if news_data:
                 for item in news_data:
-                    st.markdown(f"- **[{item['title']}]({item['link']})**  \n  *{item['publisher']} ({item['date']})*")
+                    st.markdown(f"- [{item['title']}]({item['link']})  \n  <small style='color:gray;'>출처: {item['publisher']} | {item['date']}</small>", unsafe_allow_html=True)
             else:
                 st.info("수집된 최신 뉴스가 없습니다.")
                 
