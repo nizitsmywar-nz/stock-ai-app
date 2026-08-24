@@ -73,7 +73,9 @@ def fetch_stock_technical_data(ticker: str):
     return data, last_date
 
 def fetch_macro_indicators():
+    """6대 자산군(현금/달러, 채권, 주식, 코인, 금, 원유) 실시간 거시 데이터 수집"""
     macro_data = {}
+    # 1. 미 국채 10년물 (FRED)
     try:
         end = datetime.now()
         start = end - timedelta(days=30)
@@ -86,7 +88,15 @@ def fetch_macro_indicators():
     except Exception:
         macro_data["us_10y_yield"] = {"value": "N/A", "date": "N/A"}
         
-    for name, ticker in [("vix", "^VIX"), ("wti_oil", "CL=F"), ("dollar_index", "DX-Y.NYB")]:
+    # 2. 글로벌 자산군 (달러, VIX, 원유, 금, 비트코인)
+    asset_tickers = [
+        ("vix", "^VIX"),
+        ("dollar_index", "DX-Y.NYB"),
+        ("wti_oil", "CL=F"),
+        ("gold", "GC=F"),
+        ("bitcoin", "BTC-USD")
+    ]
+    for name, ticker in asset_tickers:
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if not hist.empty:
@@ -268,7 +278,7 @@ def summarize_news_with_gemini(news_list, api_key):
             prompt_items.append(f"{i+1}. {n['title']} (요약: {n.get('raw_summary', '')})")
             
         prompt_text = (
-            "아래 영문 주식 기사 목록을 읽고 핵심 내용을 투자자가 바로 이해할 수 있도록 한국어로 1문장씩 요약해줘.\n"
+            "아래 영문 주식 기사 목록을 읽고 핵심 내용을 한국어로 1문장씩 요약해줘.\n"
             "각 줄에 번호 없이 요약문만 하나씩 줄바꿈으로 출력해줘:\n\n"
             + "\n".join(prompt_items)
         )
@@ -326,7 +336,7 @@ with st.sidebar:
     ticker_input = st.text_input("종목 티커 (Ticker)", value="TSLA").upper()
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.markdown("---")
-    st.caption("• **가치 모델:** 그레이엄, 린치, ROE-PBR\n• **성장주 모델:** PEG 1.5, 타깃 PSR, DCF\n• **기술/수급:** MACD, MFI, RSI\n• **추론 엔진:** Gemini 3.6 Flash")
+    st.caption("• **가치 모델:** 그레이엄, 린치, ROE-PBR\n• **성장주 모델:** PEG 1.5, 타깃 PSR, DCF\n• **자산군 전망:** 현금·채권·주식·코인·금·원유\n• **추론 엔진:** Gemini 3.6 Flash")
 
 st.header(f"📊 {ticker_input} 종합 밸류에이션 & 투자전략 리포트")
 
@@ -341,7 +351,7 @@ if analyze_btn:
     if not api_key:
         st.error("GEMINI_API_KEY가 설정되지 않았습니다. Streamlit Secrets에 등록하세요.")
     else:
-        with st.spinner(f"🔍 [{ticker_input}] 실시간 데이터 수집 및 정밀 분석 중..."):
+        with st.spinner(f"🔍 [{ticker_input}] 실시간 매크로/자산군 지표 수집 및 정밀 분석 중..."):
             tech_data, stock_date = fetch_stock_technical_data(ticker_input)
             macro_data = fetch_macro_indicators()
             fund_data = fetch_fundamentals_and_valuation(ticker_input)
@@ -352,7 +362,7 @@ if analyze_btn:
             
             curr_p = tech_data.get('current_price', 0)
             
-            # 1. 상단 핵심 메트릭 (재무 + 기술적/수급 지표 완벽 복원)
+            # 1. 상단 핵심 메트릭 (재무 + 기술적/수급 + 6대 자산군 지표)
             with st.container(border=True):
                 st.markdown("**🏢 핵심 시장 및 재무 지표**")
                 r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
@@ -363,16 +373,16 @@ if analyze_btn:
                 
                 st.divider()
                 
-                st.markdown("**📈 기술적 모멘텀 및 거시 지표 (MACD / 수급 / 변동성)**")
+                st.markdown("**🌐 글로벌 매크로 & 6대 유동성 자산 실시간 현황**")
                 r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
                 r2_c1.metric(
                     "MACD (Signal)", 
                     f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", 
                     f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None
                 )
-                r2_c2.metric("RSI (14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
-                r2_c3.metric("ROE (자기자본수익률)", str(fund_data.get('roe', 'N/A')))
-                r2_c4.metric("미 10년물 금리 / VIX", f"{macro_data.get('us_10y_yield', {}).get('value', 'N/A')} / {macro_data.get('vix', {}).get('value', 'N/A')}")
+                r2_c2.metric("RSI(14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
+                r2_c3.metric("미 10년물 금리 / 달러", f"{macro_data.get('us_10y_yield', {}).get('value', 'N/A')} / {macro_data.get('dollar_index', {}).get('value', 'N/A')}")
+                r2_c4.metric("금($/oz) / 비트코인($)", f"${macro_data.get('gold', {}).get('value', 'N/A')} / ${macro_data.get('bitcoin', {}).get('value', 'N/A'):,}" if isinstance(macro_data.get('bitcoin', {}).get('value'), (int, float)) else f"${macro_data.get('gold', {}).get('value', 'N/A')} / N/A")
 
             # 2. 성장주 3대 밸류에이션 모델
             with st.container(border=True):
@@ -422,7 +432,7 @@ if analyze_btn:
 1. 기술적/수급 데이터 ({ticker}) (기준일: {stock_date}):
 {tech_json}
 
-2. 매크로/시장 지표:
+2. 매크로/6대 자산 지표 (국채금리, 달러, VIX, 금, 비트코인, 원유):
 {macro_json}
 
 3. 주요 섹터 5일 등락률:
@@ -445,7 +455,14 @@ if analyze_btn:
 1. 거시환경 및 시장 국면
 - 경기 국면 (회복 / 활황 / 둔화 / 침체 판정)
 - 단기 변동성 촉발 요인
-- 권장 자산 배분 비중 (주식 : 채권 : 현금)
+- 최신 뉴스와 매크로 지표 기반 [6대 유동성 자산 변동 예측]:
+  * 현금 (달러): 전망 (상승/중립/하락) 및 사유
+  * 채권 (미 국채 등): 금리 경로에 따른 가격 전망 및 사유
+  * 주식 (위험자산): 시장 유동성 및 실적 장세 기반 전망
+  * 코인 (가상자산): 비트코인 등 위험선호 심리 및 유동성 민감도 전망
+  * 금 (원자재/안전자산): 실질금리 및 지정학 리스크 기반 전망
+  * 원유 (에너지): 공급망 및 경기 수요 기반 가격 전망
+- 권장 자산 배분 비중 (주식 : 채권 : 대체자산/금·코인 : 현금)
 
 2. 섹터 전망 및 순환매
 - 상대적 강세 섹터 및 약세 섹터 요약
@@ -457,7 +474,7 @@ if analyze_btn:
 - PER/PBR/PSR/ROE 관점에서의 고평가/저평가 종합 판정
 
 4. 종목 종합 평가 ({ticker})
-- 기술적 분석: 이평선 배열, MACD 모멘텀(히스토그램), MFI 자금 수급 상태, 지지/저항선
+- 기술적 분석: 이평선 배열, MACD 모멘텀(히스토그램), MFI 수급 상태, 지지/저항선
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 리스크
 - 종합 평점 및 최종 투자 의견 (적극매수 / 분할매수 / 관망 / 비중축소)
 - 매매 시나리오: 분할 매수 밴드, 목표가/익절 라인, 손절(Stop-loss) 기준선
