@@ -4,7 +4,7 @@ import math
 import time
 import re
 import warnings
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 import pandas as pd
@@ -19,6 +19,13 @@ from langchain_google_genai import ChatGoogleGenerativeAI
 warnings.filterwarnings("ignore")
 load_dotenv()
 
+# 한국 표준시(KST) 정의 (UTC+9)
+KST = timezone(timedelta(hours=9))
+
+def get_current_kst_time_str():
+    """한국 표준시 기준 현재 시간 문자열 반환"""
+    return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+
 st.set_page_config(
     page_title="AI Stock Valuation Dashboard Pro",
     page_icon="⚡",
@@ -32,7 +39,6 @@ st.set_page_config(
 HISTORY_FILE = "history.json"
 
 def load_history():
-    """파일에서 영구 저장된 히스토리 불러오기"""
     if os.path.exists(HISTORY_FILE):
         try:
             with open(HISTORY_FILE, "r", encoding="utf-8") as f:
@@ -42,7 +48,6 @@ def load_history():
     return {}
 
 def save_history(history_data):
-    """히스토리 데이터를 파일에 영구 저장하기"""
     try:
         with open(HISTORY_FILE, "w", encoding="utf-8") as f:
             json.dump(history_data, f, ensure_ascii=False, indent=2)
@@ -161,31 +166,33 @@ def fetch_macro_indicators():
         fred_res = web.DataReader('DGS10', 'fred', start, end).dropna()
         dgs10 = fred_res.iloc[-1, 0]
         macro_data["us_10y_yield"] = {
+            "source": "FRED (Federal Reserve Economic Data)",
             "value": f"{round(float(dgs10), 2)}%",
             "date": fred_res.index[-1].strftime("%Y-%m-%d")
         }
     except Exception:
-        macro_data["us_10y_yield"] = {"value": "N/A", "date": "N/A"}
+        macro_data["us_10y_yield"] = {"source": "FRED", "value": "N/A", "date": "N/A"}
         
     asset_tickers = [
-        ("vix", "^VIX"),
-        ("dollar_index", "DX-Y.NYB"),
-        ("wti_oil", "CL=F"),
-        ("gold", "GC=F"),
-        ("bitcoin", "BTC-USD")
+        ("vix", "^VIX", "CBOE Volatility Index"),
+        ("dollar_index", "DX-Y.NYB", "ICE US Dollar Index"),
+        ("wti_oil", "CL=F", "NYMEX WTI Crude Oil"),
+        ("gold", "GC=F", "COMEX Gold Futures"),
+        ("bitcoin", "BTC-USD", "Binance/Coinbase Crypto Market")
     ]
-    for name, ticker in asset_tickers:
+    for name, ticker, src_name in asset_tickers:
         try:
             hist = yf.Ticker(ticker).history(period="5d")
             if not hist.empty:
                 macro_data[name] = {
+                    "source": src_name,
                     "value": round(float(hist['Close'].iloc[-1]), 2),
                     "date": hist.index[-1].strftime("%Y-%m-%d")
                 }
             else:
-                macro_data[name] = {"value": "N/A", "date": "N/A"}
+                macro_data[name] = {"source": src_name, "value": "N/A", "date": "N/A"}
         except Exception:
-            macro_data[name] = {"value": "N/A", "date": "N/A"}
+            macro_data[name] = {"source": src_name, "value": "N/A", "date": "N/A"}
     return macro_data
 
 def format_market_cap(market_cap):
@@ -341,6 +348,7 @@ def fetch_sector_performance():
     return summary
 
 def fetch_news(ticker: str, limit: int = 5):
+    """종목별 개별 뉴스 수집"""
     try:
         stock = yf.Ticker(ticker)
         raw_news = stock.news
@@ -378,6 +386,46 @@ def fetch_news(ticker: str, limit: int = 5):
         return articles
     except Exception:
         return []
+
+def fetch_macro_news(limit: int = 4):
+    """6대 유동성 자산(매크로/금리/시장) 전용 주요 뉴스 수집"""
+    macro_articles = []
+    # 대표 거시 시장 지수/ETF (SPY: 주식시장, TLT: 미 국채)
+    for sym in ["SPY", "TLT"]:
+        try:
+            stock = yf.Ticker(sym)
+            raw = stock.news
+            if raw:
+                for n in raw[:2]:
+                    content = n.get("content", {})
+                    if isinstance(content, dict) and content:
+                        title = content.get("title", "")
+                        summary = content.get("summary", "")
+                        publisher = content.get("provider", {}).get("displayName", "MarketWatch")
+                        click_url = content.get("clickThroughUrl", {})
+                        link = click_url.get("url", "") if isinstance(click_url, dict) else click_url
+                        if not link:
+                            link = content.get("canonicalUrl", {}).get("url", "")
+                        pub_date = str(content.get("pubDate", "최근"))[:10]
+                    else:
+                        title = n.get("title", "")
+                        summary = ""
+                        publisher = n.get("publisher", "MarketWatch")
+                        link = n.get("link", "")
+                        pub_time = n.get("providerPublishTime", None)
+                        pub_date = datetime.fromtimestamp(pub_time).strftime("%Y-%m-%d") if pub_time else "최근"
+                    
+                    if title and not any(a["title"] == title for a in macro_articles):
+                        macro_articles.append({
+                            "title": title,
+                            "summary": summary,
+                            "publisher": publisher,
+                            "date": pub_date,
+                            "link": link or f"https://finance.yahoo.com/quote/{sym}"
+                        })
+        except Exception:
+            pass
+    return macro_articles[:limit]
 
 def extract_clean_text(content):
     if isinstance(content, str):
@@ -453,7 +501,7 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
         return []
 
 # -------------------------------------------------------------
-# 2. 사이드바 UI (영구 히스토리 뷰어)
+# 2. 사이드바 UI (영구 히스토리 뷰어 - KST 시간 보정)
 # -------------------------------------------------------------
 with st.sidebar:
     st.markdown("### ⚡ **AI Stock Analyst**")
@@ -492,7 +540,7 @@ with st.sidebar:
                 st.markdown(f"- **📤 매도가 밴드:** `{data['sell_target']}`")
                 st.markdown(f"- **📥 분할매수 밴드:** `{data['buy_band']}`")
                 st.markdown(f"- **🛑 손절선:** `{data['stop_loss']}`")
-                st.caption(f"분석 일시: {data['time']}")
+                st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
                 if st.button(f"'{t_code}' 다시 분석", key=f"btn_re_{tab_prefix}_{t_code}", use_container_width=True):
                     st.session_state.selected_ticker = t_code
                     st.rerun()
@@ -550,13 +598,14 @@ if analyze_btn:
     if not api_key:
         st.error("GEMINI_API_KEY가 설정되지 않았습니다. Streamlit Secrets에 등록하세요.")
     else:
-        with st.spinner(f"🔍 [{ticker_input}] 실시간 재무/옵션체인/수급/매크로 지표 수집 및 분석 중..."):
+        with st.spinner(f"🔍 [{ticker_input}] 실시간 재무/옵션체인/매크로 기사 수집 및 분석 중..."):
             tech_data, stock_date = fetch_stock_technical_data(ticker_input)
             options_data = fetch_nearest_options_data(ticker_input)
             macro_data = fetch_macro_indicators()
             fund_data = fetch_fundamentals_and_valuation(ticker_input)
             sector_data = fetch_sector_performance()
             news_data = fetch_news(ticker_input, limit=5)
+            macro_news_data = fetch_macro_news(limit=4)
             analyst_data = fetch_recent_upgrades_downgrades(ticker_input, months=2)
             
             curr_p = tech_data.get('current_price', 0)
@@ -579,7 +628,7 @@ if analyze_btn:
                     p_c3.metric("현재 평가 금액", f"${total_current:,.2f}")
                     p_c4.metric("평가 손익 (수익률)", f"${pnl_dollar:+,.2f}", f"{pnl_pct:+.2f}%")
 
-            # 1. 상단 핵심 메트릭 (재무 + 스마트머니 + 매크로)
+            # 1. 상단 핵심 메트릭
             with st.container(border=True):
                 st.markdown("**🏢 핵심 시장 및 재무 지표**")
                 r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
@@ -693,9 +742,9 @@ if analyze_btn:
                 diff_r = round(((r_val - curr_p) / curr_p) * 100, 1) if isinstance(r_val, (int, float)) and curr_p else None
                 v3.metric("ROE-PBR 자본가치", f"${r_val}" if isinstance(r_val, (int, float)) else str(r_val), f"{diff_r:+.1f}%" if diff_r is not None else None)
 
-            st.caption(f"🕒 기준일자: 주가/재무제표 ({stock_date}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
+            st.caption(f"🕒 데이터 수집 기준일자: 주가/재무제표 ({stock_date}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
 
-            # 4. Gemini 3.6 Flash 심층 분석
+            # 4. Gemini 3.6 Flash 심층 분석 (매크로 전용 뉴스 연동)
             user_position_text = (
                 f"사용자 현재 보유 정보: 평단가 ${user_avg_price}, 보유 수량 {user_shares}주 (현재 수익률: {my_return_str})"
                 if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
@@ -712,22 +761,25 @@ if analyze_btn:
 3. 내부자 & 기관 수급 (Insider/Inst Own & Trans):
 {ownership_json}
 
-4. 매크로 및 6대 자산 실시간 지표:
+4. 매크로 및 6대 자산 실시간 지표 (출처 및 기준일 포함):
 {macro_json}
 
-5. 주요 섹터 5일 등락률:
+5. 글로벌 거시/시장 주요 뉴스 (6대 자산 분석용):
+{macro_news_json}
+
+6. 주요 섹터 5일 등락률:
 {sector_json}
 
-6. 펀더멘털 및 6대 밸류에이션:
+7. 펀더멘털 및 6대 밸류에이션:
 {fund_json}
 
-7. 사용자 보유 현황:
+8. 사용자 보유 현황:
 {user_position}
 
-8. 최신 주요 기사 (원문 헤드라인 및 세부 요약):
+9. 종목 최신 주요 기사:
 {news_json}
 
-9. 최근 2개월 증권가 투자의견 변동:
+10. 최근 2개월 증권가 투자의견 변동:
 {analyst_json}
 
 ---
@@ -736,10 +788,16 @@ if analyze_btn:
 위 데이터를 바탕으로 최고 수준의 금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
+- **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표(미 국채 10년물 금리, 달러 인덱스, VIX, WTI 유가, 금, 비트코인 등)의 **출처 및 수집 기준일자**를 요약 명시할 것.
 - 경기 국면 (회복 / 활황 / 둔화 / 침체 판정)
 - 단기 변동성 촉발 요인
-- 최신 뉴스와 매크로 지표 기반 [6대 유동성 자산 변동 예측]:
-  * 현금 (달러), 채권 (미 국채), 주식 (위험자산), 코인 (가상자산), 금 (안전자산), 원유 (에너지) 각각의 전망 및 사유
+- 최신 매크로 지표 및 글로벌 거시 뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측]:
+  * 현금 (달러): 전망 (상승/중립/하락) 및 사유
+  * 채권 (미 국채): 금리 경로에 따른 가격 전망 및 사유
+  * 주식 (위험자산): 시장 유동성 및 실적 장세 기반 전망
+  * 코인 (가상자산): 비트코인 등 위험선호 심리 및 유동성 민감도 전망
+  * 금 (원자재/안전자산): 실질금리 및 지정학 리스크 기반 전망
+  * 원유 (에너지): 공급망 및 경기 수요 기반 가격 전망
 - 권장 자산 배분 비중 (주식 : 채권 : 대체자산 : 현금)
 
 2. 섹터 전망 및 순환매
@@ -764,7 +822,7 @@ if analyze_btn:
   * 손절(Stop-loss) 기준선: [구체적 달러 가격대 제시]
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "options_json", "ownership_json", "macro_json", "sector_json", "fund_json", "user_position", "news_json", "analyst_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "options_json", "ownership_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "news_json", "analyst_json"],
                 template=template
             )
             llm = ChatGoogleGenerativeAI(model="gemini-3.6-flash", google_api_key=api_key)
@@ -777,6 +835,7 @@ if analyze_btn:
                 "options_json": json.dumps(options_data, indent=2, ensure_ascii=False) if options_data else "옵션 데이터 없음",
                 "ownership_json": json.dumps(ownership, indent=2, ensure_ascii=False),
                 "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
+                "macro_news_json": json.dumps(macro_news_data, indent=2, ensure_ascii=False),
                 "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
                 "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
                 "user_position": user_position_text,
@@ -798,7 +857,7 @@ if analyze_btn:
             if not response_content:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. 잠시 후 다시 [분석 실행]을 눌러주세요."
 
-            # 📌 [핵심] 영구 저장소에 저장 (history.json 파일에 기록)
+            # 한국 시간(KST) 기준 히스토리 영구 저장
             act, buy_b, tp_b, sell_b, sl_b = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
                 "action": act,
@@ -809,22 +868,35 @@ if analyze_btn:
                 "take_profit": tp_b,
                 "sell_target": sell_b,
                 "stop_loss": sl_b,
-                "time": datetime.now().strftime("%Y-%m-%d %H:%M")
+                "time": get_current_kst_time_str()
             }
             save_history(st.session_state.history)
 
+            # AI 종합 분석 브리핑
             with st.container(border=True):
                 st.markdown("### 📝 **Gemini 3.6 Flash 종합 분석 브리핑**")
                 st.markdown(response_content)
+
+            # 📌 [신규] 6대 유동성 자산 분석에 사용된 거시 기사 원문 및 링크 (접기/펼치기)
+            with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
+                if macro_news_data:
+                    for m_item in macro_news_data:
+                        st.markdown(f"- **[{m_item['title']}]({m_item['link']})**")
+                        if m_item.get("summary"):
+                            st.caption(f"> {m_item['summary']}")
+                        st.caption(f"출처: {m_item['publisher']} | 게시일: {m_item['date']}")
+                        st.write("")
+                else:
+                    st.info("수집된 거시경제 기사가 없습니다.")
             
             st.write("")
 
-            # 5. 하단 뉴스 및 증권가 투자의견
+            # 5. 하단 종목 개별 뉴스 및 증권가 투자의견
             col_left, col_right = st.columns([1.1, 0.9])
             
             with col_left:
                 with st.container(border=True):
-                    st.markdown("##### 📰 **최신 주요 뉴스 및 기사 원문**")
+                    st.markdown(f"##### 📰 **{ticker_input} 최신 주요 뉴스 및 기사 원문**")
                     if news_data:
                         for item in news_data:
                             st.markdown(f"**[{item['title']}]({item['link']})**")
@@ -837,7 +909,7 @@ if analyze_btn:
                         
             with col_right:
                 with st.container(border=True):
-                    st.markdown("##### 🏛️ **최근 2개월 증권가 투자의견 변동**")
+                    st.markdown(f"##### 🏛️ **{ticker_input} 최근 2개월 증권가 투자의견 변동**")
                     if analyst_data:
                         df_analyst = pd.DataFrame(analyst_data)
                         df_analyst.columns = ["일자", "증권사", "투자의견", "액션"]
