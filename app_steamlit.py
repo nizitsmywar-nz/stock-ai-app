@@ -33,6 +33,71 @@ st.set_page_config(
 )
 
 # -------------------------------------------------------------
+# 📌 모바일 전용 반응형 & 텍스트 넘침 방지 커스텀 CSS 주입
+# -------------------------------------------------------------
+st.markdown("""
+<style>
+    /* 1. 전체 화면 가로 스크롤 튀어나감 방지 */
+    html, body, [data-testid="stAppViewContainer"] {
+        overflow-x: hidden !important;
+        max-width: 100vw !important;
+    }
+    
+    /* 2. 텍스트 자동 줄바꿈 및 글자 겹침 방지 */
+    div, p, span, h1, h2, h3, h4, h5, h6 {
+        overflow-wrap: break-word !important;
+        word-break: break-word !important;
+    }
+
+    /* 3. 모바일 화면 최적화 미디어 쿼리 (스마트폰 & 태블릿 세로) */
+    @media (max-width: 768px) {
+        /* 상하/좌우 패딩 축소 */
+        .block-container {
+            padding-top: 1.2rem !important;
+            padding-left: 0.6rem !important;
+            padding-right: 0.6rem !important;
+            padding-bottom: 2rem !important;
+        }
+
+        /* 4열 컬럼을 모바일에서 2열 2행(50%)으로 자동 줄바꿈 */
+        [data-testid="stHorizontalBlock"] {
+            flex-wrap: wrap !important;
+            gap: 8px !important;
+        }
+        
+        [data-testid="stHorizontalBlock"] > [data-testid="column"] {
+            flex: 1 1 calc(50% - 10px) !important;
+            min-width: calc(50% - 10px) !important;
+            max-width: 100% !important;
+            margin-bottom: 4px !important;
+        }
+
+        /* 메트릭 폰트 크기 모바일 축소 */
+        [data-testid="stMetricValue"] {
+            font-size: 1.15rem !important;
+            line-height: 1.25 !important;
+        }
+        [data-testid="stMetricLabel"] {
+            font-size: 0.72rem !important;
+            line-height: 1.2 !important;
+        }
+        [data-testid="stMetricDelta"] {
+            font-size: 0.68rem !important;
+            line-height: 1.2 !important;
+        }
+        
+        /* 헤더 폰트 크기 조정 */
+        h2 {
+            font-size: 1.35rem !important;
+        }
+        h4, h5 {
+            font-size: 0.95rem !important;
+        }
+    }
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------------------------------------------------
 # 0. 영구 저장소 (history.json) 관리 함수
 # -------------------------------------------------------------
 HISTORY_FILE = "history.json"
@@ -251,7 +316,7 @@ def fetch_ownership_and_shorts(stock, info):
         
     short_rat = info.get("shortRatio", None)
     if short_rat is not None:
-        data["short_ratio"] = f"{short_rat:.2f}일 (Days to Cover)"
+        data["short_ratio"] = f"{short_rat:.2f}일"
 
     try:
         ins_df = stock.insider_transactions
@@ -768,7 +833,7 @@ if analyze_btn:
                     op_c1.metric(
                         "콜옵션 Max OI (상방 저항벽)",
                         f"${c_oi['strike']}",
-                        f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,}계약 / 프리미엄: ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}"
+                        f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,} / ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}"
                     )
                     
                     c_vol = options_data['call_max_vol']
@@ -776,7 +841,7 @@ if analyze_btn:
                     op_c2.metric(
                         "콜옵션 Max Vol (당일 상방 수급)",
                         f"${c_vol['strike']}",
-                        f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,}계약 / 프리미엄: ${c_vol['price']})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}"
+                        f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,} / ${c_vol['price']})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}"
                     )
                     
                     p_oi = options_data['put_max_oi']
@@ -784,7 +849,7 @@ if analyze_btn:
                     op_c3.metric(
                         "풋옵션 Max OI (하방 지지벽)",
                         f"${p_oi['strike']}",
-                        f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,}계약 / 프리미엄: ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}"
+                        f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,} / ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}"
                     )
                     
                     p_vol = options_data['put_max_vol']
@@ -792,7 +857,7 @@ if analyze_btn:
                     op_c4.metric(
                         "풋옵션 Max Vol (당일 하방 헤지)",
                         f"${p_vol['strike']}",
-                        f"{diff_p_vol:+.1f}% (Vol: {p_vol['volume']:,}계약 / 프리미엄: ${p_vol['price']})" if diff_p_vol is not None else f"Vol: {p_vol['volume']:,}"
+                        f"{diff_p_vol:+.1f}% (Vol: {p_vol['volume']:,} / ${p_vol['price']})" if diff_p_vol is not None else f"Vol: {p_vol['volume']:,}"
                     )
                 else:
                     st.markdown("##### 🎯 **옵션 체인 스마트머니 포지션**")
