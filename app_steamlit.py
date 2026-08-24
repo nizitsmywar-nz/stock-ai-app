@@ -26,9 +26,32 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# -------------------------------------------------------------
+# 0. 영구 저장소 (history.json) 관리 함수
+# -------------------------------------------------------------
+HISTORY_FILE = "history.json"
+
+def load_history():
+    """파일에서 영구 저장된 히스토리 불러오기"""
+    if os.path.exists(HISTORY_FILE):
+        try:
+            with open(HISTORY_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return {}
+    return {}
+
+def save_history(history_data):
+    """히스토리 데이터를 파일에 영구 저장하기"""
+    try:
+        with open(HISTORY_FILE, "w", encoding="utf-8") as f:
+            json.dump(history_data, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
 # --- 세션 상태 초기화 ---
 if "history" not in st.session_state:
-    st.session_state.history = {}
+    st.session_state.history = load_history()
 
 if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = "TSLA"
@@ -364,22 +387,19 @@ def extract_clean_text(content):
     return str(content)
 
 def parse_full_trading_scenario(text):
-    """AI 응답 텍스트에서 액션(매수/매도/홀딩), 분할매수, 익절가, 매도가, 손절가 정밀 파싱"""
-    action = "홀딩"  # 기본값
+    action = "홀딩"
     buy_band = "분석 리포트 참조"
     take_profit = "분석 리포트 참조"
     sell_target = "분석 리포트 참조"
     stop_loss = "분석 리포트 참조"
     
-    # 1. 투자 의견 (매수/매도/홀딩) 판정
-    if "적극매수" in text or "분할매수" in text or "매수 (" in text or "매수의견" in text:
+    if "적극매수" in text or "분할매수" in text or "매수의견" in text or "매수 (" in text:
         action = "매수"
-    elif "비중축소" in text or "매도" in text or "전량매도" in text:
+    elif "비중축소" in text or "전량매도" in text or "매도 (" in text:
         action = "매도"
     elif "관망" in text or "보유" in text or "홀딩" in text:
         action = "홀딩"
 
-    # 2. 가격대 밴드 파싱
     for line in text.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").strip()
         if "분할 매수" in line_clean or "매수 밴드" in line_clean:
@@ -433,7 +453,7 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
         return []
 
 # -------------------------------------------------------------
-# 2. 사이드바 UI (종목 입력 + 보유 정보 + 매수/매도/홀딩 히스토리 바)
+# 2. 사이드바 UI (영구 히스토리 뷰어)
 # -------------------------------------------------------------
 with st.sidebar:
     st.markdown("### ⚡ **AI Stock Analyst**")
@@ -456,13 +476,13 @@ with st.sidebar:
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.divider()
 
-    # --- 📋 [개선] 매수/매도/홀딩 분류형 트레이딩 히스토리 바 ---
+    # --- 📋 영구 저장 트레이딩 히스토리 바 ---
     st.markdown("#### 📌 **종목별 트레이딩 히스토리**")
     
     if st.session_state.history:
         tab_all, tab_buy, tab_sell, tab_hold = st.tabs(["전체", "🟢매수", "🔴매도", "🟡홀딩"])
         
-        def render_history_card(t_code, data):
+        def render_history_card(tab_prefix, t_code, data):
             action_badge = "🟢 매수" if data['action'] == "매수" else ("🔴 매도" if data['action'] == "매도" else "🟡 홀딩")
             with st.expander(f"**{t_code}** (${data['price']}) | {action_badge}", expanded=False):
                 st.markdown(f"- **현재가:** `${data['price']}`")
@@ -472,49 +492,47 @@ with st.sidebar:
                 st.markdown(f"- **📤 매도가 밴드:** `{data['sell_target']}`")
                 st.markdown(f"- **📥 분할매수 밴드:** `{data['buy_band']}`")
                 st.markdown(f"- **🛑 손절선:** `{data['stop_loss']}`")
-                st.caption(f"분석 시각: {data['time']}")
-                if st.button(f"'{t_code}' 다시 분석", key=f"btn_re_{t_code}_{data['action']}", use_container_width=True):
+                st.caption(f"분석 일시: {data['time']}")
+                if st.button(f"'{t_code}' 다시 분석", key=f"btn_re_{tab_prefix}_{t_code}", use_container_width=True):
                     st.session_state.selected_ticker = t_code
                     st.rerun()
 
-        # 1. 전체 탭
         with tab_all:
             for t_code, data in list(st.session_state.history.items())[::-1]:
-                render_history_card(t_code, data)
+                render_history_card("all", t_code, data)
                 
-        # 2. 매수 탭
         with tab_buy:
             buy_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "매수"]
             if buy_items:
                 for t_code, data in buy_items:
-                    render_history_card(t_code, data)
+                    render_history_card("buy", t_code, data)
             else:
                 st.caption("매수 판정 종목이 없습니다.")
 
-        # 3. 매도 탭
         with tab_sell:
             sell_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "매도"]
             if sell_items:
                 for t_code, data in sell_items:
-                    render_history_card(t_code, data)
+                    render_history_card("sell", t_code, data)
             else:
                 st.caption("매도 판정 종목이 없습니다.")
 
-        # 4. 홀딩 탭
         with tab_hold:
             hold_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "홀딩"]
             if hold_items:
                 for t_code, data in hold_items:
-                    render_history_card(t_code, data)
+                    render_history_card("hold", t_code, data)
             else:
                 st.caption("홀딩/관망 판정 종목이 없습니다.")
                     
         st.write("")
         if st.button("🗑️ 히스토리 전체 삭제", use_container_width=True):
             st.session_state.history = {}
+            if os.path.exists(HISTORY_FILE):
+                os.remove(HISTORY_FILE)
             st.rerun()
     else:
-        st.caption("분석을 실행하면 종목별 매수/매도/홀딩 판정 및 목표가/손절가 밴드가 이곳에 자동 기록됩니다.")
+        st.caption("분석을 실행하면 종목별 매수/매도/홀딩 판정 및 목표가/손절가 밴드가 영구 저장됩니다.")
 
 # -------------------------------------------------------------
 # 3. 메인 분석 화면
@@ -780,7 +798,7 @@ if analyze_btn:
             if not response_content:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. 잠시 후 다시 [분석 실행]을 눌러주세요."
 
-            # 📌 [핵심 개선] 매수/매도/홀딩 및 4대 밴드(익절/매도/분할매수/손절) 정밀 파싱 후 히스토리 즉시 기록
+            # 📌 [핵심] 영구 저장소에 저장 (history.json 파일에 기록)
             act, buy_b, tp_b, sell_b, sl_b = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
                 "action": act,
@@ -791,8 +809,9 @@ if analyze_btn:
                 "take_profit": tp_b,
                 "sell_target": sell_b,
                 "stop_loss": sl_b,
-                "time": datetime.now().strftime("%m-%d %H:%M")
+                "time": datetime.now().strftime("%Y-%m-%d %H:%M")
             }
+            save_history(st.session_state.history)
 
             with st.container(border=True):
                 st.markdown("### 📝 **Gemini 3.6 Flash 종합 분석 브리핑**")
