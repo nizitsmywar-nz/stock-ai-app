@@ -61,7 +61,7 @@ if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = "TSLA"
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈 (기술지표, ATR, 피보나치, 공매도, 실적일정 등)
+# 1. RAG 데이터 수집 모듈
 # -------------------------------------------------------------
 def fetch_stock_technical_data(ticker: str):
     stock = yf.Ticker(ticker)
@@ -69,7 +69,6 @@ def fetch_stock_technical_data(ticker: str):
     if df.empty:
         return {}, "N/A", {}
     
-    # 기본 이동평균 및 모멘텀
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_60'] = df['Close'].rolling(window=60).mean()
     df['SMA_120'] = df['Close'].rolling(window=120).mean()
@@ -79,7 +78,6 @@ def fetch_stock_technical_data(ticker: str):
     df['MACD_Signal'] = macd.macd_signal()
     df['MACD_Hist'] = macd.macd_diff()
     
-    # 📌 2. ATR (14일 평균 변동폭) 계산
     try:
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
     except Exception:
@@ -97,7 +95,6 @@ def fetch_stock_technical_data(ticker: str):
     latest = df.iloc[-1]
     last_date = df.index[-1].strftime("%Y-%m-%d")
     
-    # 📌 5. 최근 6개월 고점/저점 기반 피보나치 되돌림 밴드 계산
     high_6m = float(df['High'].max())
     low_6m = float(df['Low'].min())
     diff_hl = high_6m - low_6m
@@ -232,7 +229,6 @@ def format_market_cap(market_cap):
     return f"${market_cap:,.0f}"
 
 def fetch_ownership_and_shorts(stock, info):
-    """내부자/기관 지분율 + 📌 1. 공매도 수급 데이터 수집"""
     data = {
         "insider_own": "N/A",
         "insider_trans": "N/A",
@@ -249,7 +245,6 @@ def fetch_ownership_and_shorts(stock, info):
     if inst_own_val is not None:
         data["inst_own"] = f"{inst_own_val * 100:.2f}%"
 
-    # 📌 공매도 지표
     short_float = info.get("shortPercentOfFloat", None)
     if short_float is not None:
         data["short_percent_of_float"] = f"{short_float * 100:.2f}%"
@@ -286,7 +281,6 @@ def fetch_ownership_and_shorts(stock, info):
     return data
 
 def fetch_earnings_calendar(stock, info):
-    """📌 3. 차기 실적 발표 일정 및 D-Day 계산"""
     try:
         cal = stock.calendar
         earnings_date_str = "미정"
@@ -308,7 +302,6 @@ def fetch_earnings_calendar(stock, info):
                 val = cal.loc['Earnings Date'].iloc[0]
                 earnings_date_str = str(val)[:10]
         
-        # 52주 최고/최저 및 괴리율 (📌 5번 항목 보완)
         high_52w = info.get("fiftyTwoWeekHigh", "N/A")
         low_52w = info.get("fiftyTwoWeekLow", "N/A")
         
@@ -700,7 +693,7 @@ if analyze_btn:
                     p_c3.metric("현재 평가 금액", f"${total_current:,.2f}")
                     p_c4.metric("평가 손익 (수익률)", f"${pnl_dollar:+,.2f}", f"{pnl_pct:+.2f}%")
 
-            # 1. 상단 핵심 메트릭 (재무 + 실적일정 + 52주 고저)
+            # 1. 상단 핵심 메트릭 (재무 + 스마트머니 8대 지표 완벽 복원)
             with st.container(border=True):
                 st.markdown("**🏢 핵심 시장 및 재무 지표**")
                 r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
@@ -711,11 +704,21 @@ if analyze_btn:
                 
                 st.divider()
                 
-                # 📌 1 & 3. 스마트머니 수급 & 공매도 & 차기 실적 발표 일정
-                st.markdown("**👥 스마트머니 수급, 공매도 및 실적 발표 일정**")
+                # 📌 내부자/기관 지분율 및 최근 매매 변동 (Own & Trans 완벽 복원)
+                st.markdown("**👥 스마트머니 수급 분석 (내부자 & 기관 지분 및 최근 매매)**")
+                own_c1, own_c2, own_c3, own_c4 = st.columns(4)
+                own_c1.metric("Insider Own (내부자 지분)", str(ownership.get('insider_own', 'N/A')))
+                own_c2.metric("Insider Trans (내부자 매매)", str(ownership.get('insider_trans', 'N/A')))
+                own_c3.metric("Inst Own (기관 지분)", str(ownership.get('inst_own', 'N/A')))
+                own_c4.metric("Inst Trans (기관 매매/보유)", str(ownership.get('inst_trans', 'N/A')))
+
+                st.divider()
+
+                # 📌 공매도 수급, 차기 실적 발표일, 52주 최고/최저가
+                st.markdown("**🎯 공매도 수급(Shorts) 및 차기 실적 발표 일정**")
                 s_c1, s_c2, s_c3, s_c4 = st.columns(4)
-                s_c1.metric("Insider / Inst 지분", f"{ownership.get('insider_own', 'N/A')} / {ownership.get('inst_own', 'N/A')}")
-                s_c2.metric("공매도 잔고 비율 (Float)", str(ownership.get('short_percent_of_float', 'N/A')), f"상환소요: {ownership.get('short_ratio', 'N/A')}")
+                s_c1.metric("공매도 잔고 비율 (Float)", str(ownership.get('short_percent_of_float', 'N/A')))
+                s_c2.metric("공매도 상환 소요 일수", str(ownership.get('short_ratio', 'N/A')))
                 s_c3.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
                 
                 high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
@@ -725,7 +728,7 @@ if analyze_btn:
 
                 st.divider()
                 
-                # 📌 2. 변동성(ATR), 기술지표 및 매크로 지표
+                # 변동성(ATR), 기술지표 및 거시지표
                 st.markdown("**📈 변동성(ATR), 기술적 모멘텀 및 거시 지표**")
                 r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
                 r2_c1.metric(
@@ -737,7 +740,7 @@ if analyze_btn:
                 r2_c3.metric("RSI(14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
                 r2_c4.metric("미 10년물 금리 / 달러", f"{macro_data.get('us_10y_yield', {}).get('value', 'N/A')} / {macro_data.get('dollar_index', {}).get('value', 'N/A')}")
 
-            # 📌 5. 최근 6개월 피보나치 되돌림 밴드 컨테이너
+            # 📌 피보나치 되돌림 지지/저항 밴드 컨테이너
             with st.container(border=True):
                 st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
                 fb1, fb2, fb3, fb4 = st.columns(4)
@@ -837,7 +840,7 @@ if analyze_btn:
 
             st.caption(f"🕒 데이터 수집 기준일자: 주가/재무제표 ({stock_date}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
 
-            # 4. Gemini 3.6 Flash 심층 분석 (ATR, 피보나치, 공매도, 실적일정 주입)
+            # 4. Gemini 3.6 Flash 심층 분석
             user_position_text = (
                 f"사용자 현재 보유 정보: 평단가 ${user_avg_price}, 보유 수량 {user_shares}주 (현재 수익률: {my_return_str})"
                 if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
@@ -854,7 +857,7 @@ if analyze_btn:
 3. 가장 빠른 만기 옵션 체인 수급 (콜/풋 Max OI & Volume):
 {options_json}
 
-4. 내부자/기관 지분율 및 공매도 지표 (Short Interest):
+4. 내부자/기관 지분율 및 최근 매매, 공매도 지표 (Short Interest):
 {ownership_json}
 
 5. 실적 발표 일정 및 52주 고저:
@@ -898,7 +901,7 @@ if analyze_btn:
 
 3. 밸류에이션 및 스마트머니/공매도/옵션 수급 분석 ({ticker})
 - 전통 가치모델 vs 성장주 모델 괴리 분석 및 적정주가 밴드 제시
-- **스마트머니 & 공매도 분석**: 내부자/기관 지분 변동, 공매도 잔고율(Short % of Float) 및 숏스퀴즈 잠재력 평가
+- **스마트머니 & 공매도 분석**: 내부자/기관 지분 및 최근 매매 동향, 공매도 잔고율(Short % of Float) 및 숏스퀴즈 잠재력 평가
 - **옵션 체인 분석**: 콜/풋 Max OI 벽 및 P/C Ratio 기반 스마트머니 배팅 평가
 
 4. 종목 종합 평가 및 [정밀 매매 시나리오] ({ticker})
@@ -953,7 +956,6 @@ if analyze_btn:
             if not response_content:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. 잠시 후 다시 [분석 실행]을 눌러주세요."
 
-            # 한국 시간(KST) 기준 히스토리 영구 저장
             act, buy_b, tp_b, sell_b, sl_b = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
                 "action": act,
@@ -968,12 +970,10 @@ if analyze_btn:
             }
             save_history(st.session_state.history)
 
-            # AI 종합 분석 브리핑
             with st.container(border=True):
                 st.markdown("### 📝 **Gemini 3.6 Flash 종합 분석 브리핑**")
                 st.markdown(response_content)
 
-            # 6대 유동성 자산 분석 참고 거시 기사 원문 및 링크 (접기/펼치기)
             with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
                 if macro_news_data:
                     for m_item in macro_news_data:
@@ -987,7 +987,6 @@ if analyze_btn:
             
             st.write("")
 
-            # 5. 하단 종목 개별 뉴스 및 증권가 투자의견
             col_left, col_right = st.columns([1.1, 0.9])
             
             with col_left:
