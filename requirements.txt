@@ -1,0 +1,10 @@
+﻿streamlit
+langchain
+langchain-core
+langchain-google-genai
+yfinance
+pandas
+pandas-datareader
+ta
+python-dotenv
+pydantic
