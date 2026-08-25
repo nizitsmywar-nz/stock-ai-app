@@ -122,7 +122,7 @@ if "last_analysis_result" not in st.session_state:
     st.session_state.last_analysis_result = None
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈
+# 1. RAG 데이터 수집 모듈 (stock.info vs fast_info 판별 로직)
 # -------------------------------------------------------------
 def get_stock_info_with_retry(stock, retries=3):
     for attempt in range(retries):
@@ -618,7 +618,7 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 정밀 파서
+# 📌 정밀 파서 (1차/2차 목표가, 불타기 조건 완벽 추출)
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -846,7 +846,6 @@ if analyze_btn:
         ownership = fund_data.get('ownership_and_shorts', {})
         earnings_info = fund_data.get('earnings_calendar', {})
         
-        # 텍스트 포맷팅 뭉개짐 방지
         my_return_str = "N/A"
         if is_holding and user_avg_price > 0 and user_shares > 0 and curr_p > 0:
             total_invested = user_avg_price * user_shares
@@ -888,7 +887,6 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [핵심 개선] 0선 기준 MACD 질적 분리 및 가격 모순 방지 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 ATR 변동성 데이터 ({ticker}) (기준일: {stock_date}):
@@ -1244,7 +1242,7 @@ if st.session_state.last_analysis_result:
 
     with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
         if res.get("macro_news_data"):
-            for m_item in res["macro_news_data"]:
+            for m_item in res.get("macro_news_data", []):
                 st.markdown(f"- **[{m_item['title']}]({m_item['link']})**")
                 if m_item.get("summary"):
                     st.caption(f"> {m_item['summary']}")
@@ -1257,11 +1255,12 @@ if st.session_state.last_analysis_result:
 
     col_left, col_right = st.columns([1.1, 0.9])
     
+    # 📌 [수정 완료] 캐시된 res["news_data"]를 안전하게 참조
     with col_left:
         with st.container(border=True):
             st.markdown(f"##### 📰 **{res['ticker']} 최신 주요 뉴스 및 기사 원문**")
             if res.get("news_data"):
-                for item in news_data:
+                for item in res.get("news_data", []):
                     st.markdown(f"**[{item['title']}]({item['link']})**")
                     if item.get("summary"):
                         st.markdown(f"> *{item['summary']}*")
@@ -1274,7 +1273,7 @@ if st.session_state.last_analysis_result:
         with st.container(border=True):
             st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 변동**")
             if res.get("analyst_data"):
-                df_analyst = pd.DataFrame(res["analyst_data"])
+                df_analyst = pd.DataFrame(res.get("analyst_data", []))
                 df_analyst.columns = ["일자", "증권사", "투자의견", "액션"]
                 st.dataframe(df_analyst, use_container_width=True, hide_index=True)
             else:
