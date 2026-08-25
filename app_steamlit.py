@@ -618,7 +618,47 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 [핵심 개선] 블록 단위 격리 파서 (대응전략 문장 완벽 추출)
+# 📌 [핵심 로직] 사용자 대응 전략 핵심 액션 압축 요약 함수 (토큰 소모 0)
+# -------------------------------------------------------------
+def summarize_user_strategy(raw_text: str) -> str:
+    """원문 텍스트에서 불필요한 서술어를 걷어내고 실전 매매 액션만 1~2문장으로 압축"""
+    if not raw_text or raw_text == "분석 리포트 참조":
+        return "분석 리포트 참조"
+        
+    text = raw_text.replace("\n", " ").strip()
+    
+    # 1. '보유자:' / '미보유자:' 패턴이 있는 경우 핵심만 분리 압축
+    if "보유자:" in text or "미보유자:" in text:
+        parts = []
+        if "보유자:" in text:
+            holder_part = text.split("보유자:")[1].split("미보유자:")[0].strip()
+            # 첫 문장만 추출
+            first_sen = re.split(r'[.!?]\s+', holder_part)[0].strip()
+            if first_sen:
+                parts.append(f"보유: {first_sen}")
+        if "미보유자:" in text:
+            non_holder_part = text.split("미보유자:")[1].strip()
+            first_sen = re.split(r'[.!?]\s+', non_holder_part)[0].strip()
+            if first_sen:
+                parts.append(f"신규: {first_sen}")
+        if parts:
+            res = " | ".join(parts)
+            return res[:120] + "..." if len(res) > 120 else res
+
+    # 2. 일반 단일 문장인 경우: 핵심 1~2문장만 추출
+    sentences = [s.strip() for s in re.split(r'[.!?]\s+', text) if len(s.strip()) > 5]
+    if not sentences:
+        return text[:100]
+        
+    summary = ". ".join(sentences[:2])
+    if len(summary) > 110:
+        summary = summary[:110] + "..."
+    elif not summary.endswith("."):
+        summary += "."
+    return summary
+
+# -------------------------------------------------------------
+# 📌 [핵심 개선] 블록 단위 격리 파서 (대응전략 요약 연동)
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -628,7 +668,7 @@ def parse_full_trading_scenario(text):
     buy_band = "분석 리포트 참조"
     stop_loss = "분석 리포트 참조"
     pyramiding = ""
-    user_strategy = ""
+    user_strategy_raw = ""
 
     # 1. 최종 투자의견 추출
     match_action = re.search(r"\[최종\s*투자의견\s*[:\-]?\s*([^\]]+)\]", text)
@@ -652,17 +692,17 @@ def parse_full_trading_scenario(text):
                     action = "홀딩"
                 break
 
-    # 2. 사용자 대응 전략 추출 (마크다운 볼드 ** 기호와 무관하게 안전하게 추출)
+    # 2. 사용자 대응 전략 원문 추출
     for line in text.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
         if "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
             if ":" in line_clean:
-                user_strategy = ":".join(line_clean.split(":")[1:]).strip()
+                user_strategy_raw = ":".join(line_clean.split(":")[1:]).strip()
             else:
-                user_strategy = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
+                user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
             break
 
-    # 3. [정밀 매매 시나리오] 블록 내부 텍스트만 분리하여 파싱 (사용자 전략 문장의 키워드 침범 차단)
+    # 3. [정밀 매매 시나리오] 블록 내부 텍스트만 분리하여 파싱
     scenario_block = text
     if "[정밀 매매 시나리오]" in text:
         after_header = text.split("[정밀 매매 시나리오]")[1]
@@ -696,10 +736,10 @@ def parse_full_trading_scenario(text):
             if ":" in line_clean:
                 pyramiding = ":".join(line_clean.split(":")[1:]).strip()
 
-    if not user_strategy:
-        user_strategy = "분석 리포트 참조"
+    # 요약 함수 적용
+    user_strategy_summary = summarize_user_strategy(user_strategy_raw)
 
-    return action, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy
+    return action, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
@@ -769,7 +809,7 @@ with st.sidebar:
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.divider()
 
-    # 📌 종목별 트레이딩 히스토리
+    # 📌 종목별 트레이딩 히스토리 (요약된 대응 전략 표시)
     st.markdown("#### 📌 **종목별 트레이딩 히스토리**")
     
     if st.session_state.history:
@@ -795,12 +835,10 @@ with st.sidebar:
                 if data.get('pyramiding'):
                     st.markdown(f"- **🔥 불타기 조건:** `{data['pyramiding']}`")
                 
-                # 📌 대응 전략 출력 보장
+                # 📌 요약된 대응 전략 출력
                 strat_text = data.get('user_strategy', '')
                 if strat_text and strat_text != "분석 리포트 참조":
-                    st.markdown(f"- **💡 대응 전략:** `{strat_text}`")
-                else:
-                    st.markdown(f"- **💡 대응 전략:** `분석 리포트 참조`")
+                    st.markdown(f"- **💡 대응 요약:** `{strat_text}`")
                     
                 st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
 
@@ -1029,7 +1067,7 @@ if analyze_btn:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
         if response_content and not response_content.startswith("⚠️"):
-            act, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat = parse_full_trading_scenario(response_content)
+            act, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
                 "action": act,
                 "price": curr_p,
@@ -1042,7 +1080,7 @@ if analyze_btn:
                 "buy_band": buy_b,
                 "stop_loss": sl_b,
                 "pyramiding": pyr,
-                "user_strategy": u_strat,
+                "user_strategy": u_strat_summary,
                 "time": get_current_kst_time_str()
             }
             save_history(st.session_state.history)
