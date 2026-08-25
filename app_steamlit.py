@@ -618,7 +618,7 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 정밀 파서 (1차/2차 목표가, 불타기 조건 완벽 추출)
+# 📌 정밀 파서 (1차/2차 목표가, 불타기 조건, 사용자 대응 전략 추출)
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -628,7 +628,9 @@ def parse_full_trading_scenario(text):
     buy_band = "분석 리포트 참조"
     stop_loss = "분석 리포트 참조"
     pyramiding = ""
+    user_strategy = "분석 리포트 참조"
 
+    # 1. 최종 투자의견 추출
     match_action = re.search(r"\[최종\s*투자의견\s*:\s*([^\]]+)\]", text)
     if match_action:
         op_text = match_action.group(1).strip()
@@ -650,6 +652,12 @@ def parse_full_trading_scenario(text):
                     action = "홀딩"
                 break
 
+    # 2. 사용자 대응 전략 추출
+    match_strat = re.search(r"사용자\s*대응\s*전략\s*:\s*([^\n\r]+)", text)
+    if match_strat:
+        user_strategy = match_strat.group(1).replace("*", "").strip()
+
+    # 3. 정밀 시나리오 항목별 라인 파싱
     for line in text.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").strip()
         
@@ -682,7 +690,7 @@ def parse_full_trading_scenario(text):
             if len(parts) > 1:
                 pyramiding = parts[1].strip()
 
-    return action, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding
+    return action, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
@@ -752,6 +760,7 @@ with st.sidebar:
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.divider()
 
+    # 📌 종목별 트레이딩 히스토리 (사용자 대응 전략까지 완벽 표시)
     st.markdown("#### 📌 **종목별 트레이딩 히스토리**")
     
     if st.session_state.history:
@@ -776,6 +785,10 @@ with st.sidebar:
                 
                 if data.get('pyramiding'):
                     st.markdown(f"- **🔥 불타기 조건:** `{data['pyramiding']}`")
+                
+                # 📌 [신규 추가] 사용자 대응 전략 히스토리 출력
+                if data.get('user_strategy'):
+                    st.markdown(f"- **💡 대응 전략:** `{data['user_strategy']}`")
                     
                 st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
 
@@ -887,7 +900,6 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [핵심 개선] % 기호 및 띄어쓰기 누락 방지 강화 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 ATR 변동성 데이터 ({ticker}) (기준일: {stock_date}):
@@ -1005,7 +1017,7 @@ if analyze_btn:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
         if response_content and not response_content.startswith("⚠️"):
-            act, t1, t2, sell_b, buy_b, sl_b, pyr = parse_full_trading_scenario(response_content)
+            act, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
                 "action": act,
                 "price": curr_p,
@@ -1018,6 +1030,7 @@ if analyze_btn:
                 "buy_band": buy_b,
                 "stop_loss": sl_b,
                 "pyramiding": pyr,
+                "user_strategy": u_strat,
                 "time": get_current_kst_time_str()
             }
             save_history(st.session_state.history)
@@ -1237,7 +1250,6 @@ if st.session_state.last_analysis_result:
                 mime="application/json",
                 use_container_width=True
             )
-        # 📌 [핵심 수정] 달러 기호($)를 이스케이프하여 Streamlit의 수식 모드 오작동(공백/기호 증발) 완벽 차단
         clean_rendered_content = re.sub(r'(?<!\\)\$', r'\$', res["response_content"])
         st.markdown(clean_rendered_content)
 
