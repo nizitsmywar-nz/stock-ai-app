@@ -119,13 +119,33 @@ if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = "TSLA"
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈
+# 1. RAG 데이터 수집 모듈 (stock.info 3회 리트라이 탑재)
 # -------------------------------------------------------------
+def get_stock_info_with_retry(stock, retries=3):
+    """stock.info를 최대 3회 재시도하여 가져오는 안전 함수"""
+    for attempt in range(retries):
+        try:
+            info = stock.info
+            # 정상적인 유효 딕셔너리이고 기본 키들이 존재하는지 검증
+            if isinstance(info, dict) and len(info) > 10 and any(k in info for k in ['marketCap', 'trailingPE', 'forwardPE', 'trailingEps', 'bookValue', 'currentPrice']):
+                return info
+        except Exception:
+            pass
+        if attempt < retries - 1:
+            time.sleep(1.0 * (attempt + 1))  # 1초, 2초 지수 백오프
+    # 최종적으로 실패하더라도 빈 dict 대신 가져올 수 있는 최소 info 시도
+    try:
+        return stock.info or {}
+    except Exception:
+        return {}
+
 def fetch_stock_technical_data(ticker: str):
     stock = yf.Ticker(ticker)
-    df = stock.history(period="6mo")
+    df = stock.history(period="1y")
     if df.empty:
-        return {}, "N/A", {}
+        df = stock.history(period="6mo")
+    if df.empty:
+        return {}, "N/A", {}, "N/A", "N/A"
     
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_60'] = df['Close'].rolling(window=60).mean()
@@ -153,8 +173,12 @@ def fetch_stock_technical_data(ticker: str):
     latest = df.iloc[-1]
     last_date = df.index[-1].strftime("%Y-%m-%d")
     
-    high_6m = float(df['High'].max())
-    low_6m = float(df['Low'].min())
+    high_52w_calc = round(float(df['High'].max()), 2)
+    low_52w_calc = round(float(df['Low'].min()), 2)
+    
+    df_6m = df.tail(126) if len(df) >= 126 else df
+    high_6m = float(df_6m['High'].max())
+    low_6m = float(df_6m['Low'].min())
     diff_hl = high_6m - low_6m
     
     fibonacci_levels = {
@@ -184,7 +208,7 @@ def fetch_stock_technical_data(ticker: str):
         "bb_upper": round(float(latest['BB_High']), 2) if pd.notnull(latest['BB_High']) else "N/A",
         "bb_lower": round(float(latest['BB_Low']), 2) if pd.notnull(latest['BB_Low']) else "N/A"
     }
-    return data, last_date, fibonacci_levels
+    return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc
 
 def fetch_nearest_options_data(ticker: str):
     try:
@@ -278,13 +302,17 @@ def fetch_macro_indicators():
 def format_market_cap(market_cap):
     if not market_cap or market_cap == "N/A":
         return "N/A"
-    if market_cap >= 1e12:
-        return f"${market_cap / 1e12:.2f}T"
-    elif market_cap >= 1e9:
-        return f"${market_cap / 1e9:.2f}B"
-    elif market_cap >= 1e6:
-        return f"${market_cap / 1e6:.2f}M"
-    return f"${market_cap:,.0f}"
+    try:
+        mc = float(market_cap)
+        if mc >= 1e12:
+            return f"${mc / 1e12:.2f}T"
+        elif mc >= 1e9:
+            return f"${mc / 1e9:.2f}B"
+        elif mc >= 1e6:
+            return f"${mc / 1e6:.2f}M"
+        return f"${mc:,.0f}"
+    except Exception:
+        return str(market_cap)
 
 def fetch_ownership_and_shorts(stock, info):
     data = {
@@ -295,21 +323,24 @@ def fetch_ownership_and_shorts(stock, info):
         "short_percent_of_float": "N/A",
         "short_ratio": "N/A"
     }
-    ins_own_val = info.get("heldPercentInsiders", None)
-    if ins_own_val is not None:
-        data["insider_own"] = f"{ins_own_val * 100:.2f}%"
-        
-    inst_own_val = info.get("heldPercentInstitutions", None)
-    if inst_own_val is not None:
-        data["inst_own"] = f"{inst_own_val * 100:.2f}%"
+    try:
+        ins_own_val = info.get("heldPercentInsiders", None)
+        if ins_own_val is not None:
+            data["insider_own"] = f"{ins_own_val * 100:.2f}%"
+            
+        inst_own_val = info.get("heldPercentInstitutions", None)
+        if inst_own_val is not None:
+            data["inst_own"] = f"{inst_own_val * 100:.2f}%"
 
-    short_float = info.get("shortPercentOfFloat", None)
-    if short_float is not None:
-        data["short_percent_of_float"] = f"{short_float * 100:.2f}%"
-        
-    short_rat = info.get("shortRatio", None)
-    if short_rat is not None:
-        data["short_ratio"] = f"{short_rat:.2f}일"
+        short_float = info.get("shortPercentOfFloat", None)
+        if short_float is not None:
+            data["short_percent_of_float"] = f"{short_float * 100:.2f}%"
+            
+        short_rat = info.get("shortRatio", None)
+        if short_rat is not None:
+            data["short_ratio"] = f"{short_rat:.2f}일"
+    except Exception:
+        pass
 
     try:
         ins_df = stock.insider_transactions
@@ -338,12 +369,11 @@ def fetch_ownership_and_shorts(stock, info):
 
     return data
 
-def fetch_earnings_calendar(stock, info):
+def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
+    earnings_date_str = "미정"
+    d_day_str = ""
     try:
         cal = stock.calendar
-        earnings_date_str = "미정"
-        d_day_str = ""
-        
         if cal is not None and isinstance(cal, dict) and 'Earnings Date' in cal:
             e_dates = cal['Earnings Date']
             if isinstance(e_dates, list) and e_dates:
@@ -359,80 +389,111 @@ def fetch_earnings_calendar(stock, info):
             if 'Earnings Date' in cal.index:
                 val = cal.loc['Earnings Date'].iloc[0]
                 earnings_date_str = str(val)[:10]
-        
-        high_52w = info.get("fiftyTwoWeekHigh", "N/A")
-        low_52w = info.get("fiftyTwoWeekLow", "N/A")
-        
-        return {
-            "earnings_date": earnings_date_str,
-            "d_day": d_day_str,
-            "fiftyTwoWeekHigh": high_52w,
-            "fiftyTwoWeekLow": low_52w
-        }
     except Exception:
-        return {"earnings_date": "확인불가", "d_day": "", "fiftyTwoWeekHigh": "N/A", "fiftyTwoWeekLow": "N/A"}
+        pass
 
-def fetch_fundamentals_and_valuation(ticker: str):
+    high_52w = info.get("fiftyTwoWeekHigh", None) or high_52_calc
+    low_52w = info.get("fiftyTwoWeekLow", None) or low_52_calc
+
+    return {
+        "earnings_date": earnings_date_str,
+        "d_day": d_day_str,
+        "fiftyTwoWeekHigh": high_52w,
+        "fiftyTwoWeekLow": low_52w
+    }
+
+def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
+    stock = yf.Ticker(ticker)
+    
+    # 📌 stock.info 최대 3회 재시도 호출
+    info = get_stock_info_with_retry(stock, retries=3)
+
+    # 📌 3회 실패 시에만 fast_info 최종 백업 가동
+    fast_info = {}
     try:
-        stock = yf.Ticker(ticker)
-        info = stock.info
-        
-        market_cap = info.get("marketCap", "N/A")
-        trailing_pe = info.get("trailingPE", "N/A")
-        forward_pe = info.get("forwardPE", "N/A")
-        pbr = info.get("priceToBook", "N/A")
-        ps_ratio = info.get("priceToSalesTrailing12Months", "N/A")
-        
-        roe_raw = info.get("returnOnEquity", None)
-        roe_pct = round(roe_raw * 100, 2) if roe_raw is not None else "N/A"
-        eps = info.get("trailingEps", None)
-        forward_eps = info.get("forwardEps", None)
-        bps = info.get("bookValue", None)
-        revenue_per_share = info.get("revenuePerShare", None)
-        target_mean_price = info.get("targetMeanPrice", "N/A")
-        
-        ownership_and_shorts = fetch_ownership_and_shorts(stock, info)
-        earnings_cal = fetch_earnings_calendar(stock, info)
-        
-        earnings_growth = info.get("earningsGrowth", None)
-        if earnings_growth and earnings_growth > 0:
-            est_growth = min(earnings_growth * 100, 35.0)
-        else:
-            est_growth = 20.0
-            
-        value_models = {}
+        if hasattr(stock, 'fast_info') and stock.fast_info:
+            fast_info = stock.fast_info
+    except Exception:
+        pass
+
+    # 시가총액 (info 우선 -> 실패 시 fast_info)
+    market_cap = info.get("marketCap", None)
+    if not market_cap and fast_info:
+        market_cap = getattr(fast_info, 'market_cap', None) or fast_info.get('market_cap', "N/A")
+
+    trailing_pe = info.get("trailingPE", "N/A")
+    forward_pe = info.get("forwardPE", "N/A")
+    pbr = info.get("priceToBook", "N/A")
+    ps_ratio = info.get("priceToSalesTrailing12Months", "N/A")
+    
+    roe_raw = info.get("returnOnEquity", None)
+    roe_pct = round(roe_raw * 100, 2) if roe_raw is not None else "N/A"
+    eps = info.get("trailingEps", None)
+    forward_eps = info.get("forwardEps", None)
+    bps = info.get("bookValue", None)
+    revenue_per_share = info.get("revenuePerShare", None)
+    target_mean_price = info.get("targetMeanPrice", "N/A")
+
+    ownership_and_shorts = fetch_ownership_and_shorts(stock, info)
+    earnings_cal = fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc)
+
+    earnings_growth = info.get("earningsGrowth", None)
+    if earnings_growth and earnings_growth > 0:
+        est_growth = min(earnings_growth * 100, 35.0)
+    else:
+        est_growth = 15.0
+
+    # 가치투자 모델 (Graham, Peter Lynch, ROE-PBR)
+    value_models = {}
+    try:
         if eps and bps and eps > 0 and bps > 0:
-            value_models["graham"] = round(math.sqrt(22.5 * eps * bps), 2)
+            value_models["graham"] = round(math.sqrt(22.5 * float(eps) * float(bps)), 2)
         else:
             value_models["graham"] = "산출불가"
-            
+    except Exception:
+        value_models["graham"] = "산출불가"
+
+    try:
         if eps and eps > 0 and roe_raw and roe_raw > 0:
-            value_models["peter_lynch"] = round(eps * min(roe_raw * 100, 25.0), 2)
+            value_models["peter_lynch"] = round(float(eps) * min(float(roe_raw) * 100, 25.0), 2)
         else:
             value_models["peter_lynch"] = "산출불가"
+    except Exception:
+        value_models["peter_lynch"] = "산출불가"
 
+    try:
         if bps and bps > 0 and roe_raw and roe_raw > 0:
-            value_models["roe_pbr"] = round(bps * (roe_raw / 0.10), 2)
+            value_models["roe_pbr"] = round(float(bps) * (float(roe_raw) / 0.10), 2)
         else:
             value_models["roe_pbr"] = "산출불가"
+    except Exception:
+        value_models["roe_pbr"] = "산출불가"
 
-        growth_models = {}
-        f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
+    # 성장주 모델 (Forward PEG, PSR Target, 2단계 DCF)
+    growth_models = {}
+    f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
+    try:
         if f_eps and f_eps > 0:
-            growth_models["forward_peg"] = round(f_eps * (est_growth * 1.5), 2)
+            growth_models["forward_peg"] = round(float(f_eps) * (est_growth * 1.5), 2)
         else:
             growth_models["forward_peg"] = "산출불가"
+    except Exception:
+        growth_models["forward_peg"] = "산출불가"
 
+    try:
         if revenue_per_share and revenue_per_share > 0:
-            growth_models["psr_target"] = round(revenue_per_share * 8.5, 2)
+            growth_models["psr_target"] = round(float(revenue_per_share) * 5.0, 2)
         else:
             growth_models["psr_target"] = "산출불가"
+    except Exception:
+        growth_models["psr_target"] = "산출불가"
 
+    try:
         if f_eps and f_eps > 0:
             wacc = 0.09
             g_long = 0.025
             pv_sum = 0
-            cur_cf = f_eps
+            cur_cf = float(f_eps)
             for y in range(1, 6):
                 cur_cf *= (1 + est_growth / 100)
                 pv_sum += cur_cf / ((1 + wacc) ** y)
@@ -441,22 +502,22 @@ def fetch_fundamentals_and_valuation(ticker: str):
             growth_models["dcf_growth"] = round(pv_sum + pv_terminal, 2)
         else:
             growth_models["dcf_growth"] = "산출불가"
-
-        return {
-            "market_cap_fmt": format_market_cap(market_cap),
-            "trailing_pe": round(trailing_pe, 2) if isinstance(trailing_pe, (int, float)) else trailing_pe,
-            "forward_pe": round(forward_pe, 2) if isinstance(forward_pe, (int, float)) else forward_pe,
-            "pbr": round(pbr, 2) if isinstance(pbr, (int, float)) else pbr,
-            "ps_ratio": round(ps_ratio, 2) if isinstance(ps_ratio, (int, float)) else ps_ratio,
-            "roe": f"{roe_pct}%" if roe_pct != "N/A" else "N/A",
-            "target_mean_price": target_mean_price,
-            "ownership_and_shorts": ownership_and_shorts,
-            "earnings_calendar": earnings_cal,
-            "value_models": value_models,
-            "growth_models": growth_models
-        }
     except Exception:
-        return {}
+        growth_models["dcf_growth"] = "산출불가"
+
+    return {
+        "market_cap_fmt": format_market_cap(market_cap),
+        "trailing_pe": round(trailing_pe, 2) if isinstance(trailing_pe, (int, float)) else trailing_pe,
+        "forward_pe": round(forward_pe, 2) if isinstance(forward_pe, (int, float)) else forward_pe,
+        "pbr": round(pbr, 2) if isinstance(pbr, (int, float)) else pbr,
+        "ps_ratio": round(ps_ratio, 2) if isinstance(ps_ratio, (int, float)) else ps_ratio,
+        "roe": f"{roe_pct}%" if roe_pct != "N/A" else "N/A",
+        "target_mean_price": target_mean_price,
+        "ownership_and_shorts": ownership_and_shorts,
+        "earnings_calendar": earnings_cal,
+        "value_models": value_models,
+        "growth_models": growth_models
+    }
 
 def fetch_sector_performance():
     sector_etfs = ["XLK", "XLF", "XLE", "XLV", "XLI"]
@@ -629,7 +690,6 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
 with st.sidebar:
     st.markdown("### ⚡ **AI Stock Analyst**")
     
-    # 📌 모델 선택 드롭다운 3종 (기본값: Gemini 3.1 Flash Lite)
     MODEL_OPTIONS = {
         "Gemini 3.1 Flash Lite": "gemini-3.1-flash-lite",
         "Gemini 3.6 Flash Lite": "gemini-3.6-flash-lite",
@@ -639,7 +699,7 @@ with st.sidebar:
     selected_model_label = st.selectbox(
         "🤖 **AI 추론 모델 선택**",
         options=list(MODEL_OPTIONS.keys()),
-        index=0  # 기본값: Gemini 3.1 Flash Lite
+        index=0
     )
     selected_model_id = MODEL_OPTIONS[selected_model_label]
     
@@ -732,17 +792,18 @@ if analyze_btn:
         except Exception:
             api_key = None
             
-    with st.spinner(f"🔍 [{ticker_input}] 실시간 재무/옵션체인/피보나치/공매도/실적일정 수집 및 [{selected_model_label}] 분석 중..."):
-        tech_data, stock_date, fib_levels = fetch_stock_technical_data(ticker_input)
+    with st.spinner(f"🔍 [{ticker_input}] 실시간 재무(최대 3회 재시도)/옵션체인/피보나치/공매도 수집 및 [{selected_model_label}] 분석 중..."):
+        tech_data, stock_date, fib_levels, high_52_calc, low_52_calc = fetch_stock_technical_data(ticker_input)
         options_data = fetch_nearest_options_data(ticker_input)
         macro_data = fetch_macro_indicators()
-        fund_data = fetch_fundamentals_and_valuation(ticker_input)
+        
+        curr_p = tech_data.get('current_price', 0)
+        fund_data = fetch_fundamentals_and_valuation(ticker_input, curr_p, high_52_calc, low_52_calc)
         sector_data = fetch_sector_performance()
         news_data = fetch_news(ticker_input, limit=5)
         macro_news_data = fetch_macro_news(limit=4)
         analyst_data = fetch_recent_upgrades_downgrades(ticker_input, months=2)
         
-        curr_p = tech_data.get('current_price', 0)
         ownership = fund_data.get('ownership_and_shorts', {})
         earnings_info = fund_data.get('earnings_calendar', {})
         
@@ -881,7 +942,7 @@ if analyze_btn:
             
             psr_p = g_models.get('psr_target', 'N/A')
             diff_psr = round(((psr_p - curr_p) / curr_p) * 100, 1) if isinstance(psr_p, (int, float)) and curr_p else None
-            g3.metric("PSR 타깃 매출가치 (8.5배)", f"${psr_p}" if isinstance(psr_p, (int, float)) else str(psr_p), f"{diff_psr:+.1f}%" if diff_psr is not None else None)
+            g3.metric("PSR 타깃 매출가치 (5배)", f"${psr_p}" if isinstance(psr_p, (int, float)) else str(psr_p), f"{diff_psr:+.1f}%" if diff_psr is not None else None)
             
             dcf_p = g_models.get('dcf_growth', 'N/A')
             diff_dcf = round(((dcf_p - curr_p) / curr_p) * 100, 1) if isinstance(dcf_p, (int, float)) and curr_p else None
@@ -1019,7 +1080,6 @@ if analyze_btn:
                 input_variables=["ticker", "stock_date", "tech_json", "fib_json", "options_json", "ownership_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "news_json", "analyst_json"],
                 template=template
             )
-            # 사용자가 선택한 모델 ID로 동적 생성
             llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
             chain = prompt | llm
             
