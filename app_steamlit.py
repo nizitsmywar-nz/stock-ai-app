@@ -118,26 +118,32 @@ if "history" not in st.session_state:
 if "selected_ticker" not in st.session_state:
     st.session_state.selected_ticker = "TSLA"
 
+if "last_analysis_result" not in st.session_state:
+    st.session_state.last_analysis_result = None
+
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈 (stock.info 3회 리트라이 탑재)
+# 1. RAG 데이터 수집 모듈 (stock.info vs fast_info 판별 로직)
 # -------------------------------------------------------------
 def get_stock_info_with_retry(stock, retries=3):
-    """stock.info를 최대 3회 재시도하여 가져오는 안전 함수"""
+    """stock.info를 최대 3회 재시도하고, 출처(stock.info vs fast_info)를 함께 반환"""
     for attempt in range(retries):
         try:
             info = stock.info
-            # 정상적인 유효 딕셔너리이고 기본 키들이 존재하는지 검증
             if isinstance(info, dict) and len(info) > 10 and any(k in info for k in ['marketCap', 'trailingPE', 'forwardPE', 'trailingEps', 'bookValue', 'currentPrice']):
-                return info
+                return info, "stock.info"
         except Exception:
             pass
         if attempt < retries - 1:
-            time.sleep(1.0 * (attempt + 1))  # 1초, 2초 지수 백오프
-    # 최종적으로 실패하더라도 빈 dict 대신 가져올 수 있는 최소 info 시도
+            time.sleep(1.0 * (attempt + 1))
+            
+    # 3회 실패 시 fast_info 출처로 반환
     try:
-        return stock.info or {}
+        fallback_info = stock.info or {}
+        if fallback_info and len(fallback_info) > 5:
+            return fallback_info, "stock.info"
     except Exception:
-        return {}
+        pass
+    return {}, "stock.fast_info"
 
 def fetch_stock_technical_data(ticker: str):
     stock = yf.Ticker(ticker)
@@ -405,10 +411,9 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
     stock = yf.Ticker(ticker)
     
-    # 📌 stock.info 최대 3회 재시도 호출
-    info = get_stock_info_with_retry(stock, retries=3)
+    # 📌 stock.info 3회 재시도 및 실제 출처 판정
+    info, info_source = get_stock_info_with_retry(stock, retries=3)
 
-    # 📌 3회 실패 시에만 fast_info 최종 백업 가동
     fast_info = {}
     try:
         if hasattr(stock, 'fast_info') and stock.fast_info:
@@ -416,7 +421,6 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     except Exception:
         pass
 
-    # 시가총액 (info 우선 -> 실패 시 fast_info)
     market_cap = info.get("marketCap", None)
     if not market_cap and fast_info:
         market_cap = getattr(fast_info, 'market_cap', None) or fast_info.get('market_cap', "N/A")
@@ -443,7 +447,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     else:
         est_growth = 15.0
 
-    # 가치투자 모델 (Graham, Peter Lynch, ROE-PBR)
+    # 가치투자 모델
     value_models = {}
     try:
         if eps and bps and eps > 0 and bps > 0:
@@ -469,7 +473,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     except Exception:
         value_models["roe_pbr"] = "산출불가"
 
-    # 성장주 모델 (Forward PEG, PSR Target, 2단계 DCF)
+    # 성장주 모델
     growth_models = {}
     f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
     try:
@@ -506,6 +510,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         growth_models["dcf_growth"] = "산출불가"
 
     return {
+        "info_source": info_source,
         "market_cap_fmt": format_market_cap(market_cap),
         "trailing_pe": round(trailing_pe, 2) if isinstance(trailing_pe, (int, float)) else trailing_pe,
         "forward_pe": round(forward_pe, 2) if isinstance(forward_pe, (int, float)) else forward_pe,
@@ -727,7 +732,7 @@ with st.sidebar:
     if st.session_state.history:
         tab_all, tab_buy, tab_sell, tab_hold = st.tabs(["전체", "🟢매수", "🔴매도", "🟡홀딩"])
         
-        def render_history_card(tab_prefix, t_code, data):
+        def render_history_card(t_code, data):
             action_badge = "🟢 매수" if data['action'] == "매수" else ("🔴 매도" if data['action'] == "매도" else "🟡 홀딩")
             with st.expander(f"**{t_code}** (${data['price']}) | {action_badge}", expanded=False):
                 st.markdown(f"- **현재가:** `${data['price']}`")
@@ -738,19 +743,16 @@ with st.sidebar:
                 st.markdown(f"- **📥 분할매수 밴드:** `{data['buy_band']}`")
                 st.markdown(f"- **🛑 손절선:** `{data['stop_loss']}`")
                 st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
-                if st.button(f"'{t_code}' 다시 분석", key=f"btn_re_{tab_prefix}_{t_code}", use_container_width=True):
-                    st.session_state.selected_ticker = t_code
-                    st.rerun()
 
         with tab_all:
             for t_code, data in list(st.session_state.history.items())[::-1]:
-                render_history_card("all", t_code, data)
+                render_history_card(t_code, data)
                 
         with tab_buy:
             buy_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "매수"]
             if buy_items:
                 for t_code, data in buy_items:
-                    render_history_card("buy", t_code, data)
+                    render_history_card(t_code, data)
             else:
                 st.caption("매수 판정 종목이 없습니다.")
 
@@ -758,7 +760,7 @@ with st.sidebar:
             sell_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "매도"]
             if sell_items:
                 for t_code, data in sell_items:
-                    render_history_card("sell", t_code, data)
+                    render_history_card(t_code, data)
             else:
                 st.caption("매도 판정 종목이 없습니다.")
 
@@ -766,7 +768,7 @@ with st.sidebar:
             hold_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "홀딩"]
             if hold_items:
                 for t_code, data in hold_items:
-                    render_history_card("hold", t_code, data)
+                    render_history_card(t_code, data)
             else:
                 st.caption("홀딩/관망 판정 종목이 없습니다.")
                     
@@ -780,10 +782,11 @@ with st.sidebar:
         st.caption("분석을 실행하면 종목별 매수/매도/홀딩 판정 및 목표가/손절가 밴드가 영구 저장됩니다.")
 
 # -------------------------------------------------------------
-# 3. 메인 분석 화면
+# 3. 메인 분석 화면 & 분석 완료 즉시 렌더링 로직
 # -------------------------------------------------------------
 st.header(f"📊 {ticker_input} 종합 밸류에이션 & 투자전략 리포트")
 
+# [1] 분석 버튼 클릭 시 실행
 if analyze_btn:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
@@ -804,10 +807,10 @@ if analyze_btn:
         macro_news_data = fetch_macro_news(limit=4)
         analyst_data = fetch_recent_upgrades_downgrades(ticker_input, months=2)
         
+        info_source_flag = fund_data.get('info_source', 'stock.info')
         ownership = fund_data.get('ownership_and_shorts', {})
         earnings_info = fund_data.get('earnings_calendar', {})
         
-        # 💼 보유 주식 평가손익 전용 컨테이너
         my_return_str = "N/A"
         if is_holding and user_avg_price > 0 and user_shares > 0 and curr_p > 0:
             total_invested = user_avg_price * user_shares
@@ -815,162 +818,7 @@ if analyze_btn:
             pnl_dollar = total_current - total_invested
             pnl_pct = ((curr_p - user_avg_price) / user_avg_price) * 100
             my_return_str = f"{pnl_pct:+.2f}%"
-            
-            with st.container(border=True):
-                st.markdown(f"#### 💼 **내 보유 포지션 분석 ({ticker_input})**")
-                p_c1, p_c2, p_c3, p_c4 = st.columns(4)
-                p_c1.metric("내 매수 평단가", f"${user_avg_price:,.2f}", f"{user_shares:,.1f}주 보유")
-                p_c2.metric("총 매수 원금", f"${total_invested:,.2f}")
-                p_c3.metric("현재 평가 금액", f"${total_current:,.2f}")
-                p_c4.metric("평가 손익 (수익률)", f"${pnl_dollar:+,.2f}", f"{pnl_pct:+.2f}%")
 
-        # 1. 상단 핵심 메트릭 (재무 + 스마트머니 8대 지표)
-        with st.container(border=True):
-            st.markdown("**🏢 핵심 시장 및 재무 지표**")
-            r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
-            r1_c1.metric("현재 주가", f"${curr_p}")
-            r1_c2.metric("시가총액", str(fund_data.get('market_cap_fmt', 'N/A')))
-            r1_c3.metric("PER (선행/후행)", f"{fund_data.get('forward_pe', 'N/A')} / {fund_data.get('trailing_pe', 'N/A')}")
-            r1_c4.metric("PBR / PSR", f"{fund_data.get('pbr', 'N/A')} / {fund_data.get('ps_ratio', 'N/A')}")
-            
-            st.divider()
-            
-            st.markdown("**👥 스마트머니 수급 분석 (내부자 & 기관 지분 및 최근 매매)**")
-            own_c1, own_c2, own_c3, own_c4 = st.columns(4)
-            own_c1.metric("Insider Own (내부자 지분)", str(ownership.get('insider_own', 'N/A')))
-            own_c2.metric("Insider Trans (내부자 매매)", str(ownership.get('insider_trans', 'N/A')))
-            own_c3.metric("Inst Own (기관 지분)", str(ownership.get('inst_own', 'N/A')))
-            own_c4.metric("Inst Trans (기관 매매/보유)", str(ownership.get('inst_trans', 'N/A')))
-
-            st.divider()
-
-            st.markdown("**🎯 공매도 수급(Shorts) 및 차기 실적 발표 일정**")
-            s_c1, s_c2, s_c3, s_c4 = st.columns(4)
-            s_c1.metric("공매도 잔고 비율 (Float)", str(ownership.get('short_percent_of_float', 'N/A')))
-            s_c2.metric("공매도 상환 소요 일수", str(ownership.get('short_ratio', 'N/A')))
-            s_c3.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
-            
-            high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
-            low_52 = earnings_info.get('fiftyTwoWeekLow', 'N/A')
-            diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
-            s_c4.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
-
-            st.divider()
-            
-            st.markdown("**📈 변동성(ATR), 기술적 모멘텀 및 거시 지표**")
-            r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
-            r2_c1.metric(
-                "MACD (Signal)", 
-                f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", 
-                f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None
-            )
-            r2_c2.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"1.5x 손절가: ${tech_data.get('atr_stop_1_5x', 'N/A')}")
-            r2_c3.metric("RSI(14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
-            r2_c4.metric("미 10년물 금리 / 달러", f"{macro_data.get('us_10y_yield', {}).get('value', 'N/A')} / {macro_data.get('dollar_index', {}).get('value', 'N/A')}")
-
-        # 📌 피보나치 되돌림 지지/저항 밴드 컨테이너
-        with st.container(border=True):
-            st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
-            fb1, fb2, fb3, fb4 = st.columns(4)
-            
-            f236 = fib_levels.get('fib_236', 'N/A')
-            f382 = fib_levels.get('fib_382', 'N/A')
-            f500 = fib_levels.get('fib_500', 'N/A')
-            f618 = fib_levels.get('fib_618', 'N/A')
-            
-            fb1.metric("23.6% 되돌림 (단기 지지)", f"${f236}", f"{round(((f236-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f236, (int, float)) and curr_p else None)
-            fb2.metric("38.2% 되돌림 (1차 매수 지지)", f"${f382}", f"{round(((f382-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f382, (int, float)) and curr_p else None)
-            fb3.metric("50.0% 하프라인 (추세 기준선)", f"${f500}", f"{round(((f500-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f500, (int, float)) and curr_p else None)
-            fb4.metric("61.8% 되돌림 (강력한 2차 지지)", f"${f618}", f"{round(((f618-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f618, (int, float)) and curr_p else None)
-
-        # 📌 옵션 체인 스마트머니 포지션 카드
-        with st.container(border=True):
-            if options_data:
-                exp_date = options_data['expiration_date']
-                pc_rat = options_data['pc_volume_ratio']
-                st.markdown(f"##### 🎯 **가장 빠른 만기 옵션 체인 스마트머니 포지션** `만기일: {exp_date}` `P/C Ratio: {pc_rat}`")
-                
-                op_c1, op_c2, op_c3, op_c4 = st.columns(4)
-                c_oi = options_data['call_max_oi']
-                diff_c_oi = round(((c_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_oi['strike'], (int, float)) else None
-                op_c1.metric(
-                    "콜옵션 Max OI (상방 저항벽)",
-                    f"${c_oi['strike']}",
-                    f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,} / ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}"
-                )
-                
-                c_vol = options_data['call_max_vol']
-                diff_c_vol = round(((c_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_vol['strike'], (int, float)) else None
-                op_c2.metric(
-                    "콜옵션 Max Vol (당일 상방 수급)",
-                    f"${c_vol['strike']}",
-                    f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,} / ${c_vol['price']})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}"
-                )
-                
-                p_oi = options_data['put_max_oi']
-                diff_p_oi = round(((p_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_oi['strike'], (int, float)) else None
-                op_c3.metric(
-                    "풋옵션 Max OI (하방 지지벽)",
-                    f"${p_oi['strike']}",
-                    f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,} / ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}"
-                )
-                
-                p_vol = options_data['put_max_vol']
-                diff_p_vol = round(((p_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_vol['strike'], (int, float)) else None
-                op_c4.metric(
-                    "풋옵션 Max Vol (당일 하방 헤지)",
-                    f"${p_vol['strike']}",
-                    f"{diff_p_vol:+.1f}% (Vol: {p_vol['volume']:,} / ${p_vol['price']})" if diff_p_vol is not None else f"Vol: {p_vol['volume']:,}"
-                )
-            else:
-                st.markdown("##### 🎯 **옵션 체인 스마트머니 포지션**")
-                st.info("해당 종목은 옵션 체인 거래 데이터가 없거나 수집되지 않았습니다.")
-
-        # 2. 성장주 3대 밸류에이션 모델
-        with st.container(border=True):
-            st.markdown("##### 🚀 **성장주/빅테크 맞춤형 밸류에이션 모델 (Growth Models)**")
-            g_models = fund_data.get('growth_models', {})
-            g1, g2, g3, g4 = st.columns(4)
-            
-            target_p = fund_data.get('target_mean_price', 'N/A')
-            diff_t = round(((target_p - curr_p) / curr_p) * 100, 1) if isinstance(target_p, (int, float)) and curr_p else None
-            g1.metric("IB 컨센서스 목표가", f"${target_p}" if isinstance(target_p, (int, float)) else str(target_p), f"{diff_t:+.1f}%" if diff_t is not None else None)
-            
-            peg_p = g_models.get('forward_peg', 'N/A')
-            diff_peg = round(((peg_p - curr_p) / curr_p) * 100, 1) if isinstance(peg_p, (int, float)) and curr_p else None
-            g2.metric("Forward PEG 1.5 모델", f"${peg_p}" if isinstance(peg_p, (int, float)) else str(peg_p), f"{diff_peg:+.1f}%" if diff_peg is not None else None)
-            
-            psr_p = g_models.get('psr_target', 'N/A')
-            diff_psr = round(((psr_p - curr_p) / curr_p) * 100, 1) if isinstance(psr_p, (int, float)) and curr_p else None
-            g3.metric("PSR 타깃 매출가치 (5배)", f"${psr_p}" if isinstance(psr_p, (int, float)) else str(psr_p), f"{diff_psr:+.1f}%" if diff_psr is not None else None)
-            
-            dcf_p = g_models.get('dcf_growth', 'N/A')
-            diff_dcf = round(((dcf_p - curr_p) / curr_p) * 100, 1) if isinstance(dcf_p, (int, float)) and curr_p else None
-            g4.metric("2단계 DCF 현금흐름 모델", f"${dcf_p}" if isinstance(dcf_p, (int, float)) else str(dcf_p), f"{diff_dcf:+.1f}%" if diff_dcf is not None else None)
-
-        # 3. 전통 가치투자 모델
-        with st.container(border=True):
-            st.markdown("##### 🏛️ **전통 제조업/자산가치 기반 3대 모델 (Value Models - 청산/장부가치 기준)**")
-            v_models = fund_data.get('value_models', {})
-            v1, v2, v3 = st.columns(3)
-            
-            g_val = v_models.get('graham', 'N/A')
-            diff_g = round(((g_val - curr_p) / curr_p) * 100, 1) if isinstance(g_val, (int, float)) and curr_p else None
-            v1.metric("그레이엄 청산가치", f"${g_val}" if isinstance(g_val, (int, float)) else str(g_val), f"{diff_g:+.1f}%" if diff_g is not None else None)
-            
-            l_val = v_models.get('peter_lynch', 'N/A')
-            diff_l = round(((l_val - curr_p) / curr_p) * 100, 1) if isinstance(l_val, (int, float)) and curr_p else None
-            v2.metric("피터 린치 가치모델", f"${l_val}" if isinstance(l_val, (int, float)) else str(l_val), f"{diff_l:+.1f}%" if diff_l is not None else None)
-            
-            r_val = v_models.get('roe_pbr', 'N/A')
-            diff_r = round(((r_val - curr_p) / curr_p) * 100, 1) if isinstance(r_val, (int, float)) and curr_p else None
-            v3.metric("ROE-PBR 자본가치", f"${r_val}" if isinstance(r_val, (int, float)) else str(r_val), f"{diff_r:+.1f}%" if diff_r is not None else None)
-
-        st.caption(f"🕒 데이터 수집 기준일자: 주가/재무제표 ({stock_date}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
-
-        # -------------------------------------------------------------
-        # 📥 RAG 수집 데이터 JSON 패키징
-        # -------------------------------------------------------------
         user_position_text = (
             f"사용자 현재 보유 정보: 평단가 ${user_avg_price}, 보유 수량 {user_shares}주 (현재 수익률: {my_return_str})"
             if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
@@ -979,6 +827,7 @@ if analyze_btn:
         full_rag_payload = {
             "meta": {
                 "ticker": ticker_input,
+                "data_source": info_source_flag,
                 "model_used": selected_model_label,
                 "analysis_requested_at": get_current_kst_time_str(),
                 "stock_data_date": stock_date
@@ -999,10 +848,9 @@ if analyze_btn:
 
         full_json_str = json.dumps(full_rag_payload, indent=2, ensure_ascii=False)
 
-        # 4. 동적 선택된 모델 기반 심층 분석
         response_content = None
         if not api_key:
-            response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼을 눌러 JSON 파일을 다운로드한 뒤 Gemini 채팅창에 붙여넣어 분석을 요청하세요."
+            response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
             template = """
 [RAG 심층 주입 데이터]
@@ -1111,9 +959,8 @@ if analyze_btn:
                     continue
                     
             if not response_content:
-                response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 Gemini 웹에서 분석을 요청하실 수도 있습니다."
+                response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
-        # 히스토리 기록
         if response_content and not response_content.startswith("⚠️"):
             act, buy_b, tp_b, sell_b, sl_b = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
@@ -1129,55 +976,258 @@ if analyze_btn:
             }
             save_history(st.session_state.history)
 
-        # AI 종합 분석 브리핑 & JSON 다운로드 버튼
+        st.session_state.last_analysis_result = {
+            "ticker": ticker_input,
+            "info_source": info_source_flag,
+            "model_label": selected_model_label,
+            "curr_p": curr_p,
+            "is_holding": is_holding,
+            "user_avg_price": user_avg_price,
+            "user_shares": user_shares,
+            "my_return_str": my_return_str,
+            "tech_data": tech_data,
+            "stock_date": stock_date,
+            "fib_levels": fib_levels,
+            "options_data": options_data,
+            "macro_data": macro_data,
+            "fund_data": fund_data,
+            "ownership": ownership,
+            "earnings_info": earnings_info,
+            "response_content": response_content,
+            "full_json_str": full_json_str,
+            "macro_news_data": macro_news_data,
+            "news_data": news_data,
+            "analyst_data": analyst_data
+        }
+        st.rerun()
+
+# [2] 캐시된 분석 결과 렌더링
+if st.session_state.last_analysis_result:
+    res = st.session_state.last_analysis_result
+    curr_p = res["curr_p"]
+    ownership = res["ownership"]
+    earnings_info = res["earnings_info"]
+    tech_data = res["tech_data"]
+    macro_data = res["macro_data"]
+    fib_levels = res["fib_levels"]
+    options_data = res["options_data"]
+    fund_data = res["fund_data"]
+    info_source = res.get("info_source", "stock.info")
+
+    # 📌 [신규] 제목 바로 아래 데이터 소스(stock.info vs fast_info) 표시
+    if info_source == "stock.info":
+        st.markdown("📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` (상세 펀더멘털 & 밸류에이션 정상 수집)")
+    else:
+        st.markdown("📡 **데이터 소스:** `🟡 Yahoo Finance stock.fast_info` (야후 서버 지연으로 인한 간이 시세 백업 데이터 적용)")
+
+    # 💼 보유 주식 평가손익 전용 컨테이너
+    if res["is_holding"] and res["user_avg_price"] > 0 and res["user_shares"] > 0 and curr_p > 0:
+        total_invested = res["user_avg_price"] * res["user_shares"]
+        total_current = curr_p * res["user_shares"]
+        pnl_dollar = total_current - total_invested
+        pnl_pct = ((curr_p - res["user_avg_price"]) / res["user_avg_price"]) * 100
+        
         with st.container(border=True):
-            head_col1, head_col2 = st.columns([0.65, 0.35])
-            with head_col1:
-                st.markdown(f"### 📝 **{selected_model_label} 종합 분석 브리핑**")
-            with head_col2:
-                st.download_button(
-                    label=f"📥 {ticker_input} 분석용 JSON 다운로드",
-                    data=full_json_str,
-                    file_name=f"{ticker_input}_rag_analysis_data_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-            st.markdown(response_content)
+            st.markdown(f"#### 💼 **내 보유 포지션 분석 ({res['ticker']})**")
+            p_c1, p_c2, p_c3, p_c4 = st.columns(4)
+            p_c1.metric("내 매수 평단가", f"${res['user_avg_price']:,.2f}", f"{res['user_shares']:,.1f}주 보유")
+            p_c2.metric("총 매수 원금", f"${total_invested:,.2f}")
+            p_c3.metric("현재 평가 금액", f"${total_current:,.2f}")
+            p_c4.metric("평가 손익 (수익률)", f"${pnl_dollar:+,.2f}", f"{pnl_pct:+.2f}%")
 
-        with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
-            if macro_news_data:
-                for m_item in macro_news_data:
-                    st.markdown(f"- **[{m_item['title']}]({m_item['link']})**")
-                    if m_item.get("summary"):
-                        st.caption(f"> {m_item['summary']}")
-                    st.caption(f"출처: {m_item['publisher']} | 게시일: {m_item['date']}")
-                    st.write("")
+    # 1. 상단 핵심 메트릭
+    with st.container(border=True):
+        st.markdown("**🏢 핵심 시장 및 재무 지표**")
+        r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
+        r1_c1.metric("현재 주가", f"${curr_p}")
+        r1_c2.metric("시가총액", str(fund_data.get('market_cap_fmt', 'N/A')))
+        r1_c3.metric("PER (선행/후행)", f"{fund_data.get('forward_pe', 'N/A')} / {fund_data.get('trailing_pe', 'N/A')}")
+        r1_c4.metric("PBR / PSR", f"{fund_data.get('pbr', 'N/A')} / {fund_data.get('ps_ratio', 'N/A')}")
+        
+        st.divider()
+        
+        st.markdown("**👥 스마트머니 수급 분석 (내부자 & 기관 지분 및 최근 매매)**")
+        own_c1, own_c2, own_c3, own_c4 = st.columns(4)
+        own_c1.metric("Insider Own (내부자 지분)", str(ownership.get('insider_own', 'N/A')))
+        own_c2.metric("Insider Trans (내부자 매매)", str(ownership.get('insider_trans', 'N/A')))
+        own_c3.metric("Inst Own (기관 지분)", str(ownership.get('inst_own', 'N/A')))
+        own_c4.metric("Inst Trans (기관 매매/보유)", str(ownership.get('inst_trans', 'N/A')))
+
+        st.divider()
+
+        st.markdown("**🎯 공매도 수급(Shorts) 및 차기 실적 발표 일정**")
+        s_c1, s_c2, s_c3, s_c4 = st.columns(4)
+        s_c1.metric("공매도 잔고 비율 (Float)", str(ownership.get('short_percent_of_float', 'N/A')))
+        s_c2.metric("공매도 상환 소요 일수", str(ownership.get('short_ratio', 'N/A')))
+        s_c3.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
+        
+        high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
+        low_52 = earnings_info.get('fiftyTwoWeekLow', 'N/A')
+        diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
+        s_c4.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
+
+        st.divider()
+        
+        st.markdown("**📈 변동성(ATR), 기술적 모멘텀 및 거시 지표**")
+        r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
+        r2_c1.metric(
+            "MACD (Signal)", 
+            f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", 
+            f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None
+        )
+        r2_c2.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"1.5x 손절가: ${tech_data.get('atr_stop_1_5x', 'N/A')}")
+        r2_c3.metric("RSI(14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
+        r2_c4.metric("미 10년물 금리 / 달러", f"{macro_data.get('us_10y_yield', {}).get('value', 'N/A')} / {macro_data.get('dollar_index', {}).get('value', 'N/A')}")
+
+    # 📌 피보나치 되돌림 컨테이너
+    with st.container(border=True):
+        st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
+        fb1, fb2, fb3, fb4 = st.columns(4)
+        
+        f236 = fib_levels.get('fib_236', 'N/A')
+        f382 = fib_levels.get('fib_382', 'N/A')
+        f500 = fib_levels.get('fib_500', 'N/A')
+        f618 = fib_levels.get('fib_618', 'N/A')
+        
+        fb1.metric("23.6% 되돌림 (단기 지지)", f"${f236}", f"{round(((f236-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f236, (int, float)) and curr_p else None)
+        fb2.metric("38.2% 되돌림 (1차 매수 지지)", f"${f382}", f"{round(((f382-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f382, (int, float)) and curr_p else None)
+        fb3.metric("50.0% 하프라인 (추세 기준선)", f"${f500}", f"{round(((f500-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f500, (int, float)) and curr_p else None)
+        fb4.metric("61.8% 되돌림 (강력한 2차 지지)", f"${f618}", f"{round(((f618-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f618, (int, float)) and curr_p else None)
+
+    # 📌 옵션 체인 컨테이너
+    with st.container(border=True):
+        if options_data:
+            exp_date = options_data['expiration_date']
+            pc_rat = options_data['pc_volume_ratio']
+            st.markdown(f"##### 🎯 **가장 빠른 만기 옵션 체인 스마트머니 포지션** `만기일: {exp_date}` `P/C Ratio: {pc_rat}`")
+            
+            op_c1, op_c2, op_c3, op_c4 = st.columns(4)
+            c_oi = options_data['call_max_oi']
+            diff_c_oi = round(((c_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_oi['strike'], (int, float)) else None
+            op_c1.metric(
+                "콜옵션 Max OI (상방 저항벽)",
+                f"${c_oi['strike']}",
+                f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,} / ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}"
+            )
+            
+            c_vol = options_data['call_max_vol']
+            diff_c_vol = round(((c_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_vol['strike'], (int, float)) else None
+            op_c2.metric(
+                "콜옵션 Max Vol (당일 상방 수급)",
+                f"${c_vol['strike']}",
+                f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,} / ${c_vol['price']})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}"
+            )
+            
+            p_oi = options_data['put_max_oi']
+            diff_p_oi = round(((p_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_oi['strike'], (int, float)) else None
+            op_c3.metric(
+                "풋옵션 Max OI (하방 지지벽)",
+                f"${p_oi['strike']}",
+                f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,} / ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}"
+            )
+            
+            p_vol = options_data['put_max_vol']
+            diff_p_vol = round(((p_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_vol['strike'], (int, float)) else None
+            op_c4.metric(
+                "풋옵션 Max Vol (당일 하방 헤지)",
+                f"${p_vol['strike']}",
+                f"{diff_p_vol:+.1f}% (Vol: {p_vol['volume']:,} / ${p_vol['price']})" if diff_p_vol is not None else f"Vol: {p_vol['volume']:,}"
+            )
+        else:
+            st.markdown("##### 🎯 **옵션 체인 스마트머니 포지션**")
+            st.info("해당 종목은 옵션 체인 거래 데이터가 없거나 수집되지 않았습니다.")
+
+    # 2. 성장주 3대 밸류에이션 모델
+    with st.container(border=True):
+        st.markdown("##### 🚀 **성장주/빅테크 맞춤형 밸류에이션 모델 (Growth Models)**")
+        g_models = fund_data.get('growth_models', {})
+        g1, g2, g3, g4 = st.columns(4)
+        
+        target_p = fund_data.get('target_mean_price', 'N/A')
+        diff_t = round(((target_p - curr_p) / curr_p) * 100, 1) if isinstance(target_p, (int, float)) and curr_p else None
+        g1.metric("IB 컨센서스 목표가", f"${target_p}" if isinstance(target_p, (int, float)) else str(target_p), f"{diff_t:+.1f}%" if diff_t is not None else None)
+        
+        peg_p = g_models.get('forward_peg', 'N/A')
+        diff_peg = round(((peg_p - curr_p) / curr_p) * 100, 1) if isinstance(peg_p, (int, float)) and curr_p else None
+        g2.metric("Forward PEG 1.5 모델", f"${peg_p}" if isinstance(peg_p, (int, float)) else str(peg_p), f"{diff_peg:+.1f}%" if diff_peg is not None else None)
+        
+        psr_p = g_models.get('psr_target', 'N/A')
+        diff_psr = round(((psr_p - curr_p) / curr_p) * 100, 1) if isinstance(psr_p, (int, float)) and curr_p else None
+        g3.metric("PSR 타깃 매출가치 (5배)", f"${psr_p}" if isinstance(psr_p, (int, float)) else str(psr_p), f"{diff_psr:+.1f}%" if diff_psr is not None else None)
+        
+        dcf_p = g_models.get('dcf_growth', 'N/A')
+        diff_dcf = round(((dcf_p - curr_p) / curr_p) * 100, 1) if isinstance(dcf_p, (int, float)) and curr_p else None
+        g4.metric("2단계 DCF 현금흐름 모델", f"${dcf_p}" if isinstance(dcf_p, (int, float)) else str(dcf_p), f"{diff_dcf:+.1f}%" if diff_dcf is not None else None)
+
+    # 3. 전통 가치투자 모델
+    with st.container(border=True):
+        st.markdown("##### 🏛️ **전통 제조업/자산가치 기반 3대 모델 (Value Models - 청산/장부가치 기준)**")
+        v_models = fund_data.get('value_models', {})
+        v1, v2, v3 = st.columns(3)
+        
+        g_val = v_models.get('graham', 'N/A')
+        diff_g = round(((g_val - curr_p) / curr_p) * 100, 1) if isinstance(g_val, (int, float)) and curr_p else None
+        v1.metric("그레이엄 청산가치", f"${g_val}" if isinstance(g_val, (int, float)) else str(g_val), f"{diff_g:+.1f}%" if diff_g is not None else None)
+        
+        l_val = v_models.get('peter_lynch', 'N/A')
+        diff_l = round(((l_val - curr_p) / curr_p) * 100, 1) if isinstance(l_val, (int, float)) and curr_p else None
+        v2.metric("피터 린치 가치모델", f"${l_val}" if isinstance(l_val, (int, float)) else str(l_val), f"{diff_l:+.1f}%" if diff_l is not None else None)
+        
+        r_val = v_models.get('roe_pbr', 'N/A')
+        diff_r = round(((r_val - curr_p) / curr_p) * 100, 1) if isinstance(r_val, (int, float)) and curr_p else None
+        v3.metric("ROE-PBR 자본가치", f"${r_val}" if isinstance(r_val, (int, float)) else str(r_val), f"{diff_r:+.1f}%" if diff_r is not None else None)
+
+    st.caption(f"🕒 데이터 수집 기준일자: 주가/재무제표 ({res['stock_date']}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
+
+    # AI 종합 분석 브리핑 & JSON 다운로드 버튼
+    with st.container(border=True):
+        head_col1, head_col2 = st.columns([0.65, 0.35])
+        with head_col1:
+            st.markdown(f"### 📝 **{res['model_label']} 종합 분석 브리핑**")
+        with head_col2:
+            st.download_button(
+                label=f"📥 {res['ticker']} 분석용 JSON 다운로드",
+                data=res["full_json_str"],
+                file_name=f"{res['ticker']}_rag_analysis_data_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        st.markdown(res["response_content"])
+
+    with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
+        if res["macro_news_data"]:
+            for m_item in macro_news_data:
+                st.markdown(f"- **[{m_item['title']}]({m_item['link']})**")
+                if m_item.get("summary"):
+                    st.caption(f"> {m_item['summary']}")
+                st.caption(f"출처: {m_item['publisher']} | 게시일: {m_item['date']}")
+                st.write("")
+        else:
+            st.info("수집된 거시경제 기사가 없습니다.")
+    
+    st.write("")
+
+    col_left, col_right = st.columns([1.1, 0.9])
+    
+    with col_left:
+        with st.container(border=True):
+            st.markdown(f"##### 📰 **{res['ticker']} 최신 주요 뉴스 및 기사 원문**")
+            if res["news_data"]:
+                for item in news_data:
+                    st.markdown(f"**[{item['title']}]({item['link']})**")
+                    if item.get("summary"):
+                        st.markdown(f"> *{item['summary']}*")
+                    st.caption(f"출처: {item['publisher']} | {item['date']}")
+                    st.divider()
             else:
-                st.info("수집된 거시경제 기사가 없습니다.")
-        
-        st.write("")
-
-        col_left, col_right = st.columns([1.1, 0.9])
-        
-        with col_left:
-            with st.container(border=True):
-                st.markdown(f"##### 📰 **{ticker_input} 최신 주요 뉴스 및 기사 원문**")
-                if news_data:
-                    for item in news_data:
-                        st.markdown(f"**[{item['title']}]({item['link']})**")
-                        if item.get("summary"):
-                            st.markdown(f"> *{item['summary']}*")
-                        st.caption(f"출처: {item['publisher']} | {item['date']}")
-                        st.divider()
-                else:
-                    st.info("수집된 최신 뉴스가 없습니다.")
-                    
-        with col_right:
-            with st.container(border=True):
-                st.markdown(f"##### 🏛️ **{ticker_input} 최근 2개월 증권가 투자의견 변동**")
-                if analyst_data:
-                    df_analyst = pd.DataFrame(analyst_data)
-                    df_analyst.columns = ["일자", "증권사", "투자의견", "액션"]
-                    st.dataframe(df_analyst, use_container_width=True, hide_index=True)
-                else:
-                    st.info("최근 2개월간 등록된 투자의견 변동 내역이 없습니다.")
+                st.info("수집된 최신 뉴스가 없습니다.")
+                
+    with col_right:
+        with st.container(border=True):
+            st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 변동**")
+            if res["analyst_data"]:
+                df_analyst = pd.DataFrame(res["analyst_data"])
+                df_analyst.columns = ["일자", "증권사", "투자의견", "액션"]
+                st.dataframe(df_analyst, use_container_width=True, hide_index=True)
+            else:
+                st.info("최근 2개월간 등록된 투자의견 변동 내역이 없습니다.")
