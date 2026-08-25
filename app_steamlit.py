@@ -136,7 +136,6 @@ def get_stock_info_with_retry(stock, retries=3):
         if attempt < retries - 1:
             time.sleep(1.0 * (attempt + 1))
             
-    # 3회 실패 시 fast_info 출처로 반환
     try:
         fallback_info = stock.info or {}
         if fallback_info and len(fallback_info) > 5:
@@ -410,8 +409,6 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
 
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
     stock = yf.Ticker(ticker)
-    
-    # 📌 stock.info 3회 재시도 및 실제 출처 판정
     info, info_source = get_stock_info_with_retry(stock, retries=3)
 
     fast_info = {}
@@ -1014,7 +1011,6 @@ if st.session_state.last_analysis_result:
     fund_data = res["fund_data"]
     info_source = res.get("info_source", "stock.info")
 
-    # 📌 [신규] 제목 바로 아래 데이터 소스(stock.info vs fast_info) 표시
     if info_source == "stock.info":
         st.markdown("📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` (상세 펀더멘털 & 밸류에이션 정상 수집)")
     else:
@@ -1194,9 +1190,10 @@ if st.session_state.last_analysis_result:
             )
         st.markdown(res["response_content"])
 
+    # 📌 안전하게 res에서 거시 뉴스 추출
     with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
-        if res["macro_news_data"]:
-            for m_item in macro_news_data:
+        if res.get("macro_news_data"):
+            for m_item in res["macro_news_data"]:
                 st.markdown(f"- **[{m_item['title']}]({m_item['link']})**")
                 if m_item.get("summary"):
                     st.caption(f"> {m_item['summary']}")
@@ -1209,11 +1206,12 @@ if st.session_state.last_analysis_result:
 
     col_left, col_right = st.columns([1.1, 0.9])
     
+    # 📌 안전하게 res에서 종목별 뉴스 추출
     with col_left:
         with st.container(border=True):
             st.markdown(f"##### 📰 **{res['ticker']} 최신 주요 뉴스 및 기사 원문**")
-            if res["news_data"]:
-                for item in news_data:
+            if res.get("news_data"):
+                for item in res["news_data"]:
                     st.markdown(f"**[{item['title']}]({item['link']})**")
                     if item.get("summary"):
                         st.markdown(f"> *{item['summary']}*")
@@ -1222,10 +1220,11 @@ if st.session_state.last_analysis_result:
             else:
                 st.info("수집된 최신 뉴스가 없습니다.")
                 
+    # 📌 안전하게 res에서 투자의견 추출
     with col_right:
         with st.container(border=True):
             st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 변동**")
-            if res["analyst_data"]:
+            if res.get("analyst_data"):
                 df_analyst = pd.DataFrame(res["analyst_data"])
                 df_analyst.columns = ["일자", "증권사", "투자의견", "액션"]
                 st.dataframe(df_analyst, use_container_width=True, hide_index=True)
