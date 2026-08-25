@@ -618,7 +618,7 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 정밀 파서 (1차/2차 목표가, 불타기 조건, 사용자 대응 전략 추출)
+# 📌 [핵심 개선] 블록 단위 격리 파서 (손절선-대응전략 텍스트 엉킴 완벽 차단)
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -640,25 +640,22 @@ def parse_full_trading_scenario(text):
             action = "매도"
         elif "홀딩" in op_text or "보유" in op_text or "관망" in op_text:
             action = "홀딩"
-    else:
-        for line in text.split("\n"):
-            line_str = line.replace("*", "").replace("#", "").strip()
-            if "최종 투자 의견" in line_str or "최종 투자의견" in line_str:
-                if "적극매수" in line_str or "분할매수" in line_str:
-                    action = "매수"
-                elif "비중축소" in line_str or "매도" in line_str or "차익실현" in line_str:
-                    action = "매도"
-                elif "홀딩" in line_str or "보유" in line_str or "관망" in line_str:
-                    action = "홀딩"
-                break
 
-    # 2. 사용자 대응 전략 추출
+    # 2. 사용자 대응 전략 독립 추출 (정규식 앵커)
     match_strat = re.search(r"사용자\s*대응\s*전략\s*:\s*([^\n\r]+)", text)
     if match_strat:
         user_strategy = match_strat.group(1).replace("*", "").strip()
 
-    # 3. 정밀 시나리오 항목별 라인 파싱
-    for line in text.split("\n"):
+    # 3. [정밀 매매 시나리오] 블록 내부 텍스트만 분리하여 파싱 (사용자 전략 문장의 '손절' 키워드 침범 차단)
+    scenario_block = text
+    if "[정밀 매매 시나리오]" in text:
+        after_header = text.split("[정밀 매매 시나리오]")[1]
+        if "[최종 투자의견" in after_header:
+            scenario_block = after_header.split("[최종 투자의견")[0]
+        else:
+            scenario_block = after_header
+
+    for line in scenario_block.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").strip()
         
         if "1차 목표가" in line_clean or "1차목표가" in line_clean:
@@ -760,7 +757,6 @@ with st.sidebar:
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.divider()
 
-    # 📌 종목별 트레이딩 히스토리 (사용자 대응 전략까지 완벽 표시)
     st.markdown("#### 📌 **종목별 트레이딩 히스토리**")
     
     if st.session_state.history:
@@ -786,8 +782,7 @@ with st.sidebar:
                 if data.get('pyramiding'):
                     st.markdown(f"- **🔥 불타기 조건:** `{data['pyramiding']}`")
                 
-                # 📌 [신규 추가] 사용자 대응 전략 히스토리 출력
-                if data.get('user_strategy'):
+                if data.get('user_strategy') and data['user_strategy'] != "분석 리포트 참조":
                     st.markdown(f"- **💡 대응 전략:** `{data['user_strategy']}`")
                     
                 st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
