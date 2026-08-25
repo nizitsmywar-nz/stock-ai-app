@@ -209,7 +209,7 @@ def fetch_stock_technical_data(ticker: str):
         "macd": round(float(latest['MACD']), 2) if pd.notnull(latest['MACD']) else "N/A",
         "macd_signal": round(float(latest['MACD_Signal']), 2) if pd.notnull(latest['MACD_Signal']) else "N/A",
         "macd_hist": round(float(latest['MACD_Hist']), 2) if pd.notnull(latest['MACD_Hist']) else "N/A",
-        "bb_upper": round(float(latest['BB_High']), 2) if pd.notnull(latest['BB_High']),
+        "bb_upper": round(float(latest['BB_High']), 2) if pd.notnull(latest['BB_High']) else "N/A",
         "bb_lower": round(float(latest['BB_Low']), 2) if pd.notnull(latest['BB_Low']) else "N/A"
     }
     return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc
@@ -620,7 +620,7 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 [핵심 개선] 엄격한 정밀 파서 (단순 키워드 매칭 오류 완벽 해결)
+# 📌 [핵심 개선] 엄격한 정밀 파서
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -629,7 +629,6 @@ def parse_full_trading_scenario(text):
     sell_target = "분석 리포트 참조"
     stop_loss = "분석 리포트 참조"
     
-    # 1. [최종 투자의견: ...] 라인에서만 정확하게 액션 추출
     match_action = re.search(r"\[최종\s*투자의견\s*:\s*([^\]]+)\]", text)
     if match_action:
         op_text = match_action.group(1).strip()
@@ -640,7 +639,6 @@ def parse_full_trading_scenario(text):
         elif "홀딩" in op_text or "보유" in op_text or "관망" in op_text:
             action = "홀딩"
     else:
-        # 태그가 누락된 경우의 보조 추출 (최종 투자 의견 섹션 라인만 검색)
         for line in text.split("\n"):
             line_str = line.replace("*", "").replace("#", "").strip()
             if "최종 투자 의견" in line_str or "최종 투자의견" in line_str:
@@ -652,7 +650,6 @@ def parse_full_trading_scenario(text):
                     action = "홀딩"
                 break
 
-    # 2. 가격 밴드 라인 파싱
     for line in text.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").strip()
         if "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean:
@@ -984,7 +981,6 @@ if analyze_btn:
             if not response_content:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
-        # 📌 개선된 정밀 파서로 정확한 액션 추출
         if response_content and not response_content.startswith("⚠️"):
             act, buy_b, tp_b, sell_b, sl_b = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
