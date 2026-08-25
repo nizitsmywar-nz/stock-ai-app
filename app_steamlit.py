@@ -618,7 +618,7 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 [핵심 개선] 블록 단위 격리 파서 (손절선-대응전략 텍스트 엉킴 완벽 차단)
+# 📌 [핵심 개선] 블록 단위 격리 파서 (대응전략 문장 완벽 추출)
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -628,10 +628,10 @@ def parse_full_trading_scenario(text):
     buy_band = "분석 리포트 참조"
     stop_loss = "분석 리포트 참조"
     pyramiding = ""
-    user_strategy = "분석 리포트 참조"
+    user_strategy = ""
 
     # 1. 최종 투자의견 추출
-    match_action = re.search(r"\[최종\s*투자의견\s*:\s*([^\]]+)\]", text)
+    match_action = re.search(r"\[최종\s*투자의견\s*[:\-]?\s*([^\]]+)\]", text)
     if match_action:
         op_text = match_action.group(1).strip()
         if "매수" in op_text and "관망" not in op_text and "보유" not in op_text:
@@ -640,13 +640,29 @@ def parse_full_trading_scenario(text):
             action = "매도"
         elif "홀딩" in op_text or "보유" in op_text or "관망" in op_text:
             action = "홀딩"
+    else:
+        for line in text.split("\n"):
+            line_str = line.replace("*", "").replace("#", "").replace("-", "").replace("•", "").strip()
+            if "최종 투자 의견" in line_str or "최종 투자의견" in line_str:
+                if "적극매수" in line_str or "분할매수" in line_str:
+                    action = "매수"
+                elif "비중축소" in line_str or "매도" in line_str or "차익실현" in line_str:
+                    action = "매도"
+                elif "홀딩" in line_str or "보유" in line_str or "관망" in line_str:
+                    action = "홀딩"
+                break
 
-    # 2. 사용자 대응 전략 독립 추출 (정규식 앵커)
-    match_strat = re.search(r"사용자\s*대응\s*전략\s*:\s*([^\n\r]+)", text)
-    if match_strat:
-        user_strategy = match_strat.group(1).replace("*", "").strip()
+    # 2. 사용자 대응 전략 추출 (마크다운 볼드 ** 기호와 무관하게 안전하게 추출)
+    for line in text.split("\n"):
+        line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
+        if "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
+            if ":" in line_clean:
+                user_strategy = ":".join(line_clean.split(":")[1:]).strip()
+            else:
+                user_strategy = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
+            break
 
-    # 3. [정밀 매매 시나리오] 블록 내부 텍스트만 분리하여 파싱 (사용자 전략 문장의 '손절' 키워드 침범 차단)
+    # 3. [정밀 매매 시나리오] 블록 내부 텍스트만 분리하여 파싱 (사용자 전략 문장의 키워드 침범 차단)
     scenario_block = text
     if "[정밀 매매 시나리오]" in text:
         after_header = text.split("[정밀 매매 시나리오]")[1]
@@ -656,36 +672,32 @@ def parse_full_trading_scenario(text):
             scenario_block = after_header
 
     for line in scenario_block.split("\n"):
-        line_clean = line.replace("*", "").replace("-", "").strip()
+        line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
         
         if "1차 목표가" in line_clean or "1차목표가" in line_clean:
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                target_1 = parts[1].strip()
+            if ":" in line_clean:
+                target_1 = ":".join(line_clean.split(":")[1:]).strip()
         elif "2차 목표가" in line_clean or "2차목표가" in line_clean:
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                target_2 = parts[1].strip()
+            if ":" in line_clean:
+                target_2 = ":".join(line_clean.split(":")[1:]).strip()
         elif ("목표가" in line_clean or "익절 라인" in line_clean or "익절/" in line_clean) and target_1 == "분석 리포트 참조":
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                target_1 = parts[1].strip()
-        elif "매도가 밴드" in line_clean or "비중축소(익절) 밴드" in line_clean or "비중축소 밴드" in line_clean:
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                sell_target = parts[1].strip()
-        elif "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean:
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                buy_band = parts[1].strip()
+            if ":" in line_clean:
+                target_1 = ":".join(line_clean.split(":")[1:]).strip()
+        elif "매도가 밴드" in line_clean or "비중축소(익절) 밴드" in line_clean or "비중축소 밴드" in line_clean or "매도가" in line_clean:
+            if ":" in line_clean:
+                sell_target = ":".join(line_clean.split(":")[1:]).strip()
+        elif "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean or "분할 매수" in line_clean:
+            if ":" in line_clean:
+                buy_band = ":".join(line_clean.split(":")[1:]).strip()
         elif "손절" in line_clean or "Stop-loss" in line_clean:
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                stop_loss = parts[1].strip()
+            if ":" in line_clean:
+                stop_loss = ":".join(line_clean.split(":")[1:]).strip()
         elif "불타기 조건" in line_clean or "불타기" in line_clean or "추가 매수 조건" in line_clean:
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                pyramiding = parts[1].strip()
+            if ":" in line_clean:
+                pyramiding = ":".join(line_clean.split(":")[1:]).strip()
+
+    if not user_strategy:
+        user_strategy = "분석 리포트 참조"
 
     return action, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy
 
@@ -757,6 +769,7 @@ with st.sidebar:
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.divider()
 
+    # 📌 종목별 트레이딩 히스토리
     st.markdown("#### 📌 **종목별 트레이딩 히스토리**")
     
     if st.session_state.history:
@@ -782,8 +795,12 @@ with st.sidebar:
                 if data.get('pyramiding'):
                     st.markdown(f"- **🔥 불타기 조건:** `{data['pyramiding']}`")
                 
-                if data.get('user_strategy') and data['user_strategy'] != "분석 리포트 참조":
-                    st.markdown(f"- **💡 대응 전략:** `{data['user_strategy']}`")
+                # 📌 대응 전략 출력 보장
+                strat_text = data.get('user_strategy', '')
+                if strat_text and strat_text != "분석 리포트 참조":
+                    st.markdown(f"- **💡 대응 전략:** `{strat_text}`")
+                else:
+                    st.markdown(f"- **💡 대응 전략:** `분석 리포트 참조`")
                     
                 st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
 
