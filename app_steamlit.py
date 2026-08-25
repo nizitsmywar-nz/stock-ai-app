@@ -125,7 +125,6 @@ if "last_analysis_result" not in st.session_state:
 # 1. RAG 데이터 수집 모듈 (stock.info vs fast_info 판별 로직)
 # -------------------------------------------------------------
 def get_stock_info_with_retry(stock, retries=3):
-    """stock.info를 최대 3회 재시도하고, 출처(stock.info vs fast_info)를 함께 반환"""
     for attempt in range(retries):
         try:
             info = stock.info
@@ -210,7 +209,7 @@ def fetch_stock_technical_data(ticker: str):
         "macd": round(float(latest['MACD']), 2) if pd.notnull(latest['MACD']) else "N/A",
         "macd_signal": round(float(latest['MACD_Signal']), 2) if pd.notnull(latest['MACD_Signal']) else "N/A",
         "macd_hist": round(float(latest['MACD_Hist']), 2) if pd.notnull(latest['MACD_Hist']) else "N/A",
-        "bb_upper": round(float(latest['BB_High']), 2) if pd.notnull(latest['BB_High']) else "N/A",
+        "bb_upper": round(float(latest['BB_High']), 2) if pd.notnull(latest['BB_High']),
         "bb_lower": round(float(latest['BB_Low']), 2) if pd.notnull(latest['BB_Low']) else "N/A"
     }
     return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc
@@ -620,6 +619,9 @@ def extract_clean_text(content):
         return "\n".join([p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in content])
     return str(content)
 
+# -------------------------------------------------------------
+# 📌 [핵심 개선] 엄격한 정밀 파서 (단순 키워드 매칭 오류 완벽 해결)
+# -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
     buy_band = "분석 리포트 참조"
@@ -627,25 +629,43 @@ def parse_full_trading_scenario(text):
     sell_target = "분석 리포트 참조"
     stop_loss = "분석 리포트 참조"
     
-    if "적극매수" in text or "분할매수" in text or "매수의견" in text or "매수 (" in text:
-        action = "매수"
-    elif "비중축소" in text or "전량매도" in text or "매도 (" in text:
-        action = "매도"
-    elif "관망" in text or "보유" in text or "홀딩" in text:
-        action = "홀딩"
+    # 1. [최종 투자의견: ...] 라인에서만 정확하게 액션 추출
+    match_action = re.search(r"\[최종\s*투자의견\s*:\s*([^\]]+)\]", text)
+    if match_action:
+        op_text = match_action.group(1).strip()
+        if "매수" in op_text and "관망" not in op_text and "보유" not in op_text:
+            action = "매수"
+        elif "매도" in op_text or "비중축소" in op_text or "차익실현" in op_text:
+            action = "매도"
+        elif "홀딩" in op_text or "보유" in op_text or "관망" in op_text:
+            action = "홀딩"
+    else:
+        # 태그가 누락된 경우의 보조 추출 (최종 투자 의견 섹션 라인만 검색)
+        for line in text.split("\n"):
+            line_str = line.replace("*", "").replace("#", "").strip()
+            if "최종 투자 의견" in line_str or "최종 투자의견" in line_str:
+                if "적극매수" in line_str or "분할매수" in line_str:
+                    action = "매수"
+                elif "비중축소" in line_str or "매도" in line_str or "차익실현" in line_str:
+                    action = "매도"
+                elif "홀딩" in line_str or "보유" in line_str or "관망" in line_str:
+                    action = "홀딩"
+                break
 
+    # 2. 가격 밴드 라인 파싱
     for line in text.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").strip()
-        if "분할 매수" in line_clean or "매수 밴드" in line_clean:
+        if "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
                 buy_band = parts[1].strip()
-        elif "목표가" in line_clean or "익절" in line_clean:
+        elif "목표가" in line_clean or "익절 라인" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
                 take_profit = parts[1].strip()
-                sell_target = parts[1].strip()
-        elif "매도가" in line_clean:
+                if sell_target == "분석 리포트 참조":
+                    sell_target = parts[1].strip()
+        elif "매도가 밴드" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
                 sell_target = parts[1].strip()
@@ -911,9 +931,15 @@ if analyze_btn:
 - 기술적 분석: 피보나치 되돌림 레벨(38.2%, 61.8%), 이평선, MACD, MFI, ATR 변동폭
 - 실적 발표 D-Day 리스크 점검 및 대응 방안
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 리스크
-- 종합 평점 및 최종 투자 의견 (적극매수 / 분할매수 / 관망 / 비중축소)
+- 종합 평점 제시
+- **[핵심 투자의견 결정 규칙 - 엄격 준수]**:
+  * [보유 중이며 이미 큰 수익(+15% 이상) 중인 경우]: 신규 매수를 권하지 말고 반드시 **[최종 투자의견: 홀딩(보유)]** 또는 **[최종 투자의견: 비중축소(분할익절)]**로 판정할 것.
+  * [현재가가 52주 신고가 근처이거나 과매수 구간인 경우]: **[최종 투자의견: 관망(눌림목 대기)]**으로 판정할 것.
+  * [의미 있는 지지선까지 눌림목이 왔거나 저평가 매력도가 높은 경우에만]: **[최종 투자의견: 분할매수]** 또는 **[최종 투자의견: 적극매수]**로 판정할 것.
+  * **반드시 아래와 같이 정확한 규격 태그로 한 줄을 단독 출력할 것**:
+    `[최종 투자의견: 적극매수]` 또는 `[최종 투자의견: 분할매수]` 또는 `[최종 투자의견: 홀딩(보유)]` 또는 `[최종 투자의견: 비중축소]` 또는 `[최종 투자의견: 관망]`
 - **사용자 맞춤 포지션 대응 전략**:
-  * (보유 중인 경우) 현재 평단가 대비 물타기(추가 매수) 유효성, 불타기 시점, 부분 익절 전략
+  * (보유 중인 경우) 현재 평단가 대비 추가 매수 유효성 여부, 불타기 시점, 부분 익절 전략
   * (미보유인 경우) 신규 진입 시 매수 타이밍 검토
 - **정밀 매매 시나리오**:
   * 분할 매수 밴드: [피보나치 38.2%~61.8% 및 풋옵션 지지선을 결합한 구체적 달러 밴드 제시]
@@ -958,6 +984,7 @@ if analyze_btn:
             if not response_content:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
+        # 📌 개선된 정밀 파서로 정확한 액션 추출
         if response_content and not response_content.startswith("⚠️"):
             act, buy_b, tp_b, sell_b, sl_b = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
@@ -1190,7 +1217,6 @@ if st.session_state.last_analysis_result:
             )
         st.markdown(res["response_content"])
 
-    # 📌 안전하게 res에서 거시 뉴스 추출
     with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
         if res.get("macro_news_data"):
             for m_item in res["macro_news_data"]:
@@ -1206,7 +1232,6 @@ if st.session_state.last_analysis_result:
 
     col_left, col_right = st.columns([1.1, 0.9])
     
-    # 📌 안전하게 res에서 종목별 뉴스 추출
     with col_left:
         with st.container(border=True):
             st.markdown(f"##### 📰 **{res['ticker']} 최신 주요 뉴스 및 기사 원문**")
@@ -1220,7 +1245,6 @@ if st.session_state.last_analysis_result:
             else:
                 st.info("수집된 최신 뉴스가 없습니다.")
                 
-    # 📌 안전하게 res에서 투자의견 추출
     with col_right:
         with st.container(border=True):
             st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 변동**")
