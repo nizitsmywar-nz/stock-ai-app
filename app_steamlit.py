@@ -122,7 +122,7 @@ if "last_analysis_result" not in st.session_state:
     st.session_state.last_analysis_result = None
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈 (stock.info vs fast_info 판별 로직)
+# 1. RAG 데이터 수집 모듈
 # -------------------------------------------------------------
 def get_stock_info_with_retry(stock, retries=3):
     for attempt in range(retries):
@@ -618,7 +618,7 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 [전면 개편] 1차/2차 목표가, 불타기 조건까지 온전히 추출하는 정밀 파서
+# 📌 정밀 파서
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -629,7 +629,6 @@ def parse_full_trading_scenario(text):
     stop_loss = "분석 리포트 참조"
     pyramiding = ""
 
-    # 1. 최종 투자의견 추출
     match_action = re.search(r"\[최종\s*투자의견\s*:\s*([^\]]+)\]", text)
     if match_action:
         op_text = match_action.group(1).strip()
@@ -651,41 +650,33 @@ def parse_full_trading_scenario(text):
                     action = "홀딩"
                 break
 
-    # 2. 정밀 시나리오 항목별 라인 파싱
     for line in text.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").strip()
         
-        # 1차 목표가
-        if "1차 목표가" in line_clean or "1차익절" in line_clean:
+        if "1차 목표가" in line_clean or "1차목표가" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
                 target_1 = parts[1].strip()
-        # 2차 목표가
-        elif "2차 목표가" in line_clean or "2차익절" in line_clean:
+        elif "2차 목표가" in line_clean or "2차목표가" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
                 target_2 = parts[1].strip()
-        # 단일 목표가만 있는 경우
         elif ("목표가" in line_clean or "익절 라인" in line_clean or "익절/" in line_clean) and target_1 == "분석 리포트 참조":
             parts = line_clean.split(":")
             if len(parts) > 1:
                 target_1 = parts[1].strip()
-        # 매도가 / 비중축소 밴드
         elif "매도가 밴드" in line_clean or "비중축소(익절) 밴드" in line_clean or "비중축소 밴드" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
                 sell_target = parts[1].strip()
-        # 분할 매수 밴드
         elif "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
                 buy_band = parts[1].strip()
-        # 손절선
         elif "손절" in line_clean or "Stop-loss" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
                 stop_loss = parts[1].strip()
-        # 불타기 조건
         elif "불타기 조건" in line_clean or "불타기" in line_clean or "추가 매수 조건" in line_clean:
             parts = line_clean.split(":")
             if len(parts) > 1:
@@ -761,7 +752,6 @@ with st.sidebar:
     analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
     st.divider()
 
-    # 📌 종목별 트레이딩 히스토리 (1차/2차 목표가 & 불타기 조건 완벽 표시)
     st.markdown("#### 📌 **종목별 트레이딩 히스토리**")
     
     if st.session_state.history:
@@ -774,7 +764,6 @@ with st.sidebar:
                 if data.get('my_avg', 0) > 0:
                     st.markdown(f"- **💼 내 평단:** `${data['my_avg']}` ({data.get('my_return', 'N/A')})")
                 
-                # 🎯 1차 & 2차 목표가 분리 렌더링
                 t1 = data.get('target_1') or data.get('take_profit', '분석 리포트 참조')
                 t2 = data.get('target_2', '')
                 st.markdown(f"- **🎯 1차 목표가:** `{t1}`")
@@ -785,7 +774,6 @@ with st.sidebar:
                 st.markdown(f"- **📥 분할매수 밴드:** `{data.get('buy_band', '분석 리포트 참조')}`")
                 st.markdown(f"- **🛑 손절선:** `{data.get('stop_loss', '분석 리포트 참조')}`")
                 
-                # 🔥 불타기 조건 렌더링
                 if data.get('pyramiding'):
                     st.markdown(f"- **🔥 불타기 조건:** `{data['pyramiding']}`")
                     
@@ -858,6 +846,7 @@ if analyze_btn:
         ownership = fund_data.get('ownership_and_shorts', {})
         earnings_info = fund_data.get('earnings_calendar', {})
         
+        # 텍스트 포맷팅 뭉개짐 방지
         my_return_str = "N/A"
         if is_holding and user_avg_price > 0 and user_shares > 0 and curr_p > 0:
             total_invested = user_avg_price * user_shares
@@ -867,7 +856,7 @@ if analyze_btn:
             my_return_str = f"{pnl_pct:+.2f}%"
 
         user_position_text = (
-            f"사용자 현재 보유 정보: 평단가 ${user_avg_price}, 보유 수량 {user_shares}주 (현재 수익률: {my_return_str})"
+            f"사용자 보유 현황: 평단가 ${user_avg_price:.2f}, 보유수량 {user_shares:.1f}주, 평가수익률 {my_return_str}"
             if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
         )
 
@@ -899,6 +888,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
+            # 📌 [핵심 개선] 0선 기준 MACD 질적 분리 및 가격 모순 방지 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 ATR 변동성 데이터 ({ticker}) (기준일: {stock_date}):
@@ -951,15 +941,17 @@ if analyze_btn:
 - 상대적 강세/약세 섹터 요약 및 자금 순환매 방향
 
 3. 밸류에이션 및 스마트머니/공매도/옵션 수급 분석 ({ticker})
-- **재무 왜곡 특성 분석 (필수)**: PBR이 음수(마이너스)이거나 ROE가 산출 불가인 경우, 반드시 '대규모 자사주 매입/소각에 따른 자본잠식(음수 자기자본)' 특성을 명확히 설명할 것. 배당/가치주인 경우 왜곡된 성장 모델(PEG) 대신 배당수익률 및 잉여현금흐름(FCF) 관점으로 재평가할 것.
+- **재무 특이사항 분석 (필수)**: PBR이 음수(마이너스)이거나 ROE가 산출 불가인 경우, 반드시 '대규모 자사주 매입/소각에 따른 자본잠식(음수 자기자본)' 특성을 설명할 것. 배당/가치주인 경우 왜곡된 성장 모델(PEG) 대신 배당수익률 및 잉여현금흐름(FCF) 관점으로 재평가할 것.
 - **옵션 체인 및 스마트머니 정밀 분석**:
   * 콜옵션 Max OI 및 Max Vol의 행사가를 현재가({stock_date} 종가)와 정확히 비교할 것.
   * **[가격 논리 오류 절대 금지]**: 현재가보다 낮은 행사가를 "상향 돌파 시 매수/불타기"라고 잘못 설명하지 말 것. 현재가보다 낮은 콜 행사가(ITM)는 이미 돌파된 지지선이며, 상방 돌파 저항선은 반드시 현재가보다 높은 행사가(OTM)여야 함.
 - **증권가 투자의견 반영**: 최근 2개월 투자의견 변동 내역(예: Barclays, UBS 등)의 하향/상향 의견을 리포트에 명확히 반영할 것.
 
 4. 종목 종합 평가 및 [정밀 매매 시나리오] ({ticker})
-- **기술적 지표 엄격 판정**:
-  * MACD(-1.04) > Signal(-1.39)이고 Hist가 양수(+0.35)인 경우, '골든크로스 근접'이 아니라 **'골든크로스 발생 후 양(+)의 모멘텀 확장 중'**으로 정확히 서술할 것.
+- **[MACD 지표의 엄격한 질적 판정 규칙]**:
+  * **0선 위(MACD > 0) 골든크로스(Hist > 0)**: '대세 상승 추세 속 강한 모멘텀 확장(진성 골든크로스)'으로 판정.
+  * **0선 아래(MACD < 0) 골든크로스(Hist > 0)**: '하락/조정 국면에서의 단순 낙폭과대 기술적 되돌림(약세장 반등)'으로 판정하고, 상방 저항선에서의 차익 매물 출회 가능성을 경고할 것.
+  * **히스토그램 크기 반영**: Hist가 +0.10 미만으로 미미한 경우 '모멘텀 확장'이 아닌 '모멘텀 둔화 및 재반락 위험'으로 분석할 것.
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 리스크
 - 종합 평점 제시
 - **[핵심 투자의견 결정 규칙 - 엄격 준수]**:
@@ -969,7 +961,7 @@ if analyze_btn:
   * **반드시 아래와 같이 정확한 규격 태그로 한 줄을 단독 출력할 것**:
     `[최종 투자의견: 적극매수]` 또는 `[최종 투자의견: 분할매수]` 또는 `[최종 투자의견: 홀딩(보유)]` 또는 `[최종 투자의견: 비중축소]` 또는 `[최종 투자의견: 관망]`
 - **사용자 맞춤 포지션 대응 전략**:
-  * (보유 중인 경우) 현재 평단가 대비 추가 매수 유효성 여부, 부분 익절 전략
+  * (보유 중인 경우) 현재 평단가 대비 추가 매수 유효성 여부, 부분 익절 전략 (문장 내 수치 엉킴 없이 명확히 기술할 것)
 - **정밀 매매 시나리오 (각 항목을 명확한 레이블로 작성할 것)**:
   * 분할 매수 밴드: [피보나치 61.8% 및 2.0x ATR 지지선 결합 밴드]
   * 1차 목표가: [피보나치 38.2% 등 1차 구체적 달러 가격대]
@@ -1015,7 +1007,6 @@ if analyze_btn:
             if not response_content:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
-        # 📌 1차/2차 목표가 및 불타기 조건을 모두 포함하여 히스토리에 저장
         if response_content and not response_content.startswith("⚠️"):
             act, t1, t2, sell_b, buy_b, sl_b, pyr = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
@@ -1270,7 +1261,7 @@ if st.session_state.last_analysis_result:
         with st.container(border=True):
             st.markdown(f"##### 📰 **{res['ticker']} 최신 주요 뉴스 및 기사 원문**")
             if res.get("news_data"):
-                for item in res["news_data"]:
+                for item in news_data:
                     st.markdown(f"**[{item['title']}]({item['link']})**")
                     if item.get("summary"):
                         st.markdown(f"> *{item['summary']}*")
