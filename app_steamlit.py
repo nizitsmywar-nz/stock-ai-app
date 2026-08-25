@@ -887,7 +887,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [핵심 개선] 첨부 이미지 양식 100% 일치 프롬프트
+            # 📌 [핵심 개선] % 기호 및 띄어쓰기 누락 방지 강화 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 ATR 변동성 데이터 ({ticker}) (기준일: {stock_date}):
@@ -952,6 +952,7 @@ if analyze_btn:
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 리스크 | 종합 평점 제시
 
 - **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
+- **[서식 주의]**: 비중을 언급할 때는 반드시 '30%'처럼 퍼센트(%) 기호를 붙이고, 단어와 숫자 사이에 반드시 공백(띄어쓰기)을 명확히 둘 것.
 
 [정밀 매매 시나리오]
 
@@ -964,7 +965,7 @@ if analyze_btn:
 
 [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
 
-* **사용자 대응 전략**: [보유자의 경우 평단가 및 수익률에 따른 부분 익절/비중관리/홀딩 유지 방안을 구체적 비중(예: 30% 매도 등)과 지지선/저항선 달러 수치를 직접 명시하여 작성할 것. 미보유자의 경우 진입 타이밍 명시]
+* **사용자 대응 전략**: [보유자의 경우 평단가 및 수익률에 따른 부분 익절/비중관리/홀딩 유지 방안을 구체적 비중(예: 물량의 30% 매도 등)과 지지선/저항선 달러 수치를 공백을 두어 명확히 작성할 것. 미보유자의 경우 진입 타이밍 명시]
 """
             prompt = PromptTemplate(
                 input_variables=["ticker", "stock_date", "tech_json", "fib_json", "options_json", "ownership_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "news_json", "analyst_json"],
@@ -1236,11 +1237,13 @@ if st.session_state.last_analysis_result:
                 mime="application/json",
                 use_container_width=True
             )
-        st.markdown(res["response_content"])
+        # 📌 [핵심 수정] 달러 기호($)를 이스케이프하여 Streamlit의 수식 모드 오작동(공백/기호 증발) 완벽 차단
+        clean_rendered_content = re.sub(r'(?<!\\)\$', r'\$', res["response_content"])
+        st.markdown(clean_rendered_content)
 
     with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
         if res.get("macro_news_data"):
-            for m_item in res["macro_news_data"]:
+            for m_item in res.get("macro_news_data", []):
                 st.markdown(f"- **[{m_item['title']}]({m_item['link']})**")
                 if m_item.get("summary"):
                     st.caption(f"> {m_item['summary']}")
