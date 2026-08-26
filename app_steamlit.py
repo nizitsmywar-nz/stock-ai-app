@@ -658,7 +658,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     }
 
 # -------------------------------------------------------------
-# 📌 [11개 전 섹터 확장] S&P 500 전 섹터 5일/1개월 수익률 수집
+# 📌 S&P 500 11개 전 섹터 5일/1개월 수익률 수집
 # -------------------------------------------------------------
 def fetch_sector_performance():
     sector_etfs = [
@@ -903,6 +903,31 @@ def parse_full_trading_scenario(text):
     user_strategy_summary = summarize_user_strategy(user_strategy_raw)
     return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
 
+# -------------------------------------------------------------
+# 📌 [티어 및 신뢰도 매핑] 증권사 투자의견, 목표가 & 티어 분류기
+# -------------------------------------------------------------
+TIER_1_FIRMS = [
+    "goldman", "morgan stanley", "jpmorgan", "jp morgan", "citi", "citigroup",
+    "bank of america", "bofa", "merrill", "ubs", "barclays", "deutsche bank",
+    "hsbc", "bernstein", "credit suisse", "bnp paribas"
+]
+
+TIER_2_FIRMS = [
+    "wells fargo", "rbc", "mizuho", "jefferies", "piper sandler", "wedbush",
+    "baird", "oppenheimer", "bmo", "stifel", "td cowen", "cowen", "wolfe",
+    "keybanc", "raymond james", "canaccord", "evercore", "truist", "guggenheim",
+    "btig", "da davidson", "needham", "mmpm", "loop capital", "roth mkm", "bernstein"
+]
+
+def classify_analyst_tier(firm_name: str):
+    f_lower = firm_name.lower()
+    if any(k in f_lower for k in TIER_1_FIRMS):
+        return "🌟 Tier 1 (글로벌 탑티어)", 1
+    elif any(k in f_lower for k in TIER_2_FIRMS):
+        return "✨ Tier 2 (주요 전문리서치)", 2
+    else:
+        return "🔎 Tier 3 (독립/부티크)", 3
+
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
         stock = yf.Ticker(ticker)
@@ -918,16 +943,36 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
             upgrades['Date'] = pd.to_datetime(upgrades['Date'])
             filtered = upgrades[upgrades['Date'] >= cutoff_date]
         else:
-            filtered = upgrades.head(5)
+            filtered = upgrades.head(8)
             
         records = []
-        for idx, row in filtered.head(5).iterrows():
+        for idx, row in filtered.head(8).iterrows():
             date_str = idx.strftime("%Y-%m-%d") if isinstance(idx, pd.Timestamp) else str(idx)[:10]
+            firm_name = str(row.get("Firm", "N/A")).strip()
+            from_g = str(row.get("FromGrade", "")).strip()
+            to_g = str(row.get("ToGrade", "")).strip()
+            action_raw = str(row.get("Action", "N/A")).strip()
+            
+            # 이전 등급 -> 변경 등급 결합
+            if from_g and from_g.lower() != "nan" and from_g != to_g:
+                grade_str = f"{from_g} ➡️ {to_g}"
+            else:
+                grade_str = to_g if to_g and to_g.lower() != "nan" else "N/A"
+
+            # 개별 제시 가격 확인
+            target_val = row.get("currentPriceTarget", None) or row.get("priceTarget", None) or row.get("TargetPrice", None)
+            target_str = f"${float(target_val):.2f}" if pd.notnull(target_val) and target_val != "" else "-"
+
+            tier_badge, tier_num = classify_analyst_tier(firm_name)
+
             records.append({
                 "date": date_str,
-                "firm": row.get("Firm", "N/A"),
-                "to_grade": row.get("ToGrade", "N/A"),
-                "action": row.get("Action", "N/A")
+                "firm": firm_name,
+                "tier": tier_badge,
+                "tier_num": tier_num,
+                "action": action_raw,
+                "grade_change": grade_str,
+                "target_price": target_str
             })
         return records
     except Exception:
@@ -1061,7 +1106,7 @@ if analyze_btn:
         except Exception:
             api_key = None
             
-    with st.spinner(f"🔍 [{ticker_input}] 11개 전 섹터 수급/VWAP/BB스퀴즈/옵션체인 수집 및 1년 전략 백테스팅 & AI 추론 중..."):
+    with st.spinner(f"🔍 [{ticker_input}] IB 리서치 티어 매핑/11개 전 섹터 수급/VWAP/BB스퀴즈 분석 및 1년 백테스팅 실행 중..."):
         tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df = fetch_stock_technical_data(ticker_input)
         backtest_results = run_strategy_backtest(raw_df)
         options_data = fetch_nearest_options_data(ticker_input)
@@ -1120,7 +1165,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [11개 전 섹터 분석 추가 프롬프트]
+            # 📌 [증권사 티어 및 신뢰도 가중치 반영 프롬프트]
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
@@ -1159,12 +1204,12 @@ if analyze_btn:
 12. 종목 최신 주요 기사:
 {news_json}
 
-13. 최근 2개월 증권가 투자의견 변동:
+13. 최근 2개월 증권가 투자의견 및 목표가 변동 (기관 신뢰도 티어 포함):
 {analyst_json}
 
 ---
 
-[지시사항 - 분석 정합성 및 11개 섹터 전수 분석 규칙]
+[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 IB 신뢰도 반영 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
@@ -1172,19 +1217,17 @@ if analyze_btn:
 - 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측] (현금, 채권, 주식, 코인, 금, 원유).
 - 권장 자산 배분 비중 (주식 : 채권 : 대체자산 : 현금)
 
-2. 11개 전 섹터 전망 및 자금 순환매 심층 분석 (필수 전수 분석)
-- **11개 섹터 전수 상태 표/리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 국면(주도/강세, 순환매 유입, 조정/관망, 약세/자금유출)을 11개 모두 한 줄씩 명확히 분석할 것.
-- **자금 이동 흐름(Rotation)**: 방어주(XLP, XLU, XLV) vs 경기민감주/성장주(XLK, XLC, XLY, XLF, XLI, XLE) 간의 순환매 방향성과 분석 대상 종목({ticker})이 속한 섹터의 수혜/소외 여부를 심층 결론으로 도출할 것.
+2. 11개 전 섹터 전망 및 자금 순환매 심층 분석
+- **11개 섹터 전수 상태 표/리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 국면을 11개 모두 한 줄씩 분석할 것.
+- **자금 이동 흐름(Rotation)**: 방어주 vs 성장주 순환매 방향성과 분석 대상 종목({ticker})이 속한 섹터의 수혜/소외 여부를 심층 결론으로 도출할 것.
 
-3. 밸류에이션 및 스마트머니/옵션/공매도 분석 ({ticker})
-- **재무 특이사항 분석**: PBR 음수/ROE 산출 불가 시 자본잠식(자사주 매입) 특성 반영.
-- **옵션 체인 및 공매도**: 콜옵션 저항벽/풋옵션 지지벽 및 Short Float 상환 압력 평가.
+3. 밸류에이션 및 IB 스마트머니/옵션/공매도 분석 ({ticker})
+- **IB 투자의견 및 목표가 신뢰도 가중 평가**: 주입된 증권사 투자의견 변동 중 **Tier 1 (골드만삭스, 모건스탠리, JP모건 등) 및 Tier 2 주요 리서치**의 목표가 상향/하향 추세를 더 높은 신뢰도로 가중 분석하여 리포트에 명시할 것.
+- **재무 특이사항 및 옵션 체인**: PBR 음수/ROE 산출 불가 시 자본잠식(자사주 매입) 특성 반영 및 콜옵션 저항벽/풋옵션 지지벽 분석.
 
 4. 정밀 기술적 지표, VWAP 및 백테스팅 평가 ({ticker})
-- **VWAP & 볼린저 밴드 스퀴즈 판정**:
-  * 현재가가 1Y/20D VWAP 상단/하단 중 어디에 위치하며 스마트머니 매집 단가 대비 유리한지 분석.
-  * 볼린저 밴드 밴드폭(Bandwidth)과 KC 기반 스퀴즈(Squeeze On/Off) 상태를 평가하여 '변동성 폭발 방향성' 제시.
-- **백테스팅 시사점**: 과거 1년간 모멘텀 스퀴즈 전략과 VWAP 평균회귀 전략 중 해당 종목에 어떤 퀀트 로직이 높은 승률과 수익률을 보였는지 간략히 비교 평가.
+- **VWAP & 볼린저 밴드 스퀴즈 판정**: 현재가의 1Y/20D VWAP 위치 및 스퀴즈 상태(Squeeze On/Off)에 따른 폭발 방향성 제시.
+- **백테스팅 시사점**: 과거 1년간 모멘텀 스퀴즈 전략과 VWAP 평균회귀 전략 중 어떤 로직이 우세했는지 비교 평가.
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
@@ -1195,7 +1238,7 @@ if analyze_btn:
 6. [정밀 매매 시나리오]
 - **[매수 밴드 및 진입 가격의 상·하단 논리 일치 규칙 (필수)]**:
   * **분할 매수 밴드 설정**: 피보나치 지지선, 20일 VWAP, 풋옵션 지지선을 결합하여 실질적 달러 범위를 도출할 것.
-  * **하단 [사용자 대응 전략]과의 가격 일치**: 미보유자의 신규 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것 (상호 충돌 금지).
+  * **하단 [사용자 대응 전략]과의 가격 일치**: 미보유자의 신규 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것.
 
 - **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
 - **[서식 주의]**: 비중을 언급할 때는 반드시 '30%'처럼 퍼센트(%) 기호를 붙이고, 단어와 숫자 사이에 반드시 공백을 둘 것.
@@ -1370,7 +1413,7 @@ if st.session_state.last_analysis_result:
         diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
         s_c4.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
 
-    # 📌 [신규] S&P 500 11개 전 섹터 실시간 등락 현황판 UI
+    # S&P 500 11개 전 섹터 실시간 등락 현황판 UI
     if sector_data:
         with st.container(border=True):
             st.markdown("##### 🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 (11 Sectors Rotation)**")
@@ -1568,7 +1611,7 @@ if st.session_state.last_analysis_result:
     
     st.write("")
 
-    col_left, col_right = st.columns([1.1, 0.9])
+    col_left, col_right = st.columns([0.9, 1.1])
     
     with col_left:
         with st.container(border=True):
@@ -1585,10 +1628,13 @@ if st.session_state.last_analysis_result:
                 
     with col_right:
         with st.container(border=True):
-            st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 변동**")
+            st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 및 목표가 변동**")
             if res.get("analyst_data"):
                 df_analyst = pd.DataFrame(res.get("analyst_data", []))
-                df_analyst.columns = ["일자", "증권사", "투자의견", "액션"]
+                # 표시 순서 정렬 및 컬럼 헤더 매핑
+                display_cols = ["date", "firm", "tier", "action", "grade_change", "target_price"]
+                df_analyst = df_analyst[[c for c in display_cols if c in df_analyst.columns]]
+                df_analyst.columns = ["일자", "증권사", "기관 신뢰도 등급", "구분", "투자의견 변동", "제시 목표가"]
                 st.dataframe(df_analyst, use_container_width=True, hide_index=True)
             else:
                 st.info("최근 2개월간 등록된 투자의견 변동 내역이 없습니다.")
