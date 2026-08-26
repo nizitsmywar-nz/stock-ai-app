@@ -555,7 +555,7 @@ def fetch_ownership_and_shorts(stock, info):
             
         inst_own_val = info.get("heldPercentInstitutions", None)
         if inst_own_val is not None:
-            data["inst_own"] = f"{ins_own_val * 100:.2f}%"
+            data["inst_own"] = f"{inst_own_val * 100:.2f}%"
     except Exception:
         pass
 
@@ -1211,6 +1211,12 @@ if analyze_btn:
             if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
         )
 
+        # 📌 [핵심 개선] 보유 상태에 따른 대응 전략 프롬프트 가이드 동적 생성
+        if is_holding and user_avg_price > 0:
+            strategy_instruction_text = f"""* **사용자 대응 전략**: [현재 사용자가 평단가 ${user_avg_price:.2f}, 평가수익률 {my_return_str}로 주식을 보유 중인 상태입니다. 반드시 '보유자 관점'의 전략만 단독 작성할 것. 미보유자나 신규 진입 관련 문구는 일절 작성하지 말 것. 1차/2차 목표가 도달 시 구체적인 부분 익절/비중축소 비중(예: 30% 매도) 및 손절선 이탈 시 전량 손절 계획을 명시할 것.]"""
+        else:
+            strategy_instruction_text = """* **사용자 대응 전략**: [현재 사용자가 주식을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것. 보유자 관련 문구는 일절 작성하지 말 것. 상단 [신규 진입 적격성 평가] 및 [분할 매수 밴드]와 100% 일치하는 진입 가격대와 진입 비중(예: 1차 30% 분할 진입 등)을 명확히 제시할 것.]"""
+
         full_rag_payload = {
             "meta": {
                 "ticker": ticker_input,
@@ -1241,7 +1247,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [핵심 보정] 보수적 차트 지표 최우선 매도가 밴드 프롬프트
+            # 📌 [핵심 개선] 오름차순 가격 정렬 & 조건부 단독 분기 출력 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
@@ -1285,7 +1291,7 @@ if analyze_btn:
 
 ---
 
-[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 보수적 실전 매매 규칙]
+[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 엄격한 서식 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
@@ -1317,13 +1323,14 @@ if analyze_btn:
 6. [정밀 매매 시나리오]
 - **[매수 밴드 및 진입 가격의 상·하단 논리 일치 규칙 (필수)]**:
   * **분할 매수 밴드 설정**: 피보나치 지지선, 20일 VWAP, 풋옵션 지지선을 결합하여 실질적 달러 범위를 도출할 것.
-  * **하단 [사용자 대응 전략]과의 가격 일치**: 미보유자의 신규 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것.
+  * **하단 [사용자 대응 전략]과의 가격 일치**: 사용자 대응 전략에서 언급하는 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것.
 
 - **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
-- **[서식 및 보수적 매매 주의]**: 
-  * 비중을 언급할 때는 반드시 '30%'처럼 퍼센트(%) 기호를 붙이고, 단어와 숫자 사이에 반드시 공백을 둘 것.
-  * **피보나치 수치 표기 필수 규칙**: 반드시 **'피보나치 50.0%', '피보나치 38.2%', '피보나치 23.6%', '피보나치 61.8%'**와 같이 소수점과 퍼센트(%) 기호를 붙여 정확히 표기할 것.
-  * **보수적 매도가 밴드 설정 규칙**: 매도가 밴드 설정 시 후행적이고 낙관 편향이 있는 증권사 기관 목표가 대신, **볼린저 밴드 상단, 52주 고점 인근 저항선, 콜옵션 Max OI 저항벽 등 실제 차트/수급상의 실시간 저항선**을 최우선 기준으로 하여 현실적인 차익실현 달러 밴드를 도출할 것.
+- **[서식 및 가격 표기 엄격 준수 규칙]**: 
+  * **가격 밴드 오름차순 표기 (필수)**: 분할 매수 밴드, 매도가 밴드 등 모든 가격 범위는 반드시 **'낮은 가격 ~ 높은 가격 (하단 ~ 상단)' 오름차순 순서로 정렬**하여 작성할 것 (예: $332.49 ~ $356.98). 절대로 높은 가격을 앞에 적지 말 것.
+  * **보수적 매도가 밴드 설정**: 증권사 기관 목표가 대신 **볼린저 밴드 상단, 52주 고점 저항선, 피보나치 저항선 등 실제 차트/수급상의 실시간 저항선**을 최우선 기준으로 하여 현실적인 차익실현 달러 밴드를 도출할 것.
+  * **피보나치 수치 표기 규칙**: 반드시 **'피보나치 50.0%', '피보나치 38.2%', '피보나치 23.6%', '피보나치 61.8%'**와 같이 소수점과 퍼센트(%) 기호를 붙여 표기할 것.
+  * 비중 언급 시 '30%'처럼 퍼센트(%) 기호를 붙이고 단어와 숫자 사이에 공백을 둘 것.
 
 [신규 진입 적격성 평가]
 * **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망) 중 택1]
@@ -1332,19 +1339,19 @@ if analyze_btn:
 
 [정밀 매매 시나리오]
 
-* **분할 매수 밴드**: [피보나치 지지선 및 VWAP/옵션 지지선을 결합한 구체적 달러 범위와 근거]
+* **분할 매수 밴드**: [피보나치 지지선 및 VWAP/옵션 지지선을 결합한 구체적 달러 범위와 근거 (낮은 가격 ~ 높은 가격 순 정렬)]
 * **1차 목표가**: [피보나치 38.2% 또는 50.0% 구간 구체적 달러 가격대와 근거]
 * **2차 목표가**: [피보나치 23.6% 또는 52주 고점 인근 저항 구체적 달러 가격대와 근거]
-* **매도가 밴드**: [볼린저 밴드 상단, 피보나치 저항 및 콜옵션 저항벽을 최우선 반영한 실전 분할 차익실현 구체적 달러 밴드]
+* **매도가 밴드**: [볼린저 밴드 상단 및 피보나치 저항을 최우선 반영한 실전 분할 차익실현 구체적 달러 밴드 (낮은 가격 ~ 높은 가격 순 정렬)]
 * **손절(Stop-loss) 기준선**: [2.0x ATR 또는 1Y VWAP 이탈 시 추세 훼손 구체적 달러 가격대]
 * **불타기 조건**: [스퀴즈 상방 돌파 및 상방 저항선 안착 시 추가 매수 검토 기준]
 
 [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
 
-* **사용자 대응 전략**: [보유자의 경우 평단가 및 수익률에 따른 부분 익절/비중관리/홀딩 유지 방안을 구체적 비중(예: 물량의 30% 매도 등)과 지지선/저항선 달러 수치를 공백을 두어 명확히 작성할 것. 미보유자의 경우 상단 '신규 진입 적격성 평가' 및 '분할 매수 밴드'와 정확히 일치하는 진입 가격을 명시할 것]
+{strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "news_json", "analyst_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json"],
                 template=template
             )
             llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
@@ -1364,6 +1371,7 @@ if analyze_btn:
                 "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
                 "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
                 "user_position": user_position_text,
+                "strategy_guide": strategy_instruction_text,
                 "news_json": json.dumps(news_data, indent=2, ensure_ascii=False),
                 "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
             }
