@@ -152,19 +152,16 @@ def fetch_stock_technical_data(ticker: str):
     if df.empty:
         return {}, "N/A", {}, "N/A", "N/A", pd.DataFrame()
     
-    # 이동평균선
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_60'] = df['Close'].rolling(window=60).mean()
     df['SMA_120'] = df['Close'].rolling(window=120).mean()
     
-    # RSI & MACD
     df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
     macd = ta.trend.MACD(df['Close'])
     df['MACD'] = macd.macd()
     df['MACD_Signal'] = macd.macd_signal()
     df['MACD_Hist'] = macd.macd_diff()
     
-    # ATR & MFI
     try:
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
     except Exception:
@@ -175,14 +172,12 @@ def fetch_stock_technical_data(ticker: str):
     except Exception:
         df['MFI'] = None
 
-    # 볼린저 밴드 & 밴드폭
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
     df['BB_High'] = bb.bollinger_hband()
     df['BB_Low'] = bb.bollinger_lband()
     df['BB_Mid'] = bb.bollinger_mavg()
     df['BB_Width'] = (df['BB_High'] - df['BB_Low']) / df['BB_Mid'] * 100
 
-    # 켈트너 채널 (KC) 및 볼린저 밴드 스퀴즈 (BB Squeeze)
     if df['ATR'] is not None:
         df['KC_High'] = df['SMA_20'] + (1.5 * df['ATR'])
         df['KC_Low'] = df['SMA_20'] - (1.5 * df['ATR'])
@@ -190,7 +185,6 @@ def fetch_stock_technical_data(ticker: str):
     else:
         df['BB_Squeeze_On'] = False
 
-    # VWAP 계산
     df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
     df['TP_Vol'] = df['Typical_Price'] * df['Volume']
     df['Cumulative_VWAP'] = df['TP_Vol'].cumsum() / df['Volume'].cumsum()
@@ -267,7 +261,6 @@ def run_strategy_backtest(df: pd.DataFrame):
 
     bh_return = (b_df['Close'].iloc[-1] - b_df['Close'].iloc[0]) / b_df['Close'].iloc[0] * 100
 
-    # 전략 1: 모멘텀 스퀴즈 돌파
     pos1 = 0
     entry_p1 = 0
     trades1 = []
@@ -296,7 +289,6 @@ def run_strategy_backtest(df: pd.DataFrame):
         ret = (b_df['Close'].iloc[-1] - entry_p1) / entry_p1
         trades1.append(ret)
 
-    # 전략 2: VWAP + RSI 밸류 되돌림
     pos2 = 0
     entry_p2 = 0
     trades2 = []
@@ -665,19 +657,40 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         "growth_models": growth_models
     }
 
+# -------------------------------------------------------------
+# 📌 [11개 전 섹터 확장] S&P 500 전 섹터 5일/1개월 수익률 수집
+# -------------------------------------------------------------
 def fetch_sector_performance():
-    sector_etfs = ["XLK", "XLF", "XLE", "XLV", "XLI"]
+    sector_etfs = [
+        ("XLK", "IT/기술 (Technology)"),
+        ("XLC", "커뮤니케이션 (Communication Services)"),
+        ("XLY", "임의소비재 (Consumer Discretionary)"),
+        ("XLP", "필수소비재 (Consumer Staples)"),
+        ("XLF", "금융 (Financials)"),
+        ("XLV", "헬스케어 (Health Care)"),
+        ("XLI", "산업재 (Industrials)"),
+        ("XLE", "에너지 (Energy)"),
+        ("XLB", "소재 (Materials)"),
+        ("XLU", "유틸리티 (Utilities)"),
+        ("XLRE", "부동산 (Real Estate)")
+    ]
     summary = {}
-    for etf in sector_etfs:
+    for etf, name in sector_etfs:
         try:
-            hist = yf.Ticker(etf).history(period="5d")
+            hist = yf.Ticker(etf).history(period="1mo")
             if len(hist) >= 2:
-                pct = (hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100
-                summary[etf] = f"{pct:+.2f}%"
+                pct_5d = ((hist['Close'].iloc[-1] - hist['Close'].iloc[-5]) / hist['Close'].iloc[-5] * 100) if len(hist) >= 5 else ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100)
+                pct_1m = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100)
+                summary[etf] = {
+                    "sector_name": name,
+                    "return_5d": f"{pct_5d:+.2f}%",
+                    "return_1m": f"{pct_1m:+.2f}%",
+                    "latest_close": round(float(hist['Close'].iloc[-1]), 2)
+                }
             else:
-                summary[etf] = "N/A"
+                summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
         except Exception:
-            summary[etf] = "N/A"
+            summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
     return summary
 
 def fetch_news(ticker: str, limit: int = 5):
@@ -801,7 +814,7 @@ def summarize_user_strategy(raw_text: str) -> str:
     return summary
 
 # -------------------------------------------------------------
-# 📌 [업그레이드] 신규 진입 적격성 평가 파서
+# 📌 신규 진입 적격성 평가 파서
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -815,7 +828,6 @@ def parse_full_trading_scenario(text):
     pyramiding = ""
     user_strategy_raw = ""
 
-    # 1. 최종 투자의견 추출
     match_action = re.search(r"\[최종\s*투자의견\s*[:\-]?\s*([^\]]+)\]", text)
     if match_action:
         op_text = match_action.group(1).strip()
@@ -837,7 +849,6 @@ def parse_full_trading_scenario(text):
                     action = "홀딩"
                 break
 
-    # 2. 신규 진입 적격성 추출
     match_entry_grade = re.search(r"\[신규\s*진입\s*적격성\s*평가\s*[:\-]?\s*([^\]]+)\]", text)
     if match_entry_grade:
         entry_grade = match_entry_grade.group(1).strip()
@@ -856,7 +867,6 @@ def parse_full_trading_scenario(text):
             else:
                 user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
 
-    # 3. [정밀 매매 시나리오] 블록 파싱
     scenario_block = text
     if "[정밀 매매 시나리오]" in text:
         after_header = text.split("[정밀 매매 시나리오]")[1]
@@ -972,7 +982,6 @@ with st.sidebar:
             with st.expander(f"**{t_code}** (${data['price']}) | {action_badge}", expanded=False):
                 st.markdown(f"- **현재가:** `${data['price']}`")
                 
-                # 신규 진입 적합성 뱃지
                 entry_grade_val = data.get('entry_grade', '')
                 if entry_grade_val and entry_grade_val != "분석 리포트 참조":
                     st.markdown(f"- **🆕 신규 진입 판정:** `{entry_grade_val}`")
@@ -1052,7 +1061,7 @@ if analyze_btn:
         except Exception:
             api_key = None
             
-    with st.spinner(f"🔍 [{ticker_input}] VWAP/BB스퀴즈/옵션체인/피보나치 수집 및 1년 전략 백테스팅 & AI 추론 중..."):
+    with st.spinner(f"🔍 [{ticker_input}] 11개 전 섹터 수급/VWAP/BB스퀴즈/옵션체인 수집 및 1년 전략 백테스팅 & AI 추론 중..."):
         tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df = fetch_stock_technical_data(ticker_input)
         backtest_results = run_strategy_backtest(raw_df)
         options_data = fetch_nearest_options_data(ticker_input)
@@ -1098,7 +1107,7 @@ if analyze_btn:
             "earnings_calendar_and_52w": earnings_info,
             "macro_6_assets": macro_data,
             "global_macro_news": macro_news_data,
-            "sector_performance_5d": sector_data,
+            "sector_performance_11_sectors": sector_data,
             "fundamentals_and_6_valuations": fund_data,
             "user_portfolio_status": user_position_text,
             "stock_recent_news": news_data,
@@ -1111,7 +1120,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [핵심 개선] 미보유자 신규 진입 적격성 평가 및 가격 일관성 엄격 프롬프트
+            # 📌 [11개 전 섹터 분석 추가 프롬프트]
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
@@ -1138,7 +1147,7 @@ if analyze_btn:
 8. 글로벌 거시/시장 주요 뉴스:
 {macro_news_json}
 
-9. 주요 섹터 5일 등락률:
+9. S&P 500 11개 전 섹터 실시간 등락률 및 모멘텀:
 {sector_json}
 
 10. 펀더멘털 및 6대 밸류에이션:
@@ -1155,7 +1164,7 @@ if analyze_btn:
 
 ---
 
-[지시사항 - 분석 정합성 및 신규 진입 적격성 엄격 준수 규칙]
+[지시사항 - 분석 정합성 및 11개 섹터 전수 분석 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
@@ -1163,8 +1172,9 @@ if analyze_btn:
 - 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측] (현금, 채권, 주식, 코인, 금, 원유).
 - 권장 자산 배분 비중 (주식 : 채권 : 대체자산 : 현금)
 
-2. 섹터 전망 및 순환매
-- 상대적 강세/약세 섹터 요약 및 자금 순환매 방향
+2. 11개 전 섹터 전망 및 자금 순환매 심층 분석 (필수 전수 분석)
+- **11개 섹터 전수 상태 표/리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 국면(주도/강세, 순환매 유입, 조정/관망, 약세/자금유출)을 11개 모두 한 줄씩 명확히 분석할 것.
+- **자금 이동 흐름(Rotation)**: 방어주(XLP, XLU, XLV) vs 경기민감주/성장주(XLK, XLC, XLY, XLF, XLI, XLE) 간의 순환매 방향성과 분석 대상 종목({ticker})이 속한 섹터의 수혜/소외 여부를 심층 결론으로 도출할 것.
 
 3. 밸류에이션 및 스마트머니/옵션/공매도 분석 ({ticker})
 - **재무 특이사항 분석**: PBR 음수/ROE 산출 불가 시 자본잠식(자사주 매입) 특성 반영.
@@ -1179,7 +1189,7 @@ if analyze_btn:
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
 - **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망/리스크 과다) 중 택1]
-- **진입 적합성 종합 판정**: 미보유자 입장에서 현재 시점에 무조건 하방 매수를 기다려야 하는지, 아니면 현재가 부근에서 즉시/분할 진입할 만한 모멘텀과 밸류에이션 메리트가 있는지 객관적이고 냉정하게 평가할 것 (역배열/추세 하락 종목은 무조건적인 진입 추천 금지).
+- **진입 적합성 종합 판정**: 미보유자 입장에서 현재 시점에 무조건 하방 매수를 기다려야 하는지, 아니면 현재가 부근에서 즉시/분할 진입할 만한 모멘텀과 밸류에이션 메리트가 있는지 객관적이고 냉정하게 평가할 것.
 - **예상 손익비 (Risk/Reward Ratio)**: 1차 목표가까지의 기대 상승률 대비 손절선까지의 하방 리스크 비율을 수치로 명시할 것 (예: 기대수익 +12% / 손실리스크 -4.5% = 손익비 2.67 : 1).
 
 6. [정밀 매매 시나리오]
@@ -1283,6 +1293,7 @@ if analyze_btn:
             "options_data": options_data,
             "macro_data": macro_data,
             "fund_data": fund_data,
+            "sector_data": sector_data,
             "ownership": ownership,
             "earnings_info": earnings_info,
             "response_content": response_content,
@@ -1305,6 +1316,7 @@ if st.session_state.last_analysis_result:
     fib_levels = res["fib_levels"]
     options_data = res["options_data"]
     fund_data = res["fund_data"]
+    sector_data = res.get("sector_data", {})
     info_source = res.get("info_source", "stock.info")
 
     if info_source == "stock.info":
@@ -1357,6 +1369,24 @@ if st.session_state.last_analysis_result:
         low_52 = earnings_info.get('fiftyTwoWeekLow', 'N/A')
         diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
         s_c4.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
+
+    # 📌 [신규] S&P 500 11개 전 섹터 실시간 등락 현황판 UI
+    if sector_data:
+        with st.container(border=True):
+            st.markdown("##### 🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 (11 Sectors Rotation)**")
+            
+            s_rows = []
+            for etf, s_info in sector_data.items():
+                s_rows.append({
+                    "티커": etf,
+                    "섹터명": s_info.get("sector_name", ""),
+                    "5일 등락률": s_info.get("return_5d", "N/A"),
+                    "1개월 등락률": s_info.get("return_1m", "N/A"),
+                    "현재가 ($)": f"${s_info.get('latest_close', 'N/A')}"
+                })
+            
+            df_sec = pd.DataFrame(s_rows)
+            st.dataframe(df_sec, use_container_width=True, hide_index=True)
 
     # 2. 퀀트 모멘텀 & VWAP / 볼린저 밴드 스퀴즈 컨테이너
     with st.container(border=True):
