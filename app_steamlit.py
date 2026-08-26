@@ -353,57 +353,71 @@ def run_strategy_backtest(df: pd.DataFrame):
         "strategy_2_vwap_mean_reversion": calc_stats(trades2)
     }
 
-def fetch_nearest_options_data(ticker: str):
-    try:
-        stock = yf.Ticker(ticker)
-        expirations = stock.options
-        if not expirations:
-            return None
-        
-        nearest_exp = expirations[0]
-        opt_chain = stock.option_chain(nearest_exp)
-        calls = opt_chain.calls
-        puts = opt_chain.puts
-        
-        if calls.empty or puts.empty:
-            return None
+# -------------------------------------------------------------
+# 📌 옵션 체인 스마트머니 수급 수집기
+# -------------------------------------------------------------
+def fetch_nearest_options_data(ticker: str, retries: int = 3):
+    for attempt in range(retries):
+        try:
+            stock = yf.Ticker(ticker)
+            expirations = stock.options
+            if not expirations:
+                if attempt < retries - 1:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                return None
             
-        call_max_oi_row = calls.loc[calls['openInterest'].idxmax()] if calls['openInterest'].notnull().any() and calls['openInterest'].max() > 0 else calls.iloc[0]
-        call_max_vol_row = calls.loc[calls['volume'].idxmax()] if calls['volume'].notnull().any() and calls['volume'].max() > 0 else calls.iloc[0]
-        
-        put_max_oi_row = puts.loc[puts['openInterest'].idxmax()] if puts['openInterest'].notnull().any() and puts['openInterest'].max() > 0 else puts.iloc[0]
-        put_max_vol_row = puts.loc[puts['volume'].idxmax()] if puts['volume'].notnull().any() and puts['volume'].max() > 0 else puts.iloc[0]
-        
-        tot_call_vol = calls['volume'].sum() if calls['volume'].notnull().any() else 0
-        tot_put_vol = puts['volume'].sum() if puts['volume'].notnull().any() else 0
-        pc_ratio = round(tot_put_vol / tot_call_vol, 2) if tot_call_vol > 0 else "N/A"
+            nearest_exp = expirations[0]
+            opt_chain = stock.option_chain(nearest_exp)
+            calls = opt_chain.calls
+            puts = opt_chain.puts
+            
+            if calls.empty or puts.empty:
+                if attempt < retries - 1:
+                    time.sleep(1.0 * (attempt + 1))
+                    continue
+                return None
+                
+            call_max_oi_row = calls.loc[calls['openInterest'].idxmax()] if calls['openInterest'].notnull().any() and calls['openInterest'].max() > 0 else calls.iloc[0]
+            call_max_vol_row = calls.loc[calls['volume'].idxmax()] if calls['volume'].notnull().any() and calls['volume'].max() > 0 else calls.iloc[0]
+            
+            put_max_oi_row = puts.loc[puts['openInterest'].idxmax()] if puts['openInterest'].notnull().any() and puts['openInterest'].max() > 0 else puts.iloc[0]
+            put_max_vol_row = puts.loc[puts['volume'].idxmax()] if puts['volume'].notnull().any() and puts['volume'].max() > 0 else puts.iloc[0]
+            
+            tot_call_vol = calls['volume'].sum() if calls['volume'].notnull().any() else 0
+            tot_put_vol = puts['volume'].sum() if puts['volume'].notnull().any() else 0
+            pc_ratio = round(tot_put_vol / tot_call_vol, 2) if tot_call_vol > 0 else "N/A"
 
-        return {
-            "expiration_date": nearest_exp,
-            "pc_volume_ratio": pc_ratio,
-            "call_max_oi": {
-                "strike": call_max_oi_row.get("strike", "N/A"),
-                "oi": int(call_max_oi_row.get("openInterest", 0)) if pd.notnull(call_max_oi_row.get("openInterest")) else 0,
-                "price": round(float(call_max_oi_row.get("lastPrice", 0)), 2)
-            },
-            "call_max_vol": {
-                "strike": call_max_vol_row.get("strike", "N/A"),
-                "volume": int(call_max_vol_row.get("volume", 0)) if pd.notnull(call_max_vol_row.get("volume")) else 0,
-                "price": round(float(call_max_row.get("lastPrice", 0)), 2)
-            },
-            "put_max_oi": {
-                "strike": put_max_oi_row.get("strike", "N/A"),
-                "oi": int(put_max_oi_row.get("openInterest", 0)) if pd.notnull(put_max_oi_row.get("openInterest")) else 0,
-                "price": round(float(put_max_oi_row.get("lastPrice", 0)), 2)
-            },
-            "put_max_vol": {
-                "strike": put_max_vol_row.get("strike", "N/A"),
-                "volume": int(put_max_vol_row.get("volume", 0)) if pd.notnull(put_max_vol_row.get("volume")) else 0,
-                "price": round(float(put_max_vol_row.get("lastPrice", 0)), 2)
+            return {
+                "expiration_date": nearest_exp,
+                "pc_volume_ratio": pc_ratio,
+                "call_max_oi": {
+                    "strike": call_max_oi_row.get("strike", "N/A"),
+                    "oi": int(call_max_oi_row.get("openInterest", 0)) if pd.notnull(call_max_oi_row.get("openInterest")) else 0,
+                    "price": round(float(call_max_oi_row.get("lastPrice", 0)), 2)
+                },
+                "call_max_vol": {
+                    "strike": call_max_vol_row.get("strike", "N/A"),
+                    "volume": int(call_max_vol_row.get("volume", 0)) if pd.notnull(call_max_vol_row.get("volume")) else 0,
+                    "price": round(float(call_max_vol_row.get("lastPrice", 0)), 2)
+                },
+                "put_max_oi": {
+                    "strike": put_max_oi_row.get("strike", "N/A"),
+                    "oi": int(put_max_oi_row.get("openInterest", 0)) if pd.notnull(put_max_oi_row.get("openInterest")) else 0,
+                    "price": round(float(put_max_oi_row.get("lastPrice", 0)), 2)
+                },
+                "put_max_vol": {
+                    "strike": put_max_vol_row.get("strike", "N/A"),
+                    "volume": int(put_max_vol_row.get("volume", 0)) if pd.notnull(put_max_vol_row.get("volume")) else 0,
+                    "price": round(float(put_max_vol_row.get("lastPrice", 0)), 2)
+                }
             }
-        }
-    except Exception:
-        return None
+        except Exception:
+            if attempt < retries - 1:
+                time.sleep(1.0 * (attempt + 1))
+                continue
+            return None
+    return None
 
 def fetch_macro_indicators():
     macro_data = {}
@@ -541,7 +555,7 @@ def fetch_ownership_and_shorts(stock, info):
             
         inst_own_val = info.get("heldPercentInstitutions", None)
         if inst_own_val is not None:
-            data["inst_own"] = f"{inst_own_val * 100:.2f}%"
+            data["inst_own"] = f"{ins_own_val * 100:.2f}%"
     except Exception:
         pass
 
@@ -1169,7 +1183,7 @@ if analyze_btn:
     with st.spinner(f"🔍 [{ticker_input}] 헤지펀드 지분/공매도 세력 분석/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
         tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df = fetch_stock_technical_data(ticker_input)
         backtest_results = run_strategy_backtest(raw_df)
-        options_data = fetch_nearest_options_data(ticker_input)
+        options_data = fetch_nearest_options_data(ticker_input, retries=3)
         macro_data = fetch_macro_indicators()
         
         curr_p = tech_data.get('current_price', 0)
@@ -1227,7 +1241,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 헤지펀드 및 공매도 세력 분석 프롬프트
+            # 📌 [핵심 보정] 보수적 차트 지표 최우선 매도가 밴드 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
@@ -1271,7 +1285,7 @@ if analyze_btn:
 
 ---
 
-[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 헤지펀드/공매도 수급 규칙]
+[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 보수적 실전 매매 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
@@ -1288,7 +1302,7 @@ if analyze_btn:
 3. 밸류에이션, 스마트머니(헤지펀드) 및 공매도 세력/옵션 분석 ({ticker})
 - **유명 헤지펀드 포지션**: 13F 주요 보유 기관(Top Holders)의 지분 집중도와 스마트머니 매집 특성을 분석할 것.
 - **공매도 세력 및 숏스퀴즈 리스크**: Short Float, Days to Cover(상환 소요 일수), 월간 공매도 증감율을 결합하여 공매도 세력의 하방 압력 강도 및 숏스퀴즈 촉발 가능성을 평가할 것.
-- **IB 투자의견 신뢰도 가중**: Tier 1/2 투자은행의 목표가 변동을 가중 평가할 것.
+- **IB 투자의견 신뢰도 가중**: Tier 1/2 투자은행의 목표가 변동을 가중 평가하되, 기관 목표가는 중장기 상방 여력 참고용으로만 활용할 것.
 
 4. 정밀 기술적 지표, VWAP 및 백테스팅 평가 ({ticker})
 - **VWAP & 볼린저 밴드 스퀴즈 판정**: 현재가의 1Y/20D VWAP 위치 및 스퀴즈 상태(Squeeze On/Off)에 따른 폭발 방향성 제시.
@@ -1306,9 +1320,10 @@ if analyze_btn:
   * **하단 [사용자 대응 전략]과의 가격 일치**: 미보유자의 신규 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것.
 
 - **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
-- **[서식 주의]**: 
+- **[서식 및 보수적 매매 주의]**: 
   * 비중을 언급할 때는 반드시 '30%'처럼 퍼센트(%) 기호를 붙이고, 단어와 숫자 사이에 반드시 공백을 둘 것.
   * **피보나치 수치 표기 필수 규칙**: 반드시 **'피보나치 50.0%', '피보나치 38.2%', '피보나치 23.6%', '피보나치 61.8%'**와 같이 소수점과 퍼센트(%) 기호를 붙여 정확히 표기할 것.
+  * **보수적 매도가 밴드 설정 규칙**: 매도가 밴드 설정 시 후행적이고 낙관 편향이 있는 증권사 기관 목표가 대신, **볼린저 밴드 상단, 52주 고점 인근 저항선, 콜옵션 Max OI 저항벽 등 실제 차트/수급상의 실시간 저항선**을 최우선 기준으로 하여 현실적인 차익실현 달러 밴드를 도출할 것.
 
 [신규 진입 적격성 평가]
 * **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망) 중 택1]
@@ -1320,7 +1335,7 @@ if analyze_btn:
 * **분할 매수 밴드**: [피보나치 지지선 및 VWAP/옵션 지지선을 결합한 구체적 달러 범위와 근거]
 * **1차 목표가**: [피보나치 38.2% 또는 50.0% 구간 구체적 달러 가격대와 근거]
 * **2차 목표가**: [피보나치 23.6% 또는 52주 고점 인근 저항 구체적 달러 가격대와 근거]
-* **매도가 밴드**: [볼린저밴드 상단 및 피보나치 결합 분할 차익실현 구체적 달러 밴드]
+* **매도가 밴드**: [볼린저 밴드 상단, 피보나치 저항 및 콜옵션 저항벽을 최우선 반영한 실전 분할 차익실현 구체적 달러 밴드]
 * **손절(Stop-loss) 기준선**: [2.0x ATR 또는 1Y VWAP 이탈 시 추세 훼손 구체적 달러 가격대]
 * **불타기 조건**: [스퀴즈 상방 돌파 및 상방 저항선 안착 시 추가 매수 검토 기준]
 
@@ -1472,7 +1487,7 @@ if st.session_state.last_analysis_result:
 
         st.divider()
 
-        # 📌 [재배치 완료] 스마트머니 기본 지분 바로 아래로 이동한 13F 헤지펀드 지분 & 공매도 수급 정밀 분석
+        # 📌 13F 헤지펀드 지분 & 공매도 수급 정밀 분석
         st.markdown(f"**🐋 13F 헤지펀드 지분 & 공매도(Shorts) 수급 정밀 분석 ({res['ticker']})**")
         s_intel = hedge_short_intel.get("short_intel", {})
         
