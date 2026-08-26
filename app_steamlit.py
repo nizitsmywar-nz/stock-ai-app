@@ -152,19 +152,19 @@ def fetch_stock_technical_data(ticker: str):
     if df.empty:
         return {}, "N/A", {}, "N/A", "N/A", pd.DataFrame()
     
-    # 1. 이동평균선
+    # 이동평균선
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_60'] = df['Close'].rolling(window=60).mean()
     df['SMA_120'] = df['Close'].rolling(window=120).mean()
     
-    # 2. RSI 및 MACD
+    # RSI & MACD
     df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
     macd = ta.trend.MACD(df['Close'])
     df['MACD'] = macd.macd()
     df['MACD_Signal'] = macd.macd_signal()
     df['MACD_Hist'] = macd.macd_diff()
     
-    # 3. ATR & MFI
+    # ATR & MFI
     try:
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
     except Exception:
@@ -175,30 +175,25 @@ def fetch_stock_technical_data(ticker: str):
     except Exception:
         df['MFI'] = None
 
-    # 4. 볼린저 밴드 & 밴드폭
+    # 볼린저 밴드 & 밴드폭
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
     df['BB_High'] = bb.bollinger_hband()
     df['BB_Low'] = bb.bollinger_lband()
     df['BB_Mid'] = bb.bollinger_mavg()
     df['BB_Width'] = (df['BB_High'] - df['BB_Low']) / df['BB_Mid'] * 100
 
-    # 5. 켈트너 채널 (KC) 및 볼린저 밴드 스퀴즈 (BB Squeeze)
-    # KC: 20 SMA +/- 1.5 * ATR
+    # 켈트너 채널 (KC) 및 볼린저 밴드 스퀴즈 (BB Squeeze)
     if df['ATR'] is not None:
         df['KC_High'] = df['SMA_20'] + (1.5 * df['ATR'])
         df['KC_Low'] = df['SMA_20'] - (1.5 * df['ATR'])
-        # Squeeze On: BB 상하단이 모두 KC 안으로 수렴했을 때 (변동성 극단 압축)
         df['BB_Squeeze_On'] = (df['BB_High'] < df['KC_High']) & (df['BB_Low'] > df['KC_Low'])
     else:
         df['BB_Squeeze_On'] = False
 
-    # 6. VWAP (Volume-Weighted Average Price)
-    # Typical Price = (High + Low + Close) / 3
+    # VWAP 계산
     df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
     df['TP_Vol'] = df['Typical_Price'] * df['Volume']
-    # 전체 누적 VWAP (1Y Anchored VWAP)
     df['Cumulative_VWAP'] = df['TP_Vol'].cumsum() / df['Volume'].cumsum()
-    # 롤링 20일 VWAP
     df['Rolling_VWAP_20'] = df['TP_Vol'].rolling(window=20).sum() / df['Volume'].rolling(window=20).sum()
 
     latest = df.iloc[-1]
@@ -224,7 +219,6 @@ def fetch_stock_technical_data(ticker: str):
     
     atr_val = round(float(latest['ATR']), 2) if pd.notnull(latest['ATR']) else "N/A"
     
-    # 스퀴즈 상태 판별
     is_sqz_now = bool(latest['BB_Squeeze_On'])
     is_sqz_prev = bool(prev['BB_Squeeze_On'])
     if is_sqz_now:
@@ -261,7 +255,7 @@ def fetch_stock_technical_data(ticker: str):
     return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc, df
 
 # -------------------------------------------------------------
-# 📌 [신규 엔진] 정밀 전략 백테스팅 모듈 (1Y 일봉 기반)
+# 📌 정밀 전략 백테스팅 모듈 (1Y 일봉 기반)
 # -------------------------------------------------------------
 def run_strategy_backtest(df: pd.DataFrame):
     if df is None or len(df) < 60:
@@ -271,24 +265,17 @@ def run_strategy_backtest(df: pd.DataFrame):
     if len(b_df) < 30:
         return None
 
-    # Buy & Hold 기준 수익률
     bh_return = (b_df['Close'].iloc[-1] - b_df['Close'].iloc[0]) / b_df['Close'].iloc[0] * 100
 
-    # -----------------------------------------------------
-    # 전략 1: 모멘텀 스퀴즈 돌파 (MACD > Signal & BB Squeeze Off 상방)
-    # 진입: MACD_Hist > 0 and Close > SMA_20 and Close > Rolling_VWAP_20
-    # 청산: MACD_Hist < 0 or Close < (Entry - 1.5 * ATR)
-    # -----------------------------------------------------
+    # 전략 1: 모멘텀 스퀴즈 돌파
     pos1 = 0
     entry_p1 = 0
     trades1 = []
-    equity_curve1 = [1.0]
 
     for i in range(1, len(b_df)):
         cur = b_df.iloc[i]
         prev = b_df.iloc[i-1]
         
-        # 청산 조건
         if pos1 == 1:
             stop_price = entry_p1 - (1.5 * cur['ATR']) if pd.notnull(cur['ATR']) else entry_p1 * 0.93
             if cur['Close'] < stop_price or cur['MACD_Hist'] < 0:
@@ -297,7 +284,6 @@ def run_strategy_backtest(df: pd.DataFrame):
                 pos1 = 0
                 entry_p1 = 0
         
-        # 매수 조건
         if pos1 == 0:
             cond_macd = (prev['MACD_Hist'] <= 0 and cur['MACD_Hist'] > 0)
             cond_trend = cur['Close'] > cur['SMA_20']
@@ -310,11 +296,7 @@ def run_strategy_backtest(df: pd.DataFrame):
         ret = (b_df['Close'].iloc[-1] - entry_p1) / entry_p1
         trades1.append(ret)
 
-    # -----------------------------------------------------
-    # 전략 2: VWAP + RSI 밸류 되돌림 (Mean Reversion)
-    # 진입: Close < 1Y_VWAP and RSI < 40 and Close > BB_Low
-    # 청산: Close >= 1Y_VWAP or RSI >= 65 or Close < BB_Low * 0.97
-    # -----------------------------------------------------
+    # 전략 2: VWAP + RSI 밸류 되돌림
     pos2 = 0
     entry_p2 = 0
     trades2 = []
@@ -322,7 +304,6 @@ def run_strategy_backtest(df: pd.DataFrame):
     for i in range(1, len(b_df)):
         cur = b_df.iloc[i]
         
-        # 청산 조건
         if pos2 == 1:
             if cur['Close'] >= cur['Cumulative_VWAP'] or cur['RSI'] >= 65 or cur['Close'] < (cur['BB_Low'] * 0.97):
                 ret = (cur['Close'] - entry_p2) / entry_p2
@@ -330,7 +311,6 @@ def run_strategy_backtest(df: pd.DataFrame):
                 pos2 = 0
                 entry_p2 = 0
         
-        # 매수 조건
         if pos2 == 0:
             cond_val = cur['Close'] < cur['Cumulative_VWAP']
             cond_rsi = cur['RSI'] < 42
@@ -785,7 +765,7 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 히스토리용 전략 간결 요약 함수
+# 📌 히스토리용 전략 요약 함수
 # -------------------------------------------------------------
 def summarize_user_strategy(raw_text: str) -> str:
     if not raw_text or raw_text == "분석 리포트 참조":
@@ -820,8 +800,13 @@ def summarize_user_strategy(raw_text: str) -> str:
         summary += "."
     return summary
 
+# -------------------------------------------------------------
+# 📌 [업그레이드] 신규 진입 적격성 평가 파서
+# -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
+    entry_grade = "분석 리포트 참조"
+    entry_rr = "분석 리포트 참조"
     target_1 = "분석 리포트 참조"
     target_2 = ""
     sell_target = "분석 리포트 참조"
@@ -852,15 +837,24 @@ def parse_full_trading_scenario(text):
                     action = "홀딩"
                 break
 
-    # 2. 사용자 대응 전략 원문 추출
+    # 2. 신규 진입 적격성 추출
+    match_entry_grade = re.search(r"\[신규\s*진입\s*적격성\s*평가\s*[:\-]?\s*([^\]]+)\]", text)
+    if match_entry_grade:
+        entry_grade = match_entry_grade.group(1).strip()
+    
     for line in text.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
-        if "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
+        if ("신규 진입 등급" in line_clean or "진입 등급" in line_clean) and entry_grade == "분석 리포트 참조":
+            if ":" in line_clean:
+                entry_grade = ":".join(line_clean.split(":")[1:]).strip()
+        elif "예상 손익비" in line_clean or "손익비" in line_clean:
+            if ":" in line_clean:
+                entry_rr = ":".join(line_clean.split(":")[1:]).strip()
+        elif "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
             if ":" in line_clean:
                 user_strategy_raw = ":".join(line_clean.split(":")[1:]).strip()
             else:
                 user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
-            break
 
     # 3. [정밀 매매 시나리오] 블록 파싱
     scenario_block = text
@@ -897,7 +891,7 @@ def parse_full_trading_scenario(text):
                 pyramiding = ":".join(line_clean.split(":")[1:]).strip()
 
     user_strategy_summary = summarize_user_strategy(user_strategy_raw)
-    return action, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
+    return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
@@ -977,6 +971,12 @@ with st.sidebar:
             action_badge = "🟢 매수" if data['action'] == "매수" else ("🔴 매도" if data['action'] == "매도" else "🟡 홀딩")
             with st.expander(f"**{t_code}** (${data['price']}) | {action_badge}", expanded=False):
                 st.markdown(f"- **현재가:** `${data['price']}`")
+                
+                # 신규 진입 적합성 뱃지
+                entry_grade_val = data.get('entry_grade', '')
+                if entry_grade_val and entry_grade_val != "분석 리포트 참조":
+                    st.markdown(f"- **🆕 신규 진입 판정:** `{entry_grade_val}`")
+                
                 if data.get('my_avg', 0) > 0:
                     st.markdown(f"- **💼 내 평단:** `${data['my_avg']}` ({data.get('my_return', 'N/A')})")
                 
@@ -1111,7 +1111,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 고도화된 프롬프트 (BB Squeeze, VWAP, 백테스팅 성과 반영)
+            # 📌 [핵심 개선] 미보유자 신규 진입 적격성 평가 및 가격 일관성 엄격 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
@@ -1155,7 +1155,7 @@ if analyze_btn:
 
 ---
 
-[지시사항 - 분석 정합성 및 가격 일관성 엄격 준수 규칙]
+[지시사항 - 분석 정합성 및 신규 진입 적격성 엄격 준수 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
@@ -1177,13 +1177,23 @@ if analyze_btn:
 - **백테스팅 시사점**: 과거 1년간 모멘텀 스퀴즈 전략과 VWAP 평균회귀 전략 중 해당 종목에 어떤 퀀트 로직이 높은 승률과 수익률을 보였는지 간략히 비교 평가.
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
 
-5. [정밀 매매 시나리오]
+5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
+- **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망/리스크 과다) 중 택1]
+- **진입 적합성 종합 판정**: 미보유자 입장에서 현재 시점에 무조건 하방 매수를 기다려야 하는지, 아니면 현재가 부근에서 즉시/분할 진입할 만한 모멘텀과 밸류에이션 메리트가 있는지 객관적이고 냉정하게 평가할 것 (역배열/추세 하락 종목은 무조건적인 진입 추천 금지).
+- **예상 손익비 (Risk/Reward Ratio)**: 1차 목표가까지의 기대 상승률 대비 손절선까지의 하방 리스크 비율을 수치로 명시할 것 (예: 기대수익 +12% / 손실리스크 -4.5% = 손익비 2.67 : 1).
+
+6. [정밀 매매 시나리오]
 - **[매수 밴드 및 진입 가격의 상·하단 논리 일치 규칙 (필수)]**:
   * **분할 매수 밴드 설정**: 피보나치 지지선, 20일 VWAP, 풋옵션 지지선을 결합하여 실질적 달러 범위를 도출할 것.
-  * **하단 [사용자 대응 전략]과의 가격 일치**: 미보유자 진입가나 추가 매수가는 상단 **[분할 매수 밴드]**와 100% 동일한 수치를 인용할 것.
+  * **하단 [사용자 대응 전략]과의 가격 일치**: 미보유자의 신규 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것 (상호 충돌 금지).
 
 - **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
 - **[서식 주의]**: 비중을 언급할 때는 반드시 '30%'처럼 퍼센트(%) 기호를 붙이고, 단어와 숫자 사이에 반드시 공백을 둘 것.
+
+[신규 진입 적격성 평가]
+* **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망) 중 택1]
+* **진입 적합성 분석**: [미보유자 관점에서 현재 진입의 타당성, 추세 지속성 및 밸류에이션 매력도 분석]
+* **예상 손익비 (Risk/Reward)**: [기대수익 % : 손실 % (비율)]
 
 [정밀 매매 시나리오]
 
@@ -1196,7 +1206,7 @@ if analyze_btn:
 
 [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
 
-* **사용자 대응 전략**: [보유자의 경우 평단가 및 수익률에 따른 부분 익절/비중관리/홀딩 유지 방안을 구체적 비중(예: 물량의 30% 매도 등)과 지지선/저항선 달러 수치를 공백을 두어 명확히 작성할 것. 미보유자의 경우 상단 '분할 매수 밴드'와 정확히 일치하는 진입 가격을 명시할 것]
+* **사용자 대응 전략**: [보유자의 경우 평단가 및 수익률에 따른 부분 익절/비중관리/홀딩 유지 방안을 구체적 비중(예: 물량의 30% 매도 등)과 지지선/저항선 달러 수치를 공백을 두어 명확히 작성할 것. 미보유자의 경우 상단 '신규 진입 적격성 평가' 및 '분할 매수 밴드'와 정확히 일치하는 진입 가격을 명시할 것]
 """
             prompt = PromptTemplate(
                 input_variables=["ticker", "stock_date", "tech_json", "backtest_json", "fib_json", "options_json", "ownership_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "news_json", "analyst_json"],
@@ -1237,9 +1247,11 @@ if analyze_btn:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
         if response_content and not response_content.startswith("⚠️"):
-            act, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary = parse_full_trading_scenario(response_content)
+            act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
                 "action": act,
+                "entry_grade": ent_grade,
+                "entry_rr": ent_rr,
                 "price": curr_p,
                 "my_avg": user_avg_price if is_holding else 0,
                 "my_return": my_return_str if is_holding else "미보유",
@@ -1346,32 +1358,28 @@ if st.session_state.last_analysis_result:
         diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
         s_c4.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
 
-    # 📌 [신규] 2. 퀀트 모멘텀 & VWAP / 볼린저 밴드 스퀴즈 컨테이너
+    # 2. 퀀트 모멘텀 & VWAP / 볼린저 밴드 스퀴즈 컨테이너
     with st.container(border=True):
         st.markdown("##### 🧪 **퀀트 모멘텀, 스마트머니 VWAP & 볼린저 밴드 스퀴즈**")
         
         q_c1, q_c2, q_c3, q_c4 = st.columns(4)
         
-        # 1Y Anchored VWAP
         vwap_1y = tech_data.get('vwap_1y', 'N/A')
         diff_vwap1y = round(((curr_p - vwap_1y) / vwap_1y) * 100, 1) if isinstance(vwap_1y, (int, float)) and curr_p else None
         q_c1.metric("1Y 누적 VWAP (장기 평단)", f"${vwap_1y}", f"현재가 {diff_vwap1y:+.1f}%" if diff_vwap1y is not None else None)
 
-        # 20D Rolling VWAP
         vwap_20d = tech_data.get('vwap_20d', 'N/A')
         diff_vwap20 = round(((curr_p - vwap_20d) / vwap_20d) * 100, 1) if isinstance(vwap_20d, (int, float)) and curr_p else None
         q_c2.metric("20일 단기 VWAP (스마트머니)", f"${vwap_20d}", f"현재가 {diff_vwap20:+.1f}%" if diff_vwap20 is not None else None)
 
-        # BB Width & Squeeze Status
         bb_w = tech_data.get('bb_width_pct', 'N/A')
         q_c3.metric("볼린저 밴드폭 (Bandwidth)", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
         
-        # ATR 변동폭
         q_c4.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
         
         st.markdown(f"**⚡ 변동성 국면 판정:** `{tech_data.get('bb_squeeze_status', 'N/A')}`")
 
-    # 📌 [신규] 3. 1년 과거 데이터 기반 듀얼 전략 백테스팅 컨테이너
+    # 3. 1년 과거 데이터 기반 듀얼 전략 백테스팅 컨테이너
     if backtest_results:
         with st.container(border=True):
             st.markdown("##### 🔬 **과거 1년 퀀트 전략 백테스팅 시뮬레이션 (1-Year Backtest)**")
