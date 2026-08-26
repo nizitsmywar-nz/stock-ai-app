@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 
 import streamlit as st
 import pandas as pd
+import numpy as np
 import pandas_datareader.data as web
 import ta
 import yfinance as yf
@@ -122,7 +123,7 @@ if "last_analysis_result" not in st.session_state:
     st.session_state.last_analysis_result = None
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈 (stock.info vs fast_info 판별 로직)
+# 1. RAG 데이터 수집 모듈 (기술적 지표, BB Squeeze, VWAP 등)
 # -------------------------------------------------------------
 def get_stock_info_with_retry(stock, retries=3):
     for attempt in range(retries):
@@ -149,17 +150,21 @@ def fetch_stock_technical_data(ticker: str):
     if df.empty:
         df = stock.history(period="6mo")
     if df.empty:
-        return {}, "N/A", {}, "N/A", "N/A"
+        return {}, "N/A", {}, "N/A", "N/A", pd.DataFrame()
     
+    # 1. 이동평균선
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_60'] = df['Close'].rolling(window=60).mean()
     df['SMA_120'] = df['Close'].rolling(window=120).mean()
+    
+    # 2. RSI 및 MACD
     df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
     macd = ta.trend.MACD(df['Close'])
     df['MACD'] = macd.macd()
     df['MACD_Signal'] = macd.macd_signal()
     df['MACD_Hist'] = macd.macd_diff()
     
+    # 3. ATR & MFI
     try:
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
     except Exception:
@@ -170,11 +175,34 @@ def fetch_stock_technical_data(ticker: str):
     except Exception:
         df['MFI'] = None
 
+    # 4. 볼린저 밴드 & 밴드폭
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
     df['BB_High'] = bb.bollinger_hband()
     df['BB_Low'] = bb.bollinger_lband()
-    
+    df['BB_Mid'] = bb.bollinger_mavg()
+    df['BB_Width'] = (df['BB_High'] - df['BB_Low']) / df['BB_Mid'] * 100
+
+    # 5. 켈트너 채널 (KC) 및 볼린저 밴드 스퀴즈 (BB Squeeze)
+    # KC: 20 SMA +/- 1.5 * ATR
+    if df['ATR'] is not None:
+        df['KC_High'] = df['SMA_20'] + (1.5 * df['ATR'])
+        df['KC_Low'] = df['SMA_20'] - (1.5 * df['ATR'])
+        # Squeeze On: BB 상하단이 모두 KC 안으로 수렴했을 때 (변동성 극단 압축)
+        df['BB_Squeeze_On'] = (df['BB_High'] < df['KC_High']) & (df['BB_Low'] > df['KC_Low'])
+    else:
+        df['BB_Squeeze_On'] = False
+
+    # 6. VWAP (Volume-Weighted Average Price)
+    # Typical Price = (High + Low + Close) / 3
+    df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
+    df['TP_Vol'] = df['Typical_Price'] * df['Volume']
+    # 전체 누적 VWAP (1Y Anchored VWAP)
+    df['Cumulative_VWAP'] = df['TP_Vol'].cumsum() / df['Volume'].cumsum()
+    # 롤링 20일 VWAP
+    df['Rolling_VWAP_20'] = df['TP_Vol'].rolling(window=20).sum() / df['Volume'].rolling(window=20).sum()
+
     latest = df.iloc[-1]
+    prev = df.iloc[-2] if len(df) >= 2 else latest
     last_date = df.index[-1].strftime("%Y-%m-%d")
     
     high_52w_calc = round(float(df['High'].max()), 2)
@@ -196,6 +224,19 @@ def fetch_stock_technical_data(ticker: str):
     
     atr_val = round(float(latest['ATR']), 2) if pd.notnull(latest['ATR']) else "N/A"
     
+    # 스퀴즈 상태 판별
+    is_sqz_now = bool(latest['BB_Squeeze_On'])
+    is_sqz_prev = bool(prev['BB_Squeeze_On'])
+    if is_sqz_now:
+        squeeze_status = "⚠️ 스퀴즈 진행 중 (에너지 응축/변동성 폭발 임박)"
+    elif is_sqz_prev and not is_sqz_now:
+        if latest['Close'] > latest['BB_Mid']:
+            squeeze_status = "🚀 상방 스퀴즈 분출 (상승 랠리 가속)"
+        else:
+            squeeze_status = "📉 하방 스퀴즈 이탈 (하락 가속 경보)"
+    else:
+        squeeze_status = "정상 변동성 구간 (스퀴즈 해제 상태)"
+
     data = {
         "current_price": round(float(latest['Close']), 2),
         "atr_14": atr_val,
@@ -210,9 +251,135 @@ def fetch_stock_technical_data(ticker: str):
         "macd_signal": round(float(latest['MACD_Signal']), 2) if pd.notnull(latest['MACD_Signal']) else "N/A",
         "macd_hist": round(float(latest['MACD_Hist']), 2) if pd.notnull(latest['MACD_Hist']) else "N/A",
         "bb_upper": round(float(latest['BB_High']), 2) if pd.notnull(latest['BB_High']) else "N/A",
-        "bb_lower": round(float(latest['BB_Low']), 2) if pd.notnull(latest['BB_Low']) else "N/A"
+        "bb_middle": round(float(latest['BB_Mid']), 2) if pd.notnull(latest['BB_Mid']) else "N/A",
+        "bb_lower": round(float(latest['BB_Low']), 2) if pd.notnull(latest['BB_Low']) else "N/A",
+        "bb_width_pct": round(float(latest['BB_Width']), 2) if pd.notnull(latest['BB_Width']) else "N/A",
+        "bb_squeeze_status": squeeze_status,
+        "vwap_1y": round(float(latest['Cumulative_VWAP']), 2) if pd.notnull(latest['Cumulative_VWAP']) else "N/A",
+        "vwap_20d": round(float(latest['Rolling_VWAP_20']), 2) if pd.notnull(latest['Rolling_VWAP_20']) else "N/A"
     }
-    return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc
+    return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc, df
+
+# -------------------------------------------------------------
+# 📌 [신규 엔진] 정밀 전략 백테스팅 모듈 (1Y 일봉 기반)
+# -------------------------------------------------------------
+def run_strategy_backtest(df: pd.DataFrame):
+    if df is None or len(df) < 60:
+        return None
+
+    b_df = df.copy().dropna(subset=['Close', 'SMA_20', 'MACD', 'MACD_Signal', 'ATR', 'Cumulative_VWAP'])
+    if len(b_df) < 30:
+        return None
+
+    # Buy & Hold 기준 수익률
+    bh_return = (b_df['Close'].iloc[-1] - b_df['Close'].iloc[0]) / b_df['Close'].iloc[0] * 100
+
+    # -----------------------------------------------------
+    # 전략 1: 모멘텀 스퀴즈 돌파 (MACD > Signal & BB Squeeze Off 상방)
+    # 진입: MACD_Hist > 0 and Close > SMA_20 and Close > Rolling_VWAP_20
+    # 청산: MACD_Hist < 0 or Close < (Entry - 1.5 * ATR)
+    # -----------------------------------------------------
+    pos1 = 0
+    entry_p1 = 0
+    trades1 = []
+    equity_curve1 = [1.0]
+
+    for i in range(1, len(b_df)):
+        cur = b_df.iloc[i]
+        prev = b_df.iloc[i-1]
+        
+        # 청산 조건
+        if pos1 == 1:
+            stop_price = entry_p1 - (1.5 * cur['ATR']) if pd.notnull(cur['ATR']) else entry_p1 * 0.93
+            if cur['Close'] < stop_price or cur['MACD_Hist'] < 0:
+                ret = (cur['Close'] - entry_p1) / entry_p1
+                trades1.append(ret)
+                pos1 = 0
+                entry_p1 = 0
+        
+        # 매수 조건
+        if pos1 == 0:
+            cond_macd = (prev['MACD_Hist'] <= 0 and cur['MACD_Hist'] > 0)
+            cond_trend = cur['Close'] > cur['SMA_20']
+            cond_vwap = cur['Close'] > cur['Rolling_VWAP_20'] if pd.notnull(cur['Rolling_VWAP_20']) else True
+            if cond_macd and cond_trend and cond_vwap:
+                pos1 = 1
+                entry_p1 = cur['Close']
+
+    if pos1 == 1:
+        ret = (b_df['Close'].iloc[-1] - entry_p1) / entry_p1
+        trades1.append(ret)
+
+    # -----------------------------------------------------
+    # 전략 2: VWAP + RSI 밸류 되돌림 (Mean Reversion)
+    # 진입: Close < 1Y_VWAP and RSI < 40 and Close > BB_Low
+    # 청산: Close >= 1Y_VWAP or RSI >= 65 or Close < BB_Low * 0.97
+    # -----------------------------------------------------
+    pos2 = 0
+    entry_p2 = 0
+    trades2 = []
+
+    for i in range(1, len(b_df)):
+        cur = b_df.iloc[i]
+        
+        # 청산 조건
+        if pos2 == 1:
+            if cur['Close'] >= cur['Cumulative_VWAP'] or cur['RSI'] >= 65 or cur['Close'] < (cur['BB_Low'] * 0.97):
+                ret = (cur['Close'] - entry_p2) / entry_p2
+                trades2.append(ret)
+                pos2 = 0
+                entry_p2 = 0
+        
+        # 매수 조건
+        if pos2 == 0:
+            cond_val = cur['Close'] < cur['Cumulative_VWAP']
+            cond_rsi = cur['RSI'] < 42
+            cond_bb = cur['Close'] > cur['BB_Low']
+            if cond_val and cond_rsi and cond_bb:
+                pos2 = 1
+                entry_p2 = cur['Close']
+
+    if pos2 == 1:
+        ret = (b_df['Close'].iloc[-1] - entry_p2) / entry_p2
+        trades2.append(ret)
+
+    def calc_stats(trades):
+        if not trades:
+            return {"total_ret": 0.0, "win_rate": 0.0, "trades_count": 0, "profit_factor": 0.0, "mdd": 0.0}
+        
+        cum = 1.0
+        peak = 1.0
+        mdd = 0.0
+        wins = [t for t in trades if t > 0]
+        losses = [t for t in trades if t < 0]
+        
+        for t in trades:
+            cum *= (1.0 + t)
+            if cum > peak:
+                peak = cum
+            dd = (peak - cum) / peak
+            if dd > mdd:
+                mdd = dd
+                
+        tot_ret = (cum - 1.0) * 100
+        win_rate = (len(wins) / len(trades)) * 100 if trades else 0
+        sum_win = sum(wins) if wins else 0
+        sum_loss = abs(sum(losses)) if losses else 0
+        pf = round(sum_win / sum_loss, 2) if sum_loss > 0 else (99.9 if sum_win > 0 else 0.0)
+
+        return {
+            "total_ret": round(tot_ret, 2),
+            "win_rate": round(win_rate, 1),
+            "trades_count": len(trades),
+            "profit_factor": pf,
+            "mdd": round(mdd * 100, 2)
+        }
+
+    return {
+        "benchmark_buy_and_hold": round(bh_return, 2),
+        "strategy_1_momentum_squeeze": calc_stats(trades1),
+        "strategy_2_vwap_mean_reversion": calc_stats(trades2)
+    }
 
 def fetch_nearest_options_data(ticker: str):
     try:
@@ -618,7 +785,7 @@ def extract_clean_text(content):
     return str(content)
 
 # -------------------------------------------------------------
-# 📌 [핵심 로직] 히스토리용 전략 간결 요약 함수 (토큰 소모 0)
+# 📌 히스토리용 전략 간결 요약 함수
 # -------------------------------------------------------------
 def summarize_user_strategy(raw_text: str) -> str:
     if not raw_text or raw_text == "분석 리포트 참조":
@@ -653,9 +820,6 @@ def summarize_user_strategy(raw_text: str) -> str:
         summary += "."
     return summary
 
-# -------------------------------------------------------------
-# 📌 [핵심 개선] 블록 단위 격리 파서 (상·하단 매수 밴드 일치 추출)
-# -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
     target_1 = "분석 리포트 참조"
@@ -698,7 +862,7 @@ def parse_full_trading_scenario(text):
                 user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
             break
 
-    # 3. [정밀 매매 시나리오] 블록 내부 텍스트만 분리하여 파싱
+    # 3. [정밀 매매 시나리오] 블록 파싱
     scenario_block = text
     if "[정밀 매매 시나리오]" in text:
         after_header = text.split("[정밀 매매 시나리오]")[1]
@@ -733,7 +897,6 @@ def parse_full_trading_scenario(text):
                 pyramiding = ":".join(line_clean.split(":")[1:]).strip()
 
     user_strategy_summary = summarize_user_strategy(user_strategy_raw)
-
     return action, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
@@ -770,7 +933,7 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
 # 2. 사이드바 UI
 # -------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ⚡ **AI Stock Analyst**")
+    st.markdown("### ⚡ **AI Stock Analyst Pro**")
     
     MODEL_OPTIONS = {
         "Gemini 3.1 Flash Lite": "gemini-3.1-flash-lite",
@@ -801,7 +964,7 @@ with st.sidebar:
             user_shares = st.number_input("보유 수량 (주)", min_value=0.0, value=0.0, step=1.0, format="%.1f")
             
     st.write("")
-    analyze_btn = st.button("🚀 분석 실행", type="primary", use_container_width=True)
+    analyze_btn = st.button("🚀 분석 & 백테스팅 실행", type="primary", use_container_width=True)
     st.divider()
 
     # 📌 종목별 트레이딩 히스토리
@@ -878,7 +1041,7 @@ with st.sidebar:
 # -------------------------------------------------------------
 # 3. 메인 분석 화면 & 분석 완료 즉시 렌더링 로직
 # -------------------------------------------------------------
-st.header(f"📊 {ticker_input} 종합 밸류에이션 & 투자전략 리포트")
+st.header(f"📊 {ticker_input} 종합 밸류에이션 & 정밀 트레이딩 리포트")
 
 # [1] 분석 버튼 클릭 시 실행
 if analyze_btn:
@@ -889,8 +1052,9 @@ if analyze_btn:
         except Exception:
             api_key = None
             
-    with st.spinner(f"🔍 [{ticker_input}] 실시간 재무(최대 3회 재시도)/옵션체인/피보나치/공매도 수집 및 [{selected_model_label}] 분석 중..."):
-        tech_data, stock_date, fib_levels, high_52_calc, low_52_calc = fetch_stock_technical_data(ticker_input)
+    with st.spinner(f"🔍 [{ticker_input}] VWAP/BB스퀴즈/옵션체인/피보나치 수집 및 1년 전략 백테스팅 & AI 추론 중..."):
+        tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df = fetch_stock_technical_data(ticker_input)
+        backtest_results = run_strategy_backtest(raw_df)
         options_data = fetch_nearest_options_data(ticker_input)
         macro_data = fetch_macro_indicators()
         
@@ -926,7 +1090,8 @@ if analyze_btn:
                 "analysis_requested_at": get_current_kst_time_str(),
                 "stock_data_date": stock_date
             },
-            "technical_and_volatility": tech_data,
+            "technical_vwap_and_squeeze": tech_data,
+            "one_year_backtesting": backtest_results,
             "fibonacci_retracement_6m": fib_levels,
             "options_chain_nearest": options_data,
             "ownership_and_short_interest": ownership,
@@ -946,49 +1111,52 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [핵심 개선] 상·하단 가격 정합성 및 일관성 보장 프롬프트
+            # 📌 고도화된 프롬프트 (BB Squeeze, VWAP, 백테스팅 성과 반영)
             template = """
 [RAG 심층 주입 데이터]
-1. 기술적/수급 및 ATR 변동성 데이터 ({ticker}) (기준일: {stock_date}):
+1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
 {tech_json}
 
-2. 최근 6개월 피보나치 되돌림 밴드:
+2. 최근 1년 과거 데이터 기반 듀얼 전략 백테스팅 결과:
+{backtest_json}
+
+3. 최근 6개월 피보나치 되돌림 밴드:
 {fib_json}
 
-3. 가장 빠른 만기 옵션 체인 수급 (콜/풋 Max OI & Volume):
+4. 가장 빠른 만기 옵션 체인 수급 (콜/풋 Max OI & Volume):
 {options_json}
 
-4. 내부자/기관 지분율 및 최근 매매, 공매도 지표 (Short Interest):
+5. 내부자/기관 지분율 및 최근 매매, 공매도 지표 (Short Interest):
 {ownership_json}
 
-5. 실적 발표 일정 및 52주 고저:
+6. 실적 발표 일정 및 52주 고저:
 {earnings_json}
 
-6. 매크로 및 6대 자산 실시간 지표 (출처 및 기준일 포함):
+7. 매크로 및 6대 자산 실시간 지표 (출처 및 기준일 포함):
 {macro_json}
 
-7. 글로벌 거시/시장 주요 뉴스:
+8. 글로벌 거시/시장 주요 뉴스:
 {macro_news_json}
 
-8. 주요 섹터 5일 등락률:
+9. 주요 섹터 5일 등락률:
 {sector_json}
 
-9. 펀더멘털 및 6대 밸류에이션:
+10. 펀더멘털 및 6대 밸류에이션:
 {fund_json}
 
-10. 사용자 보유 현황:
+11. 사용자 보유 현황:
 {user_position}
 
-11. 종목 최신 주요 기사:
+12. 종목 최신 주요 기사:
 {news_json}
 
-12. 최근 2개월 증권가 투자의견 변동:
+13. 최근 2개월 증권가 투자의견 변동:
 {analyst_json}
 
 ---
 
 [지시사항 - 분석 정합성 및 가격 일관성 엄격 준수 규칙]
-위 데이터를 바탕으로 최고 수준의 금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
+위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
 - **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 요약 명시할 것.
@@ -998,40 +1166,40 @@ if analyze_btn:
 2. 섹터 전망 및 순환매
 - 상대적 강세/약세 섹터 요약 및 자금 순환매 방향
 
-3. 밸류에이션 및 스마트머니/공매도/옵션 수급 분석 ({ticker})
-- **재무 특이사항 분석**: PBR이 음수이거나 ROE가 산출 불가인 경우, 반드시 '대규모 자사주 매입/소각에 따른 자본잠식(음수 자기자본)' 특성을 설명할 것. 배당/가치주인 경우 왜곡된 성장 모델(PEG) 대신 배당수익률 및 잉여현금흐름(FCF) 관점으로 재평가할 것.
-- **옵션 체인 분석**: 콜옵션 Max OI/Vol 행사가를 현재가와 정확히 비교하여 저항/지지벽을 논리적으로 도출할 것. 현재가보다 낮은 행사가를 돌파 시 매수라고 하지 말 것.
-- **증권가 투자의견 반영**: 최근 2개월 투자의견 변동 내역(예: Barclays, UBS 등)의 하향/상향 의견을 리포트에 명확히 반영할 것.
+3. 밸류에이션 및 스마트머니/옵션/공매도 분석 ({ticker})
+- **재무 특이사항 분석**: PBR 음수/ROE 산출 불가 시 자본잠식(자사주 매입) 특성 반영.
+- **옵션 체인 및 공매도**: 콜옵션 저항벽/풋옵션 지지벽 및 Short Float 상환 압력 평가.
 
-4. 종목 종합 평가 및 [정밀 매매 시나리오] ({ticker})
-- **기술적 지표 엄격 판정**:
-  * 0선 위(MACD > 0) 골든크로스(Hist > 0): 대세 상승 속 강한 모멘텀 확장.
-  * 0선 아래(MACD < 0) 골든크로스(Hist > 0): 하락 국면에서의 단순 낙폭과대 기술적 되돌림(약세장 반등).
-  * Hist가 +0.10 미만인 경우 '모멘텀 둔화 및 재반락 위험'으로 경고할 것.
-- 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 리스크 | 종합 평점 제시
+4. 정밀 기술적 지표, VWAP 및 백테스팅 평가 ({ticker})
+- **VWAP & 볼린저 밴드 스퀴즈 판정**:
+  * 현재가가 1Y/20D VWAP 상단/하단 중 어디에 위치하며 스마트머니 매집 단가 대비 유리한지 분석.
+  * 볼린저 밴드 밴드폭(Bandwidth)과 KC 기반 스퀴즈(Squeeze On/Off) 상태를 평가하여 '변동성 폭발 방향성' 제시.
+- **백테스팅 시사점**: 과거 1년간 모멘텀 스퀴즈 전략과 VWAP 평균회귀 전략 중 해당 종목에 어떤 퀀트 로직이 높은 승률과 수익률을 보였는지 간략히 비교 평가.
+- 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
 
+5. [정밀 매매 시나리오]
 - **[매수 밴드 및 진입 가격의 상·하단 논리 일치 규칙 (필수)]**:
-  * **분할 매수 밴드 설정**: 종목의 현재 추세에 맞춰 실질적인 1차 지지선(피보나치 38.2% 또는 풋옵션 지지선)과 2차 지지선(피보나치 61.8% 또는 2.0x ATR 지지선)을 결합하여 명확한 가격 범위를 도출할 것.
-  * **하단 [사용자 대응 전략]과의 가격 일치**: 하단 사용자 대응 전략에서 언급하는 **미보유자의 신규 진입가** 또는 **보유자의 추가 매수가**는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것 (상단과 하단의 가격대가 서로 충돌하는 오류 절대 금지).
+  * **분할 매수 밴드 설정**: 피보나치 지지선, 20일 VWAP, 풋옵션 지지선을 결합하여 실질적 달러 범위를 도출할 것.
+  * **하단 [사용자 대응 전략]과의 가격 일치**: 미보유자 진입가나 추가 매수가는 상단 **[분할 매수 밴드]**와 100% 동일한 수치를 인용할 것.
 
 - **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
-- **[서식 주의]**: 비중을 언급할 때는 반드시 '30%'처럼 퍼센트(%) 기호를 붙이고, 단어와 숫자 사이에 반드시 공백(띄어쓰기)을 둘 것.
+- **[서식 주의]**: 비중을 언급할 때는 반드시 '30%'처럼 퍼센트(%) 기호를 붙이고, 단어와 숫자 사이에 반드시 공백을 둘 것.
 
 [정밀 매매 시나리오]
 
-* **분할 매수 밴드**: [피보나치 지지선 및 옵션/ATR 지지선을 결합한 구체적 달러 범위와 근거]
+* **분할 매수 밴드**: [피보나치 지지선 및 VWAP/옵션 지지선을 결합한 구체적 달러 범위와 근거]
 * **1차 목표가**: [피보나치 38.2% 또는 50% 구간 구체적 달러 가격대와 근거]
 * **2차 목표가**: [피보나치 23.6% 또는 52주 고점 인근 저항 구체적 달러 가격대와 근거]
 * **매도가 밴드**: [볼린저밴드 상단 및 피보나치 결합 분할 차익실현 구체적 달러 밴드]
-* **손절(Stop-loss) 기준선**: [2.0x ATR 이탈 시 추세 훼손 구체적 달러 가격대]
-* **불타기 조건**: [현재가보다 높은 상방 저항선 안착 및 돌파 시 추가 매수 검토 기준]
+* **손절(Stop-loss) 기준선**: [2.0x ATR 또는 1Y VWAP 이탈 시 추세 훼손 구체적 달러 가격대]
+* **불타기 조건**: [스퀴즈 상방 돌파 및 상방 저항선 안착 시 추가 매수 검토 기준]
 
 [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
 
 * **사용자 대응 전략**: [보유자의 경우 평단가 및 수익률에 따른 부분 익절/비중관리/홀딩 유지 방안을 구체적 비중(예: 물량의 30% 매도 등)과 지지선/저항선 달러 수치를 공백을 두어 명확히 작성할 것. 미보유자의 경우 상단 '분할 매수 밴드'와 정확히 일치하는 진입 가격을 명시할 것]
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "fib_json", "options_json", "ownership_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "news_json", "analyst_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "backtest_json", "fib_json", "options_json", "ownership_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "news_json", "analyst_json"],
                 template=template
             )
             llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
@@ -1041,6 +1209,7 @@ if analyze_btn:
                 "ticker": ticker_input,
                 "stock_date": stock_date,
                 "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
+                "backtest_json": json.dumps(backtest_results, indent=2, ensure_ascii=False) if backtest_results else "백테스팅 데이터 부족",
                 "fib_json": json.dumps(fib_levels, indent=2, ensure_ascii=False),
                 "options_json": json.dumps(options_data, indent=2, ensure_ascii=False) if options_data else "옵션 데이터 없음",
                 "ownership_json": json.dumps(ownership, indent=2, ensure_ascii=False),
@@ -1096,6 +1265,7 @@ if analyze_btn:
             "user_shares": user_shares,
             "my_return_str": my_return_str,
             "tech_data": tech_data,
+            "backtest_results": backtest_results,
             "stock_date": stock_date,
             "fib_levels": fib_levels,
             "options_data": options_data,
@@ -1118,6 +1288,7 @@ if st.session_state.last_analysis_result:
     ownership = res["ownership"]
     earnings_info = res["earnings_info"]
     tech_data = res["tech_data"]
+    backtest_results = res.get("backtest_results", None)
     macro_data = res["macro_data"]
     fib_levels = res["fib_levels"]
     options_data = res["options_data"]
@@ -1129,7 +1300,7 @@ if st.session_state.last_analysis_result:
     else:
         st.markdown("📡 **데이터 소스:** `🟡 Yahoo Finance stock.fast_info` (야후 서버 지연으로 인한 간이 시세 백업 데이터 적용)")
 
-    # 💼 보유 주식 평가손익 전용 컨테이너
+    # 💼 보유 주식 평가손익 컨테이너
     if res["is_holding"] and res["user_avg_price"] > 0 and res["user_shares"] > 0 and curr_p > 0:
         total_invested = res["user_avg_price"] * res["user_shares"]
         total_current = curr_p * res["user_shares"]
@@ -1144,7 +1315,7 @@ if st.session_state.last_analysis_result:
             p_c3.metric("현재 평가 금액", f"${total_current:,.2f}")
             p_c4.metric("평가 손익 (수익률)", f"${pnl_dollar:+,.2f}", f"{pnl_pct:+.2f}%")
 
-    # 1. 상단 핵심 메트릭
+    # 1. 상단 핵심 시장/재무 메트릭
     with st.container(border=True):
         st.markdown("**🏢 핵심 시장 및 재무 지표**")
         r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
@@ -1175,20 +1346,62 @@ if st.session_state.last_analysis_result:
         diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
         s_c4.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
 
-        st.divider()
+    # 📌 [신규] 2. 퀀트 모멘텀 & VWAP / 볼린저 밴드 스퀴즈 컨테이너
+    with st.container(border=True):
+        st.markdown("##### 🧪 **퀀트 모멘텀, 스마트머니 VWAP & 볼린저 밴드 스퀴즈**")
         
-        st.markdown("**📈 변동성(ATR), 기술적 모멘텀 및 거시 지표**")
-        r2_c1, r2_c2, r2_c3, r2_c4 = st.columns(4)
-        r2_c1.metric(
-            "MACD (Signal)", 
-            f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", 
-            f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None
-        )
-        r2_c2.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"1.5x 손절가: ${tech_data.get('atr_stop_1_5x', 'N/A')}")
-        r2_c3.metric("RSI(14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
-        r2_c4.metric("미 10년물 금리 / 달러", f"{macro_data.get('us_10y_yield', {}).get('value', 'N/A')} / {macro_data.get('dollar_index', {}).get('value', 'N/A')}")
+        q_c1, q_c2, q_c3, q_c4 = st.columns(4)
+        
+        # 1Y Anchored VWAP
+        vwap_1y = tech_data.get('vwap_1y', 'N/A')
+        diff_vwap1y = round(((curr_p - vwap_1y) / vwap_1y) * 100, 1) if isinstance(vwap_1y, (int, float)) and curr_p else None
+        q_c1.metric("1Y 누적 VWAP (장기 평단)", f"${vwap_1y}", f"현재가 {diff_vwap1y:+.1f}%" if diff_vwap1y is not None else None)
 
-    # 📌 피보나치 되돌림 컨테이너
+        # 20D Rolling VWAP
+        vwap_20d = tech_data.get('vwap_20d', 'N/A')
+        diff_vwap20 = round(((curr_p - vwap_20d) / vwap_20d) * 100, 1) if isinstance(vwap_20d, (int, float)) and curr_p else None
+        q_c2.metric("20일 단기 VWAP (스마트머니)", f"${vwap_20d}", f"현재가 {diff_vwap20:+.1f}%" if diff_vwap20 is not None else None)
+
+        # BB Width & Squeeze Status
+        bb_w = tech_data.get('bb_width_pct', 'N/A')
+        q_c3.metric("볼린저 밴드폭 (Bandwidth)", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
+        
+        # ATR 변동폭
+        q_c4.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
+        
+        st.markdown(f"**⚡ 변동성 국면 판정:** `{tech_data.get('bb_squeeze_status', 'N/A')}`")
+
+    # 📌 [신규] 3. 1년 과거 데이터 기반 듀얼 전략 백테스팅 컨테이너
+    if backtest_results:
+        with st.container(border=True):
+            st.markdown("##### 🔬 **과거 1년 퀀트 전략 백테스팅 시뮬레이션 (1-Year Backtest)**")
+            
+            bh_ret = backtest_results.get("benchmark_buy_and_hold", 0.0)
+            st.caption(f"📌 **벤치마크 (단순 보유 Buy & Hold 1년 수익률):** `{bh_ret:+.2f}%`")
+            
+            bt_col1, bt_col2 = st.columns(2)
+            
+            with bt_col1:
+                st.markdown("**🚀 전략 A: 모멘텀 스퀴즈 돌파 (Momentum Squeeze Breakout)**")
+                st.caption("진입: MACD 상방전환 + 20일 이평 및 20일 VWAP 상회 시 | 청산: MACD 꺾임 또는 1.5x ATR 이탈")
+                s1 = backtest_results.get("strategy_1_momentum_squeeze", {})
+                
+                m1_1, m1_2, m1_3 = st.columns(3)
+                m1_1.metric("총 누적 수익률", f"{s1.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s1.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
+                m1_2.metric("승률 (Win Rate)", f"{s1.get('win_rate', 0)}%", f"총 {s1.get('trades_count', 0)}회 매매")
+                m1_3.metric("Profit Factor / MDD", f"{s1.get('profit_factor', 0)}", f"MDD: -{s1.get('mdd', 0)}%")
+
+            with bt_col2:
+                st.markdown("**🔄 전략 B: 1Y VWAP + RSI 밸류 되돌림 (Mean Reversion)**")
+                st.caption("진입: 1Y 누적 VWAP 하회 + RSI 42 이하 + 볼린저 하단 지지 | 청산: VWAP 도달 또는 RSI 65")
+                s2 = backtest_results.get("strategy_2_vwap_mean_reversion", {})
+                
+                m2_1, m2_2, m2_3 = st.columns(3)
+                m2_1.metric("총 누적 수익률", f"{s2.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s2.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
+                m2_2.metric("승률 (Win Rate)", f"{s2.get('win_rate', 0)}%", f"총 {s2.get('trades_count', 0)}회 매매")
+                m2_3.metric("Profit Factor / MDD", f"{s2.get('profit_factor', 0)}", f"MDD: -{s2.get('mdd', 0)}%")
+
+    # 4. 피보나치 되돌림 컨테이너
     with st.container(border=True):
         st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
         fb1, fb2, fb3, fb4 = st.columns(4)
@@ -1203,7 +1416,7 @@ if st.session_state.last_analysis_result:
         fb3.metric("50.0% 하프라인 (추세 기준선)", f"${f500}", f"{round(((f500-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f500, (int, float)) and curr_p else None)
         fb4.metric("61.8% 되돌림 (강력한 2차 지지)", f"${f618}", f"{round(((f618-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f618, (int, float)) and curr_p else None)
 
-    # 📌 옵션 체인 컨테이너
+    # 5. 옵션 체인 컨테이너
     with st.container(border=True):
         if options_data:
             exp_date = options_data['expiration_date']
@@ -1246,7 +1459,7 @@ if st.session_state.last_analysis_result:
             st.markdown("##### 🎯 **옵션 체인 스마트머니 포지션**")
             st.info("해당 종목은 옵션 체인 거래 데이터가 없거나 수집되지 않았습니다.")
 
-    # 2. 성장주 3대 밸류에이션 모델
+    # 6. 성장주 3대 밸류에이션 모델
     with st.container(border=True):
         st.markdown("##### 🚀 **성장주/빅테크 맞춤형 밸류에이션 모델 (Growth Models)**")
         g_models = fund_data.get('growth_models', {})
@@ -1268,7 +1481,7 @@ if st.session_state.last_analysis_result:
         diff_dcf = round(((dcf_p - curr_p) / curr_p) * 100, 1) if isinstance(dcf_p, (int, float)) and curr_p else None
         g4.metric("2단계 DCF 현금흐름 모델", f"${dcf_p}" if isinstance(dcf_p, (int, float)) else str(dcf_p), f"{diff_dcf:+.1f}%" if diff_dcf is not None else None)
 
-    # 3. 전통 가치투자 모델
+    # 7. 전통 가치투자 모델
     with st.container(border=True):
         st.markdown("##### 🏛️ **전통 제조업/자산가치 기반 3대 모델 (Value Models - 청산/장부가치 기준)**")
         v_models = fund_data.get('value_models', {})
@@ -1288,7 +1501,7 @@ if st.session_state.last_analysis_result:
 
     st.caption(f"🕒 데이터 수집 기준일자: 주가/재무제표 ({res['stock_date']}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
 
-    # AI 종합 분석 브리핑 & JSON 다운로드 버튼
+    # 8. AI 종합 분석 브리핑 & JSON 다운로드 버튼
     with st.container(border=True):
         head_col1, head_col2 = st.columns([0.65, 0.35])
         with head_col1:
