@@ -717,10 +717,33 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     else:
         est_growth = 15.0
 
+    # 📌 [버그 수정] 그레이엄/피터 린치/ROE-PBR 모델은 원래 안정적인 저PER
+    # 자산가치주·배당주를 겨냥한 공식이다. TSLA처럼 트레일링 PER이 300배가
+    # 넘는 초고평가 성장주에 그대로 적용하면 현재가 대비 90%+ 벗어나는
+    # 무의미한 "청산가치"가 나오는데, 기존 코드는 이를 걸러내지 않고
+    # 그대로 노출했다. → growth_models와 동일한 원칙으로 괴리율/고PER 여부를
+    # 함께 검증해 무효 처리한다.
+    def _value_model_sanity(value, label):
+        try:
+            if not isinstance(value, (int, float)):
+                return "산출불가"
+            if not curr_price or curr_price <= 0:
+                return value
+            deviation = abs(value - curr_price) / curr_price
+            high_per = isinstance(trailing_pe, (int, float)) and trailing_pe >= 60.0
+            if deviation > 0.6 and high_per:
+                return f"산출불가 (고PER 성장주 - 자산가치 모델 부적합, PER {trailing_pe:.1f}배)"
+            if deviation > 0.6:
+                return f"산출불가 (모델 괴리율 과다: {deviation*100:.0f}%)"
+            return value
+        except Exception:
+            return "산출불가"
+
     value_models = {}
     try:
         if eps and bps and eps > 0 and bps > 0:
-            value_models["graham"] = round(math.sqrt(22.5 * float(eps) * float(bps)), 2)
+            raw_graham = round(math.sqrt(22.5 * float(eps) * float(bps)), 2)
+            value_models["graham"] = _value_model_sanity(raw_graham, "graham")
         else:
             value_models["graham"] = "산출불가"
     except Exception:
@@ -728,7 +751,8 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
 
     try:
         if eps and eps > 0 and roe_raw and roe_raw > 0:
-            value_models["peter_lynch"] = round(float(eps) * min(float(roe_raw) * 100, 25.0), 2)
+            raw_lynch = round(float(eps) * min(float(roe_raw) * 100, 25.0), 2)
+            value_models["peter_lynch"] = _value_model_sanity(raw_lynch, "peter_lynch")
         else:
             value_models["peter_lynch"] = "산출불가"
     except Exception:
@@ -736,7 +760,8 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
 
     try:
         if bps and bps > 0 and roe_raw and roe_raw > 0:
-            value_models["roe_pbr"] = round(float(bps) * (float(roe_raw) / 0.10), 2)
+            raw_roe_pbr = round(float(bps) * (float(roe_raw) / 0.10), 2)
+            value_models["roe_pbr"] = _value_model_sanity(raw_roe_pbr, "roe_pbr")
         else:
             value_models["roe_pbr"] = "산출불가"
     except Exception:
@@ -1408,7 +1433,7 @@ if analyze_btn:
   * 전략 수익률이 벤치마크보다 낮으면 "벤치마크 대비 열위"임을 굵은 글씨로 명확히 경고할 것 (승률/손익비만 언급하고 총수익 비교를 생략하는 것 금지).
   * `total_ret`이 마이너스(손실)인 전략은 "실전 매매 타이밍 시그널로서 신뢰도 낮음"이라고 반드시 명시할 것.
   * 결론적으로 두 전략 중 하나라도 벤치마크를 밑돌면, "이 종목은 기술적 타이밍 매매보다 단순 보유(Buy & Hold)가 더 유리했다"는 취지의 문장을 반드시 포함할 것.
-- **[밸류에이션 이상치 검증 원칙 (필수)]**: 밸류에이션 모델 값에 "산출불가", "모델 괴리율 과다", "참고용" 등의 문구가 포함되어 있으면 이를 유효한 목표가처럼 서술하지 말고, 왜 신뢰할 수 없는지(예: 저성장/성숙 기업에 성장주 모델 적용, 현재가 대비 비현실적 괴리)를 밝히고 해당 모델은 판단에서 제외할 것. PBR이 음수(자사주 매입 등으로 인한 자본잠식)인 경우도 그 원인을 짚고 액면 그대로 해석하지 말 것.
+- **[밸류에이션 이상치 검증 원칙 (필수)]**: 밸류에이션 모델 값에 "산출불가", "모델 괴리율 과다", "참고용" 등의 문구가 포함되어 있으면 이를 유효한 목표가처럼 서술하지 말고, 왜 신뢰할 수 없는지(예: 저성장/성숙 기업에 성장주 모델 적용, 고PER 성장주에 자산가치/청산가치 모델 적용, 현재가 대비 비현실적 괴리)를 밝히고 해당 모델은 판단에서 제외할 것. PBR이 음수(자사주 매입 등으로 인한 자본잠식)인 경우도 그 원인을 짚고 액면 그대로 해석하지 말 것.
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
