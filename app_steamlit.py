@@ -389,7 +389,7 @@ def fetch_nearest_options_data(ticker: str):
             "call_max_vol": {
                 "strike": call_max_vol_row.get("strike", "N/A"),
                 "volume": int(call_max_vol_row.get("volume", 0)) if pd.notnull(call_max_vol_row.get("volume")) else 0,
-                "price": round(float(call_max_vol_row.get("lastPrice", 0)), 2)
+                "price": round(float(call_max_row.get("lastPrice", 0)), 2)
             },
             "put_max_oi": {
                 "strike": put_max_oi_row.get("strike", "N/A"),
@@ -458,7 +458,7 @@ def format_market_cap(market_cap):
         return str(market_cap)
 
 # -------------------------------------------------------------
-# 📌 유명 헤지펀드 보유 내역 & 공매도 세력 인텔 수집기
+# 📌 유명 헤지펀드 보유 내역 & 공매도 세력 분석 데이터 수집기
 # -------------------------------------------------------------
 def fetch_hedge_funds_and_short_intel(stock, info):
     intel = {
@@ -1166,7 +1166,7 @@ if analyze_btn:
         except Exception:
             api_key = None
             
-    with st.spinner(f"🔍 [{ticker_input}] 헤지펀드 지분/공매도 세력 인텔/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
+    with st.spinner(f"🔍 [{ticker_input}] 헤지펀드 지분/공매도 세력 분석/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
         tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df = fetch_stock_technical_data(ticker_input)
         backtest_results = run_strategy_backtest(raw_df)
         options_data = fetch_nearest_options_data(ticker_input)
@@ -1227,7 +1227,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 헤지펀드 및 공매도 세력 인텔 분석 프롬프트
+            # 📌 헤지펀드 및 공매도 세력 분석 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
@@ -1242,7 +1242,7 @@ if analyze_btn:
 4. 가장 빠른 만기 옵션 체인 수급 (콜/풋 Max OI & Volume):
 {options_json}
 
-5. 내부자/기관 지분율 및 유명 헤지펀드/공매도 세력 인텔 (Short Squeeze Intel):
+5. 내부자/기관 지분율 및 유명 헤지펀드/공매도 세력 분석 (Short Squeeze Analysis):
 {hedge_short_json}
 
 6. 실적 발표 일정 및 52주 고저:
@@ -1462,6 +1462,7 @@ if st.session_state.last_analysis_result:
         
         st.divider()
         
+        # 📌 스마트머니 기본 지분
         st.markdown("**👥 스마트머니 기본 지분 (내부자 & 기관 지분율 및 내부자 매매)**")
         own_c1, own_c2, own_c3, own_c4 = st.columns(4)
         own_c1.metric("Insider Own (내부자 지분)", str(ownership.get('insider_own', 'N/A')))
@@ -1471,13 +1472,36 @@ if st.session_state.last_analysis_result:
 
         st.divider()
 
+        # 📌 [재배치 완료] 스마트머니 기본 지분 바로 아래로 이동한 13F 헤지펀드 지분 & 공매도 수급 정밀 분석
+        st.markdown(f"**🐋 13F 헤지펀드 지분 & 공매도(Shorts) 수급 정밀 분석 ({res['ticker']})**")
+        s_intel = hedge_short_intel.get("short_intel", {})
+        
+        sk1, sk2, sk3 = st.columns(3)
+        sk1.metric("공매도 잔고 (Float)", s_intel.get("short_percent_of_float", "N/A"), f"MoM: {s_intel.get('short_mom_change', 'N/A')}")
+        sk2.metric("상환 소요 일수 (DTC)", s_intel.get("short_ratio_days", "N/A"), "Days to Cover")
+        sk3.metric("공매도 총 주수", s_intel.get("shares_short_formatted", "N/A"))
+        
+        st.markdown(f"**🎯 숏스퀴즈 리스크 등급:** `{s_intel.get('squeeze_risk_level', 'N/A')}`")
+        
+        high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
+        diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
+        e_date = earnings_info.get('earnings_date', '미정')
+        e_dday = earnings_info.get('d_day', '')
+        st.caption(f"📅 차기 실적 발표: **{e_date} ({e_dday})** | 52주 고점 괴리율: **{diff_52h:+.1f}%**" if diff_52h is not None else f"📅 차기 실적 발표: **{e_date}**")
+        
+        holders_list = hedge_short_intel.get("top_holders", [])
+        if holders_list:
+            df_holders = pd.DataFrame(holders_list)
+            df_holders.columns = ["기관/펀드명", "보유 주식수", "지분율 (% Out)", "평가 가치"]
+            st.dataframe(df_holders, use_container_width=True, hide_index=True)
+
+        st.divider()
+
         st.markdown("**📅 차기 실적 발표 일정, 52주 가격 범위 & ATR/모멘텀**")
         s_c1, s_c2, s_c3, s_c4 = st.columns(4)
         s_c1.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
         
-        high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
         low_52 = earnings_info.get('fiftyTwoWeekLow', 'N/A')
-        diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
         s_c2.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
         
         s_c3.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
@@ -1699,7 +1723,7 @@ if st.session_state.last_analysis_result:
                 st.info("수집된 최신 뉴스가 없습니다.")
                 
     with col_right:
-        # 1. 최근 2개월 증권가 투자의견 변동
+        # 최근 2개월 증권가 투자의견 변동
         with st.container(border=True):
             st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 및 목표가 변동**")
             if res.get("analyst_data"):
@@ -1710,32 +1734,3 @@ if st.session_state.last_analysis_result:
                 st.dataframe(df_analyst, use_container_width=True, hide_index=True)
             else:
                 st.info("최근 2개월간 등록된 투자의견 변동 내역이 없습니다.")
-
-        # 📌 [통합 완료] 2. 헤지펀드 13F 보유 현황 & 공매도(Shorts) 수급 정밀 인텔
-        with st.container(border=True):
-            st.markdown(f"##### 🐋 **{res['ticker']} 13F 헤지펀드 지분 & 공매도(Shorts) 수급 정밀 인텔**")
-            
-            s_intel = hedge_short_intel.get("short_intel", {})
-            
-            sk1, sk2, sk3 = st.columns(3)
-            sk1.metric("공매도 잔고 (Float)", s_intel.get("short_percent_of_float", "N/A"), f"MoM: {s_intel.get('short_mom_change', 'N/A')}")
-            sk2.metric("상환 소요 일수 (DTC)", s_intel.get("short_ratio_days", "N/A"), "Days to Cover")
-            sk3.metric("공매도 총 주수", s_intel.get("shares_short_formatted", "N/A"))
-            
-            st.markdown(f"**🎯 숏스퀴즈 리스크 등급:** `{s_intel.get('squeeze_risk_level', 'N/A')}`")
-            
-            # 실적 발표 및 52주 고점 괴리율 캡션 연계
-            e_date = earnings_info.get('earnings_date', '미정')
-            e_dday = earnings_info.get('d_day', '')
-            st.caption(f"📅 차기 실적 발표: **{e_date} ({e_dday})** | 52주 고점 괴리율: **{diff_52h:+.1f}%**" if diff_52h is not None else f"📅 차기 실적 발표: **{e_date}**")
-            
-            st.divider()
-            
-            st.markdown("**📋 13F 상위 기관 & 헤지펀드 보유 내역 (Top Holders)**")
-            holders_list = hedge_short_intel.get("top_holders", [])
-            if holders_list:
-                df_holders = pd.DataFrame(holders_list)
-                df_holders.columns = ["기관/펀드명", "보유 주식수", "지분율 (% Out)", "평가 가치"]
-                st.dataframe(df_holders, use_container_width=True, hide_index=True)
-            else:
-                st.caption("수집된 상위 기관/헤지펀드 13F 지분 데이터가 없습니다.")
