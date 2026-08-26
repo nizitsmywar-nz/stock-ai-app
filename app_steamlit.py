@@ -458,7 +458,7 @@ def format_market_cap(market_cap):
         return str(market_cap)
 
 # -------------------------------------------------------------
-# 📌 [신규/고도화] 유명 헤지펀드 보유 내역 & 공매도 세력 인텔 수집기
+# 📌 유명 헤지펀드 보유 내역 & 공매도 세력 인텔 수집기
 # -------------------------------------------------------------
 def fetch_hedge_funds_and_short_intel(stock, info):
     intel = {
@@ -466,7 +466,6 @@ def fetch_hedge_funds_and_short_intel(stock, info):
         "short_intel": {}
     }
     
-    # 1. 13F 주요 기관 및 유명 헤지펀드 지분 추출
     try:
         inst_df = stock.institutional_holders
         if inst_df is not None and not inst_df.empty:
@@ -488,23 +487,19 @@ def fetch_hedge_funds_and_short_intel(stock, info):
     except Exception:
         pass
 
-    # 2. 공매도 세력 포지션 및 숏스퀴즈 리스크 지표
     try:
         short_float = info.get("shortPercentOfFloat", None)
         short_ratio = info.get("shortRatio", None)
         shares_short = info.get("sharesShort", None)
         shares_short_prior = info.get("sharesShortPriorMonth", None)
-        shares_out = info.get("sharesOutstanding", None)
 
         short_float_pct = round(short_float * 100, 2) if short_float is not None else None
         short_ratio_days = round(short_ratio, 2) if short_ratio is not None else None
         
-        # 월간 공매도 수량 증감율 (MoM)
         short_mom_pct = None
         if shares_short and shares_short_prior and shares_short_prior > 0:
             short_mom_pct = round(((shares_short - shares_short_prior) / shares_short_prior) * 100, 2)
 
-        # 숏스퀴즈 잠재 위험도 평가
         squeeze_risk = "🟢 안정 (Low Risk)"
         if short_float_pct is not None and short_ratio_days is not None:
             if short_float_pct >= 15.0 and short_ratio_days >= 5.0:
@@ -537,9 +532,7 @@ def fetch_ownership_and_shorts(stock, info):
         "insider_own": "N/A",
         "insider_trans": "N/A",
         "inst_own": "N/A",
-        "inst_trans": "N/A",
-        "short_percent_of_float": "N/A",
-        "short_ratio": "N/A"
+        "inst_trans": "N/A"
     }
     try:
         ins_own_val = info.get("heldPercentInsiders", None)
@@ -549,14 +542,6 @@ def fetch_ownership_and_shorts(stock, info):
         inst_own_val = info.get("heldPercentInstitutions", None)
         if inst_own_val is not None:
             data["inst_own"] = f"{inst_own_val * 100:.2f}%"
-
-        short_float = info.get("shortPercentOfFloat", None)
-        if short_float is not None:
-            data["short_percent_of_float"] = f"{short_float * 100:.2f}%"
-            
-        short_rat = info.get("shortRatio", None)
-        if short_rat is not None:
-            data["short_ratio"] = f"{short_rat:.2f}일"
     except Exception:
         pass
 
@@ -1242,7 +1227,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [헤지펀드 및 공매도 세력 인텔 분석 프롬프트]
+            # 📌 헤지펀드 및 공매도 세력 인텔 분석 프롬프트
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
@@ -1477,7 +1462,7 @@ if st.session_state.last_analysis_result:
         
         st.divider()
         
-        st.markdown("**👥 스마트머니 수급 분석 (내부자 & 기관 지분 및 최근 매매)**")
+        st.markdown("**👥 스마트머니 기본 지분 (내부자 & 기관 지분율 및 내부자 매매)**")
         own_c1, own_c2, own_c3, own_c4 = st.columns(4)
         own_c1.metric("Insider Own (내부자 지분)", str(ownership.get('insider_own', 'N/A')))
         own_c2.metric("Insider Trans (내부자 매매)", str(ownership.get('insider_trans', 'N/A')))
@@ -1486,16 +1471,21 @@ if st.session_state.last_analysis_result:
 
         st.divider()
 
-        st.markdown("**🎯 공매도 수급(Shorts) 및 차기 실적 발표 일정**")
+        st.markdown("**📅 차기 실적 발표 일정, 52주 가격 범위 & ATR/모멘텀**")
         s_c1, s_c2, s_c3, s_c4 = st.columns(4)
-        s_c1.metric("공매도 잔고 비율 (Float)", str(ownership.get('short_percent_of_float', 'N/A')))
-        s_c2.metric("공매도 상환 소요 일수", str(ownership.get('short_ratio', 'N/A')))
-        s_c3.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
+        s_c1.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
         
         high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
         low_52 = earnings_info.get('fiftyTwoWeekLow', 'N/A')
         diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
-        s_c4.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
+        s_c2.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
+        
+        s_c3.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
+        s_c4.metric(
+            "MACD (Signal)", 
+            f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", 
+            f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None
+        )
 
     # S&P 500 11개 전 섹터 실시간 등락 현황판 (기본 접기: expanded=False)
     if sector_data:
@@ -1530,7 +1520,7 @@ if st.session_state.last_analysis_result:
         bb_w = tech_data.get('bb_width_pct', 'N/A')
         q_c3.metric("볼린저 밴드폭 (Bandwidth)", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
         
-        q_c4.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
+        q_c4.metric("RSI(14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
         
         st.markdown(f"**⚡ 변동성 국면 판정:** `{tech_data.get('bb_squeeze_status', 'N/A')}`")
 
@@ -1572,7 +1562,7 @@ if st.session_state.last_analysis_result:
         f236 = fib_levels.get('fib_23.6%', 'N/A')
         f382 = fib_levels.get('fib_38.2%', 'N/A')
         f500 = fib_levels.get('fib_50.0%', 'N/A')
-        f618 = fib_levels.get('fib_618%', 'N/A') or fib_levels.get('fib_61.8%', 'N/A')
+        f618 = fib_levels.get('fib_61.8%', 'N/A')
         
         fb1.metric("23.6% 되돌림 (단기 지지)", f"${f236}", f"{round(((f236-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f236, (int, float)) and curr_p else None)
         fb2.metric("38.2% 되돌림 (1차 매수 지지)", f"${f382}", f"{round(((f382-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f382, (int, float)) and curr_p else None)
@@ -1721,22 +1711,26 @@ if st.session_state.last_analysis_result:
             else:
                 st.info("최근 2개월간 등록된 투자의견 변동 내역이 없습니다.")
 
-        # 📌 [신규 위치] 2. 헤지펀드 보유 현황 및 공매도 세력 포지션 (바로 아래 컨테이너)
+        # 📌 [통합 완료] 2. 헤지펀드 13F 보유 현황 & 공매도(Shorts) 수급 정밀 인텔
         with st.container(border=True):
-            st.markdown(f"##### 🐋 **{res['ticker']} 헤지펀드 보유 현황 및 공매도 세력 포지션**")
+            st.markdown(f"##### 🐋 **{res['ticker']} 13F 헤지펀드 지분 & 공매도(Shorts) 수급 정밀 인텔**")
             
             s_intel = hedge_short_intel.get("short_intel", {})
             
-            # 공매도 세력 포지션 메트릭
             sk1, sk2, sk3 = st.columns(3)
             sk1.metric("공매도 잔고 (Float)", s_intel.get("short_percent_of_float", "N/A"), f"MoM: {s_intel.get('short_mom_change', 'N/A')}")
             sk2.metric("상환 소요 일수 (DTC)", s_intel.get("short_ratio_days", "N/A"), "Days to Cover")
             sk3.metric("공매도 총 주수", s_intel.get("shares_short_formatted", "N/A"))
             
             st.markdown(f"**🎯 숏스퀴즈 리스크 등급:** `{s_intel.get('squeeze_risk_level', 'N/A')}`")
+            
+            # 실적 발표 및 52주 고점 괴리율 캡션 연계
+            e_date = earnings_info.get('earnings_date', '미정')
+            e_dday = earnings_info.get('d_day', '')
+            st.caption(f"📅 차기 실적 발표: **{e_date} ({e_dday})** | 52주 고점 괴리율: **{diff_52h:+.1f}%**" if diff_52h is not None else f"📅 차기 실적 발표: **{e_date}**")
+            
             st.divider()
             
-            # 13F 주요 기관 및 헤지펀드 지분 표
             st.markdown("**📋 13F 상위 기관 & 헤지펀드 보유 내역 (Top Holders)**")
             holders_list = hedge_short_intel.get("top_holders", [])
             if holders_list:
