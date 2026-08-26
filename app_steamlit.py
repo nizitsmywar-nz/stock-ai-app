@@ -123,7 +123,7 @@ if "last_analysis_result" not in st.session_state:
     st.session_state.last_analysis_result = None
 
 # -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈 (기술적 지표, BB Squeeze, VWAP 등)
+# 1. RAG 데이터 수집 모듈 (기술적 지표, BB Squeeze, VWAP, Volume Profile POC 등)
 # -------------------------------------------------------------
 def get_stock_info_with_retry(stock, retries=3):
     for attempt in range(retries):
@@ -150,7 +150,7 @@ def fetch_stock_technical_data(ticker: str):
     if df.empty:
         df = stock.history(period="6mo")
     if df.empty:
-        return {}, "N/A", {}, "N/A", "N/A", pd.DataFrame()
+        return {}, "N/A", {}, "N/A", "N/A", pd.DataFrame(), {}
     
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_60'] = df['Close'].rolling(window=60).mean()
@@ -202,6 +202,7 @@ def fetch_stock_technical_data(ticker: str):
     low_6m = float(df_6m['Low'].min())
     diff_hl = high_6m - low_6m
     
+    # 📌 피보나치 되돌림 밴드
     fibonacci_levels = {
         "high_6m": round(high_6m, 2),
         "low_6m": round(low_6m, 2),
@@ -210,6 +211,51 @@ def fetch_stock_technical_data(ticker: str):
         "fib_50.0%": round(high_6m - (0.500 * diff_hl), 2),
         "fib_61.8%": round(high_6m - (0.618 * diff_hl), 2)
     }
+    
+    # 📌 [신규] 최근 6개월 매물대 프로파일 및 POC (Point of Control) 연산
+    volume_profile = {}
+    try:
+        num_bins = 30
+        price_bins = np.linspace(low_6m, high_6m, num_bins + 1)
+        bin_indices = np.digitize(df_6m['Close'], price_bins) - 1
+        bin_indices = np.clip(bin_indices, 0, num_bins - 1)
+        
+        vol_by_bin = np.zeros(num_bins)
+        for idx_val, vol_val in zip(bin_indices, df_6m['Volume']):
+            vol_by_bin[idx_val] += vol_val
+            
+        poc_idx = int(np.argmax(vol_by_bin))
+        poc_price = round(float((price_bins[poc_idx] + price_bins[poc_idx + 1]) / 2), 2)
+        
+        # 70% Value Area (VAH / VAL)
+        tot_vol = np.sum(vol_by_bin)
+        target_va_vol = tot_vol * 0.70
+        sorted_indices = np.argsort(vol_by_bin)[::-1]
+        cum_va = 0.0
+        va_bins = []
+        for s_idx in sorted_indices:
+            cum_va += vol_by_bin[s_idx]
+            va_bins.append(s_idx)
+            if cum_va >= target_va_vol:
+                break
+        min_va_bin = min(va_bins)
+        max_va_bin = max(va_bins)
+        val_price = round(float(price_bins[min_va_bin]), 2)
+        vah_price = round(float(price_bins[max_va_bin + 1]), 2)
+        
+        volume_profile = {
+            "poc_price": poc_price,
+            "vah_price": vah_price,
+            "val_price": val_price,
+            "value_area_range": f"${val_price} ~ ${vah_price}"
+        }
+    except Exception:
+        volume_profile = {
+            "poc_price": "N/A",
+            "vah_price": "N/A",
+            "val_price": "N/A",
+            "value_area_range": "N/A"
+        }
     
     atr_val = round(float(latest['ATR']), 2) if pd.notnull(latest['ATR']) else "N/A"
     
@@ -244,9 +290,11 @@ def fetch_stock_technical_data(ticker: str):
         "bb_width_pct": round(float(latest['BB_Width']), 2) if pd.notnull(latest['BB_Width']) else "N/A",
         "bb_squeeze_status": squeeze_status,
         "vwap_1y": round(float(latest['Cumulative_VWAP']), 2) if pd.notnull(latest['Cumulative_VWAP']) else "N/A",
-        "vwap_20d": round(float(latest['Rolling_VWAP_20']), 2) if pd.notnull(latest['Rolling_VWAP_20']) else "N/A"
+        "vwap_20d": round(float(latest['Rolling_VWAP_20']), 2) if pd.notnull(latest['Rolling_VWAP_20']) else "N/A",
+        "poc_price_6m": volume_profile.get("poc_price", "N/A"),
+        "value_area_range_6m": volume_profile.get("value_area_range", "N/A")
     }
-    return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc, df
+    return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc, df, volume_profile
 
 # -------------------------------------------------------------
 # 📌 정밀 전략 백테스팅 모듈 (1Y 일봉 기반)
@@ -1180,8 +1228,8 @@ if analyze_btn:
         except Exception:
             api_key = None
             
-    with st.spinner(f"🔍 [{ticker_input}] 헤지펀드 지분/공매도 세력 분석/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
-        tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df = fetch_stock_technical_data(ticker_input)
+    with st.spinner(f"🔍 [{ticker_input}] POC 매물대/헤지펀드 지분/공매도 세력 분석/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
+        tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df, vol_profile = fetch_stock_technical_data(ticker_input)
         backtest_results = run_strategy_backtest(raw_df)
         options_data = fetch_nearest_options_data(ticker_input, retries=3)
         macro_data = fetch_macro_indicators()
@@ -1211,7 +1259,7 @@ if analyze_btn:
             if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
         )
 
-        # 📌 [핵심 개선] 보유 상태에 따른 대응 전략 프롬프트 가이드 동적 생성
+        # 📌 보유 상태에 따른 대응 전략 프롬프트 가이드 동적 생성
         if is_holding and user_avg_price > 0:
             strategy_instruction_text = f"""* **사용자 대응 전략**: [현재 사용자가 평단가 ${user_avg_price:.2f}, 평가수익률 {my_return_str}로 주식을 보유 중인 상태입니다. 반드시 '보유자 관점'의 전략만 단독 작성할 것. 미보유자나 신규 진입 관련 문구는 일절 작성하지 말 것. 1차/2차 목표가 도달 시 구체적인 부분 익절/비중축소 비중(예: 30% 매도) 및 손절선 이탈 시 전량 손절 계획을 명시할 것.]"""
         else:
@@ -1226,6 +1274,7 @@ if analyze_btn:
                 "stock_data_date": stock_date
             },
             "technical_vwap_and_squeeze": tech_data,
+            "volume_profile_poc_6m": vol_profile,
             "one_year_backtesting": backtest_results,
             "fibonacci_retracement_6m": fib_levels,
             "options_chain_nearest": options_data,
@@ -1247,51 +1296,54 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [핵심 개선] 오름차순 가격 정렬 & 조건부 단독 분기 출력 프롬프트
+            # 📌 [POC 매물대 및 보수적 실전 매매 프롬프트]
             template = """
 [RAG 심층 주입 데이터]
-1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
+1. 기술적/수급, VWAP, 볼린저 밴드 스퀴즈 및 6개월 매물대 POC ({ticker}) (기준일: {stock_date}):
 {tech_json}
 
-2. 최근 1년 과거 데이터 기반 듀얼 전략 백테스팅 결과:
+2. 최근 6개월 최다 매물대(POC) 및 70% 핵심 매물대(Value Area):
+{poc_json}
+
+3. 최근 1년 과거 데이터 기반 듀얼 전략 백테스팅 결과:
 {backtest_json}
 
-3. 최근 6개월 피보나치 되돌림 밴드:
+4. 최근 6개월 피보나치 되돌림 밴드:
 {fib_json}
 
-4. 가장 빠른 만기 옵션 체인 수급 (콜/풋 Max OI & Volume):
+5. 가장 빠른 만기 옵션 체인 수급 (콜/풋 Max OI & Volume):
 {options_json}
 
-5. 내부자/기관 지분율 및 유명 헤지펀드/공매도 세력 분석 (Short Squeeze Analysis):
+6. 내부자/기관 지분율 및 유명 헤지펀드/공매도 세력 분석 (Short Squeeze Analysis):
 {hedge_short_json}
 
-6. 실적 발표 일정 및 52주 고저:
+7. 실적 발표 일정 및 52주 고저:
 {earnings_json}
 
-7. 매크로 및 6대 자산 실시간 지표 (출처 및 기준일 포함):
+8. 매크로 및 6대 자산 실시간 지표 (출처 및 기준일 포함):
 {macro_json}
 
-8. 글로벌 거시/시장 주요 뉴스:
+9. 글로벌 거시/시장 주요 뉴스:
 {macro_news_json}
 
-9. S&P 500 11개 전 섹터 실시간 등락률 및 모멘텀:
+10. S&P 500 11개 전 섹터 실시간 등락률 및 모멘텀:
 {sector_json}
 
-10. 펀더멘털 및 6대 밸류에이션:
+11. 펀더멘털 및 6대 밸류에이션:
 {fund_json}
 
-11. 사용자 보유 현황:
+12. 사용자 보유 현황:
 {user_position}
 
-12. 종목 최신 주요 기사:
+13. 종목 최신 주요 기사:
 {news_json}
 
-13. 최근 2개월 증권가 투자의견 및 목표가 변동 (기관 신뢰도 티어 포함):
+14. 최근 2개월 증권가 투자의견 및 목표가 변동 (기관 신뢰도 티어 포함):
 {analyst_json}
 
 ---
 
-[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 엄격한 서식 규칙]
+[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 POC 매물벽 검증 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
@@ -1310,9 +1362,9 @@ if analyze_btn:
 - **공매도 세력 및 숏스퀴즈 리스크**: Short Float, Days to Cover(상환 소요 일수), 월간 공매도 증감율을 결합하여 공매도 세력의 하방 압력 강도 및 숏스퀴즈 촉발 가능성을 평가할 것.
 - **IB 투자의견 신뢰도 가중**: Tier 1/2 투자은행의 목표가 변동을 가중 평가하되, 기관 목표가는 중장기 상방 여력 참고용으로만 활용할 것.
 
-4. 정밀 기술적 지표, VWAP 및 백테스팅 평가 ({ticker})
-- **VWAP & 볼린저 밴드 스퀴즈 판정**: 현재가의 1Y/20D VWAP 위치 및 스퀴즈 상태(Squeeze On/Off)에 따른 폭발 방향성 제시.
-- **백테스팅 시사점**: 과거 1년간 모멘텀 스퀴즈 전략과 VWAP 평균회귀 전략 중 어떤 로직이 우세했는지 비교 평가.
+4. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가 ({ticker})
+- **VWAP & 최다 매물대(POC) 지지/저항 판정**: 현재가가 1Y/20D VWAP 및 6개월 최다 매물대(POC) 상단/하단 중 어디에 위치하며 실제 매물 부담이 적은 구간인지 집중 분석할 것.
+- **볼린저 밴드 스퀴즈 & 백테스팅 시사점**: 스퀴즈 상태(Squeeze On/Off)에 따른 폭발 방향성 및 1년간 퀀트 백테스팅 승률/수익률을 종합 평가할 것.
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
@@ -1322,13 +1374,13 @@ if analyze_btn:
 
 6. [정밀 매매 시나리오]
 - **[매수 밴드 및 진입 가격의 상·하단 논리 일치 규칙 (필수)]**:
-  * **분할 매수 밴드 설정**: 피보나치 지지선, 20일 VWAP, 풋옵션 지지선을 결합하여 실질적 달러 범위를 도출할 것.
+  * **분할 매수 밴드 설정**: 피보나치 지지선, 20일 VWAP, POC 매물대 지지선을 결합하여 실질적 달러 범위를 도출할 것.
   * **하단 [사용자 대응 전략]과의 가격 일치**: 사용자 대응 전략에서 언급하는 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것.
 
 - **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
 - **[서식 및 가격 표기 엄격 준수 규칙]**: 
   * **가격 밴드 오름차순 표기 (필수)**: 분할 매수 밴드, 매도가 밴드 등 모든 가격 범위는 반드시 **'낮은 가격 ~ 높은 가격 (하단 ~ 상단)' 오름차순 순서로 정렬**하여 작성할 것 (예: $332.49 ~ $356.98). 절대로 높은 가격을 앞에 적지 말 것.
-  * **보수적 매도가 밴드 설정**: 증권사 기관 목표가 대신 **볼린저 밴드 상단, 52주 고점 저항선, 피보나치 저항선 등 실제 차트/수급상의 실시간 저항선**을 최우선 기준으로 하여 현실적인 차익실현 달러 밴드를 도출할 것.
+  * **보수적 매도가 밴드 설정**: 증권사 기관 목표가 대신 **볼린저 밴드 상단, 52주 고점 저항선, POC 매물대 저항선, 콜옵션 Max OI 저항벽 등 실제 차트/수급상의 실시간 저항선**을 최우선 기준으로 하여 현실적인 차익실현 달러 밴드를 도출할 것.
   * **피보나치 수치 표기 규칙**: 반드시 **'피보나치 50.0%', '피보나치 38.2%', '피보나치 23.6%', '피보나치 61.8%'**와 같이 소수점과 퍼센트(%) 기호를 붙여 표기할 것.
   * 비중 언급 시 '30%'처럼 퍼센트(%) 기호를 붙이고 단어와 숫자 사이에 공백을 둘 것.
 
@@ -1339,10 +1391,10 @@ if analyze_btn:
 
 [정밀 매매 시나리오]
 
-* **분할 매수 밴드**: [피보나치 지지선 및 VWAP/옵션 지지선을 결합한 구체적 달러 범위와 근거 (낮은 가격 ~ 높은 가격 순 정렬)]
+* **분할 매수 밴드**: [피보나치 지지선, VWAP 및 POC 지지선을 결합한 구체적 달러 범위와 근거 (낮은 가격 ~ 높은 가격 순 정렬)]
 * **1차 목표가**: [피보나치 38.2% 또는 50.0% 구간 구체적 달러 가격대와 근거]
 * **2차 목표가**: [피보나치 23.6% 또는 52주 고점 인근 저항 구체적 달러 가격대와 근거]
-* **매도가 밴드**: [볼린저 밴드 상단 및 피보나치 저항을 최우선 반영한 실전 분할 차익실현 구체적 달러 밴드 (낮은 가격 ~ 높은 가격 순 정렬)]
+* **매도가 밴드**: [볼린저 밴드 상단, POC 저항 및 콜옵션 저항벽을 최우선 반영한 실전 분할 차익실현 구체적 달러 밴드 (낮은 가격 ~ 높은 가격 순 정렬)]
 * **손절(Stop-loss) 기준선**: [2.0x ATR 또는 1Y VWAP 이탈 시 추세 훼손 구체적 달러 가격대]
 * **불타기 조건**: [스퀴즈 상방 돌파 및 상방 저항선 안착 시 추가 매수 검토 기준]
 
@@ -1351,7 +1403,7 @@ if analyze_btn:
 {strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json"],
                 template=template
             )
             llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
@@ -1361,6 +1413,7 @@ if analyze_btn:
                 "ticker": ticker_input,
                 "stock_date": stock_date,
                 "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
+                "poc_json": json.dumps(vol_profile, indent=2, ensure_ascii=False),
                 "backtest_json": json.dumps(backtest_results, indent=2, ensure_ascii=False) if backtest_results else "백테스팅 데이터 부족",
                 "fib_json": json.dumps(fib_levels, indent=2, ensure_ascii=False),
                 "options_json": json.dumps(options_data, indent=2, ensure_ascii=False) if options_data else "옵션 데이터 없음",
@@ -1420,6 +1473,7 @@ if analyze_btn:
             "user_shares": user_shares,
             "my_return_str": my_return_str,
             "tech_data": tech_data,
+            "vol_profile": vol_profile,
             "backtest_results": backtest_results,
             "stock_date": stock_date,
             "fib_levels": fib_levels,
@@ -1446,6 +1500,7 @@ if st.session_state.last_analysis_result:
     hedge_short_intel = res.get("hedge_short_intel", {})
     earnings_info = res["earnings_info"]
     tech_data = res["tech_data"]
+    vol_profile = res.get("vol_profile", {})
     backtest_results = res.get("backtest_results", None)
     macro_data = res["macro_data"]
     fib_levels = res["fib_levels"]
@@ -1550,9 +1605,9 @@ if st.session_state.last_analysis_result:
             df_sec = pd.DataFrame(s_rows)
             st.dataframe(df_sec, use_container_width=True, hide_index=True)
 
-    # 2. 퀀트 모멘텀 & VWAP / 볼린저 밴드 스퀴즈 컨테이너
+    # 📌 2. 퀀트 모멘텀, 스마트머니 VWAP, 매물대 POC & 볼린저 밴드 스퀴즈 컨테이너
     with st.container(border=True):
-        st.markdown("##### 🧪 **퀀트 모멘텀, 스마트머니 VWAP & 볼린저 밴드 스퀴즈**")
+        st.markdown("##### 🧪 **퀀트 모멘텀, 스마트머니 VWAP & 6개월 최다 매물대 (POC)**")
         
         q_c1, q_c2, q_c3, q_c4 = st.columns(4)
         
@@ -1564,12 +1619,15 @@ if st.session_state.last_analysis_result:
         diff_vwap20 = round(((curr_p - vwap_20d) / vwap_20d) * 100, 1) if isinstance(vwap_20d, (int, float)) and curr_p else None
         q_c2.metric("20일 단기 VWAP (스마트머니)", f"${vwap_20d}", f"현재가 {diff_vwap20:+.1f}%" if diff_vwap20 is not None else None)
 
+        # POC 매물대
+        poc_val = tech_data.get('poc_price_6m', 'N/A')
+        diff_poc = round(((poc_val - curr_p) / curr_p) * 100, 1) if isinstance(poc_val, (int, float)) and curr_p else None
+        q_c3.metric("6M 최다 매물대 (POC)", f"${poc_val}", f"현재가 대비 {diff_poc:+.1f}%" if diff_poc is not None else "최대 거래량 구간")
+
         bb_w = tech_data.get('bb_width_pct', 'N/A')
-        q_c3.metric("볼린저 밴드폭 (Bandwidth)", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
+        q_c4.metric("볼린저 밴드폭 (Bandwidth)", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
         
-        q_c4.metric("RSI(14) / MFI 수급", f"{tech_data.get('rsi_14', 'N/A')} / {tech_data.get('mfi_14', 'N/A')}")
-        
-        st.markdown(f"**⚡ 변동성 국면 판정:** `{tech_data.get('bb_squeeze_status', 'N/A')}`")
+        st.markdown(f"**⚡ 변동성 국면 판정:** `{tech_data.get('bb_squeeze_status', 'N/A')}` | **🧱 70% 핵심 매물대 밴드:** `{tech_data.get('value_area_range_6m', 'N/A')}`")
 
     # 3. 1년 과거 데이터 기반 듀얼 전략 백테스팅 컨테이너
     if backtest_results:
