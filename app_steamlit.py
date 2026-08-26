@@ -562,11 +562,23 @@ def fetch_hedge_funds_and_short_intel(stock, info):
         if shares_short and shares_short_prior and shares_short_prior > 0:
             short_mom_pct = round(((shares_short - shares_short_prior) / shares_short_prior) * 100, 2)
 
+        # 📌 [버그 수정] 숏스퀴즈는 "공매도 비중(float)"이 유의미하게 높아야 성립하는
+        # 개념이며, 상환소요일수(Days to Cover)는 보조 지표일 뿐이다.
+        # 기존 코드는 or 조건이라 short_float가 매우 낮아도(예: 2~3%) days_to_cover만
+        # 4일 이상이면 "숏스퀴즈 주의"로 오판정되는 버그가 있었음 (and 로 수정).
         squeeze_risk = "🟢 안정 (Low Risk)"
         if short_float_pct is not None and short_ratio_days is not None:
-            if short_float_pct >= 15.0 and short_ratio_days >= 5.0:
+            if short_float_pct >= 20.0 and short_ratio_days >= 5.0:
                 squeeze_risk = "🚨 숏스퀴즈 고위험 (High Squeeze Potential)"
-            elif short_float_pct >= 10.0 or short_ratio_days >= 4.0:
+            elif short_float_pct >= 10.0 and short_ratio_days >= 3.0:
+                squeeze_risk = "⚠️ 숏스퀴즈 주의 (Moderate Potential)"
+            elif short_float_pct >= 5.0:
+                squeeze_risk = "💡 모니터링 구간 (Low-Moderate)"
+        elif short_float_pct is not None:
+            # days_to_cover 데이터가 없을 때는 공매도 비중만으로 보수적 판정
+            if short_float_pct >= 20.0:
+                squeeze_risk = "🚨 숏스퀴즈 고위험 (High Squeeze Potential)"
+            elif short_float_pct >= 10.0:
                 squeeze_risk = "⚠️ 숏스퀴즈 주의 (Moderate Potential)"
             elif short_float_pct >= 5.0:
                 squeeze_risk = "💡 모니터링 구간 (Low-Moderate)"
@@ -730,11 +742,36 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     except Exception:
         value_models["roe_pbr"] = "산출불가"
 
+    # 📌 [버그 수정] 성장주 밸류에이션 모델(PEG/DCF)은 실제 실적 성장률(earningsGrowth)이
+    # 없거나 음수인 종목에도 기본값 15%를 강제 적용해왔다. 그 결과 알트리아(MO) 같은
+    # 저성장 성숙 배당주에도 현재가 대비 +90~130%씩 벗어나는 비현실적 목표가가 산출되어
+    # 마치 유효한 모델인 것처럼 리포트에 노출되는 문제가 있었다.
+    # → (1) 실제 성장률 데이터가 없어 기본값(fallback)을 쓴 경우와 (2) 산출값이 현재가
+    #    대비 과도하게 괴리된 경우를 구분해 "산출불가/신뢰도 낮음"으로 명시한다.
+    used_growth_fallback = not (earnings_growth and earnings_growth > 0)
+
+    def _sanity_capped(value, label):
+        """현재가 대비 괴리율이 과도하면(60% 초과) 신뢰 불가로 처리."""
+        try:
+            if not isinstance(value, (int, float)) or not curr_price or curr_price <= 0:
+                return "산출불가"
+            deviation = abs(value - curr_price) / curr_price
+            if deviation > 0.6:
+                return f"산출불가 (모델 괴리율 과다: {deviation*100:.0f}%)"
+            if used_growth_fallback:
+                # 실제 성장률 데이터 없이 기본 성장률(15%)을 가정한 값이므로
+                # 저성장/성숙 기업에는 참고용으로만 써야 함을 표시
+                return f"{value} (참고용·추정성장률 가정치)"
+            return value
+        except Exception:
+            return "산출불가"
+
     growth_models = {}
     f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
     try:
         if f_eps and f_eps > 0:
-            growth_models["forward_peg"] = round(float(f_eps) * (est_growth * 1.5), 2)
+            raw_peg = round(float(f_eps) * (est_growth * 1.5), 2)
+            growth_models["forward_peg"] = _sanity_capped(raw_peg, "forward_peg")
         else:
             growth_models["forward_peg"] = "산출불가"
     except Exception:
@@ -742,7 +779,8 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
 
     try:
         if revenue_per_share and revenue_per_share > 0:
-            growth_models["psr_target"] = round(float(revenue_per_share) * 5.0, 2)
+            raw_psr = round(float(revenue_per_share) * 5.0, 2)
+            growth_models["psr_target"] = _sanity_capped(raw_psr, "psr_target")
         else:
             growth_models["psr_target"] = "산출불가"
     except Exception:
@@ -759,7 +797,8 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
                 pv_sum += cur_cf / ((1 + wacc) ** y)
             terminal_val = (cur_cf * (1 + g_long)) / (wacc - g_long)
             pv_terminal = terminal_val / ((1 + wacc) ** 5)
-            growth_models["dcf_growth"] = round(pv_sum + pv_terminal, 2)
+            raw_dcf = round(pv_sum + pv_terminal, 2)
+            growth_models["dcf_growth"] = _sanity_capped(raw_dcf, "dcf_growth")
         else:
             growth_models["dcf_growth"] = "산출불가"
     except Exception:
@@ -1349,7 +1388,7 @@ if analyze_btn:
 1. 거시환경 및 시장 국면
 - **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 요약 명시할 것.
 - 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측] (현금, 채권, 주식, 코인, 금, 원유).
-- 권장 자산 배분 비중 (주식 : 채권 : 대체자산 : 현금)
+- **[자산배분 코멘트 – 근거 없는 수치 생성 금지 (필수)]**: 주입된 데이터(10년물 국채금리, VIX, 달러인덱스, 유가, 금, 비트코인)만을 근거로 방향성(예: "국채 비중 확대 고려" 등)을 서술할 것. "주식 40% : 채권 30%"처럼 **구체적인 퍼센트 배분 수치는 절대 임의로 생성하지 말 것** — 그런 수치를 뒷받침할 데이터가 제공되지 않았으므로, 정량 배분표 대신 정성적 방향성만 제시할 것.
 
 2. 11개 전 섹터 전망 및 자금 순환매 심층 분석 (서식 엄격 준수)
 - **11개 섹터 전수 리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 상태를 11개 모두 글머리 기호(*)로 작성할 것.
@@ -1364,7 +1403,12 @@ if analyze_btn:
 
 4. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가 ({ticker})
 - **VWAP & 최다 매물대(POC) 지지/저항 판정**: 현재가가 1Y/20D VWAP 및 6개월 최다 매물대(POC) 상단/하단 중 어디에 위치하며 실제 매물 부담이 적은 구간인지 집중 분석할 것.
-- **볼린저 밴드 스퀴즈 & 백테스팅 시사점**: 스퀴즈 상태(Squeeze On/Off)에 따른 폭발 방향성 및 1년간 퀀트 백테스팅 승률/수익률을 종합 평가할 것.
+- **볼린저 밴드 스퀴즈 & 백테스팅 시사점**: 스퀴즈 상태(Squeeze On/Off)에 따른 폭발 방향성을 평가할 것.
+- **[백테스팅 성과 정직성 원칙 (필수, 절대 축소·생략 금지)]**: 두 전략의 `total_ret`을 반드시 `benchmark_buy_and_hold`(단순 보유 수익률)와 직접 비교하여 명시할 것.
+  * 전략 수익률이 벤치마크보다 낮으면 "벤치마크 대비 열위"임을 굵은 글씨로 명확히 경고할 것 (승률/손익비만 언급하고 총수익 비교를 생략하는 것 금지).
+  * `total_ret`이 마이너스(손실)인 전략은 "실전 매매 타이밍 시그널로서 신뢰도 낮음"이라고 반드시 명시할 것.
+  * 결론적으로 두 전략 중 하나라도 벤치마크를 밑돌면, "이 종목은 기술적 타이밍 매매보다 단순 보유(Buy & Hold)가 더 유리했다"는 취지의 문장을 반드시 포함할 것.
+- **[밸류에이션 이상치 검증 원칙 (필수)]**: 밸류에이션 모델 값에 "산출불가", "모델 괴리율 과다", "참고용" 등의 문구가 포함되어 있으면 이를 유효한 목표가처럼 서술하지 말고, 왜 신뢰할 수 없는지(예: 저성장/성숙 기업에 성장주 모델 적용, 현재가 대비 비현실적 괴리)를 밝히고 해당 모델은 판단에서 제외할 것. PBR이 음수(자사주 매입 등으로 인한 자본잠식)인 경우도 그 원인을 짚고 액면 그대로 해석하지 말 것.
 - 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
