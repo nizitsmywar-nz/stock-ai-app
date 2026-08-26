@@ -399,7 +399,7 @@ def fetch_nearest_options_data(ticker: str):
             "put_max_vol": {
                 "strike": put_max_vol_row.get("strike", "N/A"),
                 "volume": int(put_max_vol_row.get("volume", 0)) if pd.notnull(put_max_vol_row.get("volume")) else 0,
-                "price": round(float(put_max_vol_row.get("lastPrice", 0)), 2)
+                "price": round(float(put_max_oi_row.get("lastPrice", 0)), 2)
             }
         }
     except Exception:
@@ -904,7 +904,7 @@ def parse_full_trading_scenario(text):
     return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
 
 # -------------------------------------------------------------
-# 📌 [티어 및 신뢰도 매핑] 증권사 투자의견, 목표가 & 티어 분류기
+# 📌 증권사 투자의견, 목표가 & 티어 분류기
 # -------------------------------------------------------------
 TIER_1_FIRMS = [
     "goldman", "morgan stanley", "jpmorgan", "jp morgan", "citi", "citigroup",
@@ -953,13 +953,11 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
             to_g = str(row.get("ToGrade", "")).strip()
             action_raw = str(row.get("Action", "N/A")).strip()
             
-            # 이전 등급 -> 변경 등급 결합
             if from_g and from_g.lower() != "nan" and from_g != to_g:
                 grade_str = f"{from_g} ➡️ {to_g}"
             else:
                 grade_str = to_g if to_g and to_g.lower() != "nan" else "N/A"
 
-            # 개별 제시 가격 확인
             target_val = row.get("currentPriceTarget", None) or row.get("priceTarget", None) or row.get("TargetPrice", None)
             target_str = f"${float(target_val):.2f}" if pd.notnull(target_val) and target_val != "" else "-"
 
@@ -1165,7 +1163,7 @@ if analyze_btn:
         if not api_key:
             response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
-            # 📌 [증권사 티어 및 신뢰도 가중치 반영 프롬프트]
+            # 📌 [11개 전 섹터 및 자금 순환매 결론 개행 분리 프롬프트]
             template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급 및 VWAP, 볼린저 밴드 스퀴즈 ({ticker}) (기준일: {stock_date}):
@@ -1209,7 +1207,7 @@ if analyze_btn:
 
 ---
 
-[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 IB 신뢰도 반영 규칙]
+[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 서식 엄격 준수 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
@@ -1217,9 +1215,11 @@ if analyze_btn:
 - 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측] (현금, 채권, 주식, 코인, 금, 원유).
 - 권장 자산 배분 비중 (주식 : 채권 : 대체자산 : 현금)
 
-2. 11개 전 섹터 전망 및 자금 순환매 심층 분석
-- **11개 섹터 전수 상태 표/리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 국면을 11개 모두 한 줄씩 분석할 것.
-- **자금 이동 흐름(Rotation)**: 방어주 vs 성장주 순환매 방향성과 분석 대상 종목({ticker})이 속한 섹터의 수혜/소외 여부를 심층 결론으로 도출할 것.
+2. 11개 전 섹터 전망 및 자금 순환매 심층 분석 (서식 엄격 준수)
+- **11개 섹터 전수 리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 상태를 11개 모두 글머리 기호(*)로 작성할 것.
+- **자금 순환매 결론 분리 (필수)**: 11개 섹터 글머리 기호 작성이 끝난 후, **반드시 빈 줄(한 줄 공백)을 삽입**하여 아래와 같이 독립된 글머리 기호로 작성할 것:
+
+  * **자금 순환매 결론**: [방어주 vs 성장주 순환매 방향성과 {ticker}가 속한 섹터의 수혜/소외 여부 및 상대 강도를 명확히 도출]
 
 3. 밸류에이션 및 IB 스마트머니/옵션/공매도 분석 ({ticker})
 - **IB 투자의견 및 목표가 신뢰도 가중 평가**: 주입된 증권사 투자의견 변동 중 **Tier 1 (골드만삭스, 모건스탠리, JP모건 등) 및 Tier 2 주요 리서치**의 목표가 상향/하향 추세를 더 높은 신뢰도로 가중 분석하여 리포트에 명시할 것.
@@ -1413,11 +1413,9 @@ if st.session_state.last_analysis_result:
         diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
         s_c4.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
 
-    # S&P 500 11개 전 섹터 실시간 등락 현황판 UI
+    # 📌 S&P 500 11개 전 섹터 실시간 등락 현황판 (기본 접기: expanded=False)
     if sector_data:
-        with st.container(border=True):
-            st.markdown("##### 🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 (11 Sectors Rotation)**")
-            
+        with st.expander("🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 (11 Sectors Rotation) [클릭하여 펼치기]**", expanded=False):
             s_rows = []
             for etf, s_info in sector_data.items():
                 s_rows.append({
@@ -1631,7 +1629,6 @@ if st.session_state.last_analysis_result:
             st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 및 목표가 변동**")
             if res.get("analyst_data"):
                 df_analyst = pd.DataFrame(res.get("analyst_data", []))
-                # 표시 순서 정렬 및 컬럼 헤더 매핑
                 display_cols = ["date", "firm", "tier", "action", "grade_change", "target_price"]
                 df_analyst = df_analyst[[c for c in display_cols if c in df_analyst.columns]]
                 df_analyst.columns = ["일자", "증권사", "기관 신뢰도 등급", "구분", "투자의견 변동", "제시 목표가"]
