@@ -1193,7 +1193,7 @@ with st.sidebar:
     selected_model_id = MODEL_OPTIONS[selected_model_label]
     
     st.markdown("---")
-    ticker_input = st.text_input("종목/자산 티커 (예: TSLA, GOLD, GC=F, BTC-USD)", value=st.session_state.get("selected_ticker", "TSLA")).upper().strip()
+    ticker_input = st.text_input("종목/자산 티커 (금 : GC=F, 비트코인 : BTC-USD)", value=st.session_state.get("selected_ticker", "TSLA")).upper().strip()
     
     is_holding = st.checkbox("💼 **현재 보유 중인 자산인가요?**", value=False)
     
