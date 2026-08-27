@@ -399,10 +399,9 @@ def run_strategy_backtest(df: pd.DataFrame):
     }
 
 # -------------------------------------------------------------
-# 📌 옵션 체인 스마트머니 수급 수집기 (안전 가드 추가)
+# 📌 옵션 체인 스마트머니 수급 수집기
 # -------------------------------------------------------------
 def fetch_nearest_options_data(ticker: str, retries: int = 3):
-    # 원자재 선물(GC=F)이나 암호화폐(BTC-USD)는 옵션 체인이 없거나 에러를 유발하므로 즉시 차단
     if "=F" in ticker or "-USD" in ticker:
         return None
 
@@ -520,9 +519,6 @@ def format_market_cap(market_cap):
     except Exception:
         return str(market_cap)
 
-# -------------------------------------------------------------
-# 📌 헤지펀드 & 공매도 분석 (비주식 자산 안전 가드 추가)
-# -------------------------------------------------------------
 def fetch_hedge_funds_and_short_intel(ticker: str, stock, info):
     intel = {
         "top_holders": [],
@@ -1007,6 +1003,9 @@ def summarize_user_strategy(raw_text: str) -> str:
         summary += "."
     return summary
 
+# -------------------------------------------------------------
+# 📌 신규 진입 적격성 평가 파서 (회피성 문구 감지 시 강제 홀딩 처리)
+# -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
     entry_grade = "분석 리포트 참조"
@@ -1019,10 +1018,16 @@ def parse_full_trading_scenario(text):
     pyramiding = ""
     user_strategy_raw = ""
 
+    # 📌 [방어 로직] "지양", "금지", "관망", "보류", "부적합" 등의 회피성 문구가 감지되면 강제로 '홀딩(관망)' 판정
+    avoidance_keywords = ["지양", "금지", "관망", "보류", "부적합", "자제", "피할"]
+    has_avoidance = any(kw in text for kw in avoidance_keywords)
+
     match_action = re.search(r"\[최종\s*투자의견\s*[:\-]?\s*([^\]]+)\]", text)
     if match_action:
         op_text = match_action.group(1).strip()
-        if "매수" in op_text and "관망" not in op_text and "보유" not in op_text:
+        if has_avoidance:
+            action = "홀딩"
+        elif "매수" in op_text and "관망" not in op_text and "보유" not in op_text:
             action = "매수"
         elif "매도" in op_text or "비중축소" in op_text or "차익실현" in op_text:
             action = "매도"
@@ -1032,7 +1037,9 @@ def parse_full_trading_scenario(text):
         for line in text.split("\n"):
             line_str = line.replace("*", "").replace("#", "").replace("-", "").replace("•", "").strip()
             if "최종 투자 의견" in line_str or "최종 투자의견" in line_str:
-                if "적극매수" in line_str or "분할매수" in line_str:
+                if has_avoidance:
+                    action = "홀딩"
+                elif "적극매수" in line_str or "분할매수" in line_str:
                     action = "매수"
                 elif "비중축소" in line_str or "매도" in line_str or "차익실현" in line_str:
                     action = "매도"
@@ -1186,7 +1193,6 @@ with st.sidebar:
     selected_model_id = MODEL_OPTIONS[selected_model_label]
     
     st.markdown("---")
-    # 사용자가 입력한 티커를 그대로 반영 (GOLD는 Barrick Gold, 금 시세는 GC=F 직접 입력)
     ticker_input = st.text_input("종목/자산 티커 (예: TSLA, GOLD, GC=F, BTC-USD)", value=st.session_state.get("selected_ticker", "TSLA")).upper().strip()
     
     is_holding = st.checkbox("💼 **현재 보유 중인 자산인가요?**", value=False)
@@ -1416,7 +1422,9 @@ if analyze_btn:
 * **손절(Stop-loss) 기준선**: [...]
 * **불타기 조건**: [...]
 
-[최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
+[최종 투자의견 규칙 (엄격 준수)]:
+- 만약 현재 과열권이거나 추격 매수를 지양해야 하는 상황, 또는 관망/보류가 유리한 국면이라면 **최종 투자의견을 절대 '매수'나 '분할매수'로 적지 말고, 반드시 '관망' 또는 '홀딩'으로 명시할 것.**
+- [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
 
 {strategy_guide}
 """
@@ -1676,7 +1684,7 @@ if st.session_state.last_analysis_result:
             op_c3.metric("풋옵션 Max OI", f"${p_oi['strike']}", f"OI: {p_oi['oi']:,}")
             op_c4.metric("풋옵션 Max Vol", f"${p_vol['strike']}", f"Vol: {p_vol['volume']:,}")
         else:
-            st.markdown(f"##### 🎯 **옵션 체인 포지션**")
+            st.markdown("##### 🎯 **옵션 체인 포지션**")
             st.info("해당 자산은 옵션 체인 거래가 지원되지 않습니다.")
 
     with st.container(border=True):
