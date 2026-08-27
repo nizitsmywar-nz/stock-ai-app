@@ -973,38 +973,12 @@ def extract_clean_text(content):
 def summarize_user_strategy(raw_text: str) -> str:
     if not raw_text or raw_text == "분석 리포트 참조":
         return "분석 리포트 참조"
-        
+    # 📌 [수정] 대응 전략이 잘리지 않고 충분히 노출되도록 250자로 글자수 완화
     text = raw_text.replace("\n", " ").strip()
-    
-    if "보유자:" in text or "미보유자:" in text:
-        parts = []
-        if "보유자:" in text:
-            holder_part = text.split("보유자:")[1].split("미보유자:")[0].strip()
-            first_sen = re.split(r'[.!?]\s+', holder_part)[0].strip()
-            if first_sen:
-                parts.append(f"보유: {first_sen}")
-        if "미보유자:" in text:
-            non_holder_part = text.split("미보유자:")[1].strip()
-            first_sen = re.split(r'[.!?]\s+', non_holder_part)[0].strip()
-            if first_sen:
-                parts.append(f"신규: {first_sen}")
-        if parts:
-            res = " | ".join(parts)
-            return res[:130] + "..." if len(res) > 130 else res
-
-    sentences = [s.strip() for s in re.split(r'[.!?]\s+', text) if len(s.strip()) > 5]
-    if not sentences:
-        return text[:110]
-        
-    summary = ". ".join(sentences[:2])
-    if len(summary) > 120:
-        summary = summary[:120] + "..."
-    elif not summary.endswith("."):
-        summary += "."
-    return summary
+    return text[:250] + "..." if len(text) > 250 else text
 
 # -------------------------------------------------------------
-# 📌 신규 진입 적격성 평가 및 전략 파서 (대응 전략 추출 로직 보완)
+# 📌 정밀 파서 함수 (손절선 가격만 깔끔하게 추출하도록 보완)
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -1018,10 +992,10 @@ def parse_full_trading_scenario(text):
     pyramiding = ""
     user_strategy_raw = ""
 
-    # 회피성 문구 감지 시 강제 홀딩 처리
     avoidance_keywords = ["지양", "금지", "관망", "보류", "부적합", "자제", "피할"]
     has_avoidance = any(kw in text for kw in avoidance_keywords)
 
+    # 1. 최종 투자의견 파싱
     match_action = re.search(r"\[최종\s*투자의견\s*[:\-]?\s*([^\]]+)\]", text)
     if match_action:
         op_text = match_action.group(1).strip()
@@ -1047,11 +1021,11 @@ def parse_full_trading_scenario(text):
                     action = "홀딩"
                 break
 
-    match_entry_grade = re.search(r"\[신규\s*진입\s*적격성\s*평가\s*[:\-]?\s*([^\]]+)]", text)
+    match_entry_grade = re.search(r"\[신규\s*진입\s*적격성\s*평가\s*[:\-]?\s*([^\]]+)\]", text)
     if match_entry_grade:
         entry_grade = match_entry_grade.group(1).strip()
     
-    # 📌 [수정] '[사용자 대응 전략]' 블록 안전하게 파싱
+    # 2. 최종 투자의견 하위 항목인 [사용자 대응 전략] 파싱
     if "[사용자 대응 전략]" in text:
         strat_part = text.split("[사용자 대응 전략]")[1]
         if "[" in strat_part:
@@ -1068,6 +1042,7 @@ def parse_full_trading_scenario(text):
                     user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
                 break
 
+    # 3. 정밀 매매 시나리오 파싱
     scenario_block = text
     if "[정밀 매매 시나리오]" in text:
         after_header = text.split("[정밀 매매 시나리오]")[1]
@@ -1096,7 +1071,13 @@ def parse_full_trading_scenario(text):
                 buy_band = ":".join(line_clean.split(":")[1:]).strip()
         elif "손절" in line_clean or "Stop-loss" in line_clean:
             if ":" in line_clean:
-                stop_loss = ":".join(line_clean.split(":")[1:]).strip()
+                raw_sl = ":".join(line_clean.split(":")[1:]).strip()
+                # 📌 [수정] 달러 기호와 가격 부근만 추출하도록 정규식 적용 (긴 문장 유입 방지)
+                dollar_match = re.search(r"(\$[0-9,]+(?:\.\d+)?(?:\s*~\s*\$[0-9,]+(?:\.\d+)?)?)", raw_sl)
+                if dollar_match:
+                    stop_loss = dollar_match.group(1)
+                else:
+                    stop_loss = raw_sl.split("(")[0].strip() # 괄호 설명 전까지만 자르기
         elif "불타기 조건" in line_clean or "불타기" in line_clean:
             if ":" in line_clean:
                 pyramiding = ":".join(line_clean.split(":")[1:]).strip()
@@ -1176,9 +1157,6 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     except Exception:
         return []
 
-# -------------------------------------------------------------
-# 📌 티커 정규화 함수 (BTC -> BTC-USD 자동 변환)
-# -------------------------------------------------------------
 def normalize_ticker(ticker: str) -> str:
     ticker = ticker.upper().strip()
     crypto_symbols = ["BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "AVAX"]
@@ -1439,12 +1417,12 @@ if analyze_btn:
 * **손절(Stop-loss) 기준선**: [...]
 * **불타기 조건**: [...]
 
-[사용자 대응 전략]
-* **대응 전략 내용**: [...]
+[최종 투자의견]
+- [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
+- **사용자 대응 전략**: [...]
 
 [최종 투자의견 규칙 (엄격 준수)]:
 - 만약 현재 과열권이거나 추격 매수를 지양해야 하는 상황, 또는 관망/보류가 유리한 국면이라면 **최종 투자의견을 절대 '매수'나 '분할매수'로 적지 말고, 반드시 '관망' 또는 '홀딩'으로 명시할 것.**
-- [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
 
 {strategy_guide}
 """
