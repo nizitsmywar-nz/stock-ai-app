@@ -178,7 +178,8 @@ def fetch_stock_technical_data(ticker: str):
     df['BB_Mid'] = bb.bollinger_mavg()
     df['BB_Width'] = (df['BB_High'] - df['BB_Low']) / df['BB_Mid'] * 100
 
-    if df['ATR'] is not None:
+    # 버그 수정: DataFrame Series 객체 판정 오류 방지를 위해 notna().any() 활용
+    if df['ATR'] is not None and df['ATR'].notna().any():
         df['KC_High'] = df['SMA_20'] + (1.5 * df['ATR'])
         df['KC_Low'] = df['SMA_20'] - (1.5 * df['ATR'])
         df['BB_Squeeze_On'] = (df['BB_High'] < df['KC_High']) & (df['BB_Low'] > df['KC_Low'])
