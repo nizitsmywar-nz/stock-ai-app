@@ -1004,7 +1004,7 @@ def summarize_user_strategy(raw_text: str) -> str:
     return summary
 
 # -------------------------------------------------------------
-# 📌 신규 진입 적격성 평가 파서 (회피성 문구 감지 시 강제 홀딩 처리)
+# 📌 신규 진입 적격성 평가 및 전략 파서 (대응 전략 추출 로직 보완)
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -1018,7 +1018,7 @@ def parse_full_trading_scenario(text):
     pyramiding = ""
     user_strategy_raw = ""
 
-    # 📌 [방어 로직] "지양", "금지", "관망", "보류", "부적합" 등의 회피성 문구가 감지되면 강제로 '홀딩(관망)' 판정
+    # 회피성 문구 감지 시 강제 홀딩 처리
     avoidance_keywords = ["지양", "금지", "관망", "보류", "부적합", "자제", "피할"]
     has_avoidance = any(kw in text for kw in avoidance_keywords)
 
@@ -1047,23 +1047,26 @@ def parse_full_trading_scenario(text):
                     action = "홀딩"
                 break
 
-    match_entry_grade = re.search(r"\[신규\s*진입\s*적격성\s*평가\s*[:\-]?\s*([^\]]+)\]", text)
+    match_entry_grade = re.search(r"\[신규\s*진입\s*적격성\s*평가\s*[:\-]?\s*([^\]]+)]", text)
     if match_entry_grade:
         entry_grade = match_entry_grade.group(1).strip()
     
-    for line in text.split("\n"):
-        line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
-        if ("신규 진입 등급" in line_clean or "진입 등급" in line_clean) and entry_grade == "분석 리포트 참조":
-            if ":" in line_clean:
-                entry_grade = ":".join(line_clean.split(":")[1:]).strip()
-        elif "예상 손익비" in line_clean or "손익비" in line_clean:
-            if ":" in line_clean:
-                entry_rr = ":".join(line_clean.split(":")[1:]).strip()
-        elif "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
-            if ":" in line_clean:
-                user_strategy_raw = ":".join(line_clean.split(":")[1:]).strip()
-            else:
-                user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
+    # 📌 [수정] '[사용자 대응 전략]' 블록 안전하게 파싱
+    if "[사용자 대응 전략]" in text:
+        strat_part = text.split("[사용자 대응 전략]")[1]
+        if "[" in strat_part:
+            strat_part = strat_part.split("[")[0]
+        user_strategy_raw = strat_part.replace("*", "").replace("-", "").replace("•", "").strip()
+    
+    if not user_strategy_raw:
+        for line in text.split("\n"):
+            line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
+            if "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
+                if ":" in line_clean:
+                    user_strategy_raw = ":".join(line_clean.split(":")[1:]).strip()
+                else:
+                    user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
+                break
 
     scenario_block = text
     if "[정밀 매매 시나리오]" in text:
@@ -1082,19 +1085,19 @@ def parse_full_trading_scenario(text):
         elif "2차 목표가" in line_clean or "2차목표가" in line_clean:
             if ":" in line_clean:
                 target_2 = ":".join(line_clean.split(":")[1:]).strip()
-        elif ("목표가" in line_clean or "익절 라인" in line_clean or "익절/" in line_clean) and target_1 == "분석 리포트 참조":
+        elif ("목표가" in line_clean or "익절 라인" in line_clean) and target_1 == "분석 리포트 참조":
             if ":" in line_clean:
                 target_1 = ":".join(line_clean.split(":")[1:]).strip()
-        elif "매도가 밴드" in line_clean or "비중축소(익절) 밴드" in line_clean or "비중축소 밴드" in line_clean or "매도가" in line_clean:
+        elif "매도가 밴드" in line_clean or "비중축소" in line_clean or "매도가" in line_clean:
             if ":" in line_clean:
                 sell_target = ":".join(line_clean.split(":")[1:]).strip()
-        elif "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean or "분할 매수" in line_clean:
+        elif "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean:
             if ":" in line_clean:
                 buy_band = ":".join(line_clean.split(":")[1:]).strip()
         elif "손절" in line_clean or "Stop-loss" in line_clean:
             if ":" in line_clean:
                 stop_loss = ":".join(line_clean.split(":")[1:]).strip()
-        elif "불타기 조건" in line_clean or "불타기" in line_clean or "추가 매수 조건" in line_clean:
+        elif "불타기 조건" in line_clean or "불타기" in line_clean:
             if ":" in line_clean:
                 pyramiding = ":".join(line_clean.split(":")[1:]).strip()
 
@@ -1174,6 +1177,19 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
         return []
 
 # -------------------------------------------------------------
+# 📌 티커 정규화 함수 (BTC -> BTC-USD 자동 변환)
+# -------------------------------------------------------------
+def normalize_ticker(ticker: str) -> str:
+    ticker = ticker.upper().strip()
+    crypto_symbols = ["BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "AVAX"]
+    if ticker in crypto_symbols:
+        return f"{ticker}-USD"
+    commodity_symbols = ["GC", "CL", "SI", "HG"]
+    if ticker in commodity_symbols:
+        return f"{ticker}=F"
+    return ticker
+
+# -------------------------------------------------------------
 # 2. 사이드바 UI
 # -------------------------------------------------------------
 with st.sidebar:
@@ -1193,7 +1209,8 @@ with st.sidebar:
     selected_model_id = MODEL_OPTIONS[selected_model_label]
     
     st.markdown("---")
-    ticker_input = st.text_input("종목/자산 티커 (금 : GC=F, 비트코인 : BTC-USD)", value=st.session_state.get("selected_ticker", "TSLA")).upper().strip()
+    raw_ticker_input = st.text_input("종목/자산 티커 (비트코인: BTC, 금: GC)", value=st.session_state.get("selected_ticker", "TSLA"))
+    ticker_input = normalize_ticker(raw_ticker_input)
     
     is_holding = st.checkbox("💼 **현재 보유 중인 자산인가요?**", value=False)
     
@@ -1421,6 +1438,9 @@ if analyze_btn:
 * **매도가 밴드**: [...]
 * **손절(Stop-loss) 기준선**: [...]
 * **불타기 조건**: [...]
+
+[사용자 대응 전략]
+* **대응 전략 내용**: [...]
 
 [최종 투자의견 규칙 (엄격 준수)]:
 - 만약 현재 과열권이거나 추격 매수를 지양해야 하는 상황, 또는 관망/보류가 유리한 국면이라면 **최종 투자의견을 절대 '매수'나 '분할매수'로 적지 말고, 반드시 '관망' 또는 '홀딩'으로 명시할 것.**
