@@ -122,9 +122,6 @@ if "selected_ticker" not in st.session_state:
 if "last_analysis_result" not in st.session_state:
     st.session_state.last_analysis_result = None
 
-if "last_macro_analysis_result" not in st.session_state:
-    st.session_state.last_macro_analysis_result = None
-
 # -------------------------------------------------------------
 # 1. RAG 데이터 수집 모듈 (기술적 지표, BB Squeeze, VWAP, Volume Profile POC 등)
 # -------------------------------------------------------------
@@ -205,6 +202,7 @@ def fetch_stock_technical_data(ticker: str):
     low_6m = float(df_6m['Low'].min())
     diff_hl = high_6m - low_6m
     
+    # 📌 피보나치 되돌림 밴드
     fibonacci_levels = {
         "high_6m": round(high_6m, 2),
         "low_6m": round(low_6m, 2),
@@ -214,6 +212,7 @@ def fetch_stock_technical_data(ticker: str):
         "fib_61.8%": round(high_6m - (0.618 * diff_hl), 2)
     }
     
+    # 📌 [신규] 최근 6개월 매물대 프로파일 및 POC (Point of Control) 연산
     volume_profile = {}
     try:
         num_bins = 30
@@ -228,6 +227,7 @@ def fetch_stock_technical_data(ticker: str):
         poc_idx = int(np.argmax(vol_by_bin))
         poc_price = round(float((price_bins[poc_idx] + price_bins[poc_idx + 1]) / 2), 2)
         
+        # 70% Value Area (VAH / VAL)
         tot_vol = np.sum(vol_by_bin)
         target_va_vol = tot_vol * 0.70
         sorted_indices = np.argsort(vol_by_bin)[::-1]
@@ -296,6 +296,9 @@ def fetch_stock_technical_data(ticker: str):
     }
     return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc, df, volume_profile
 
+# -------------------------------------------------------------
+# 📌 정밀 전략 백테스팅 모듈 (1Y 일봉 기반)
+# -------------------------------------------------------------
 def run_strategy_backtest(df: pd.DataFrame):
     if df is None or len(df) < 60:
         return None
@@ -398,6 +401,9 @@ def run_strategy_backtest(df: pd.DataFrame):
         "strategy_2_vwap_mean_reversion": calc_stats(trades2)
     }
 
+# -------------------------------------------------------------
+# 📌 옵션 체인 스마트머니 수급 수집기
+# -------------------------------------------------------------
 def fetch_nearest_options_data(ticker: str, retries: int = 3):
     for attempt in range(retries):
         try:
@@ -513,6 +519,9 @@ def format_market_cap(market_cap):
     except Exception:
         return str(market_cap)
 
+# -------------------------------------------------------------
+# 📌 유명 헤지펀드 보유 내역 & 공매도 세력 분석 데이터 수집기
+# -------------------------------------------------------------
 def fetch_hedge_funds_and_short_intel(stock, info):
     intel = {
         "top_holders": [],
@@ -553,6 +562,10 @@ def fetch_hedge_funds_and_short_intel(stock, info):
         if shares_short and shares_short_prior and shares_short_prior > 0:
             short_mom_pct = round(((shares_short - shares_short_prior) / shares_short_prior) * 100, 2)
 
+        # 📌 [버그 수정] 숏스퀴즈는 "공매도 비중(float)"이 유의미하게 높아야 성립하는
+        # 개념이며, 상환소요일수(Days to Cover)는 보조 지표일 뿐이다.
+        # 기존 코드는 or 조건이라 short_float가 매우 낮아도(예: 2~3%) days_to_cover만
+        # 4일 이상이면 "숏스퀴즈 주의"로 오판정되는 버그가 있었음 (and 로 수정).
         squeeze_risk = "🟢 안정 (Low Risk)"
         if short_float_pct is not None and short_ratio_days is not None:
             if short_float_pct >= 20.0 and short_ratio_days >= 5.0:
@@ -562,6 +575,7 @@ def fetch_hedge_funds_and_short_intel(stock, info):
             elif short_float_pct >= 5.0:
                 squeeze_risk = "💡 모니터링 구간 (Low-Moderate)"
         elif short_float_pct is not None:
+            # days_to_cover 데이터가 없을 때는 공매도 비중만으로 보수적 판정
             if short_float_pct >= 20.0:
                 squeeze_risk = "🚨 숏스퀴즈 고위험 (High Squeeze Potential)"
             elif short_float_pct >= 10.0:
@@ -703,6 +717,12 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     else:
         est_growth = 15.0
 
+    # 📌 [버그 수정] 그레이엄/피터 린치/ROE-PBR 모델은 원래 안정적인 저PER
+    # 자산가치주·배당주를 겨냥한 공식이다. TSLA처럼 트레일링 PER이 300배가
+    # 넘는 초고평가 성장주에 그대로 적용하면 현재가 대비 90%+ 벗어나는
+    # 무의미한 "청산가치"가 나오는데, 기존 코드는 이를 걸러내지 않고
+    # 그대로 노출했다. → growth_models와 동일한 원칙으로 괴리율/고PER 여부를
+    # 함께 검증해 무효 처리한다.
     def _value_model_sanity(value, label):
         try:
             if not isinstance(value, (int, float)):
@@ -747,9 +767,16 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     except Exception:
         value_models["roe_pbr"] = "산출불가"
 
+    # 📌 [버그 수정] 성장주 밸류에이션 모델(PEG/DCF)은 실제 실적 성장률(earningsGrowth)이
+    # 없거나 음수인 종목에도 기본값 15%를 강제 적용해왔다. 그 결과 알트리아(MO) 같은
+    # 저성장 성숙 배당주에도 현재가 대비 +90~130%씩 벗어나는 비현실적 목표가가 산출되어
+    # 마치 유효한 모델인 것처럼 리포트에 노출되는 문제가 있었다.
+    # → (1) 실제 성장률 데이터가 없어 기본값(fallback)을 쓴 경우와 (2) 산출값이 현재가
+    #    대비 과도하게 괴리된 경우를 구분해 "산출불가/신뢰도 낮음"으로 명시한다.
     used_growth_fallback = not (earnings_growth and earnings_growth > 0)
 
     def _sanity_capped(value, label):
+        """현재가 대비 괴리율이 과도하면(60% 초과) 신뢰 불가로 처리."""
         try:
             if not isinstance(value, (int, float)) or not curr_price or curr_price <= 0:
                 return "산출불가"
@@ -757,6 +784,8 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
             if deviation > 0.6:
                 return f"산출불가 (모델 괴리율 과다: {deviation*100:.0f}%)"
             if used_growth_fallback:
+                # 실제 성장률 데이터 없이 기본 성장률(15%)을 가정한 값이므로
+                # 저성장/성숙 기업에는 참고용으로만 써야 함을 표시
                 return f"{value} (참고용·추정성장률 가정치)"
             return value
         except Exception:
@@ -816,6 +845,9 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         "growth_models": growth_models
     }
 
+# -------------------------------------------------------------
+# 📌 S&P 500 11개 전 섹터 5일/1개월 수익률 수집
+# -------------------------------------------------------------
 def fetch_sector_performance():
     sector_etfs = [
         ("XLK", "IT/기술 (Technology)"),
@@ -933,6 +965,9 @@ def extract_clean_text(content):
         return "\n".join([p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in content])
     return str(content)
 
+# -------------------------------------------------------------
+# 📌 히스토리용 전략 요약 함수
+# -------------------------------------------------------------
 def summarize_user_strategy(raw_text: str) -> str:
     if not raw_text or raw_text == "분석 리포트 참조":
         return "분석 리포트 참조"
@@ -966,6 +1001,9 @@ def summarize_user_strategy(raw_text: str) -> str:
         summary += "."
     return summary
 
+# -------------------------------------------------------------
+# 📌 신규 진입 적격성 평가 파서
+# -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
     entry_grade = "분석 리포트 참조"
@@ -1053,6 +1091,9 @@ def parse_full_trading_scenario(text):
     user_strategy_summary = summarize_user_strategy(user_strategy_raw)
     return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
 
+# -------------------------------------------------------------
+# 📌 증권사 투자의견, 목표가 & 티어 분류기
+# -------------------------------------------------------------
 TIER_1_FIRMS = [
     "goldman", "morgan stanley", "jpmorgan", "jp morgan", "citi", "citigroup",
     "bank of america", "bofa", "merrill", "ubs", "barclays", "deutsche bank",
@@ -1127,7 +1168,7 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
 # 2. 사이드바 UI
 # -------------------------------------------------------------
 with st.sidebar:
-    st.markdown("### ⚡ **AI Multi-Asset Analyst Pro**")
+    st.markdown("### ⚡ **AI Stock Analyst Pro**")
     
     MODEL_OPTIONS = {
         "Gemini 3.1 Flash Lite": "gemini-3.1-flash-lite",
@@ -1143,115 +1184,184 @@ with st.sidebar:
     selected_model_id = MODEL_OPTIONS[selected_model_label]
     
     st.markdown("---")
+    ticker_input = st.text_input("종목 티커 (Ticker)", value=st.session_state.selected_ticker).upper()
+    
+    is_holding = st.checkbox("💼 **현재 보유 중인 종목인가요?**", value=False)
+    
+    user_avg_price = 0.0
+    user_shares = 0.0
+    
+    if is_holding:
+        u_col1, u_col2 = st.columns(2)
+        with u_col1:
+            user_avg_price = st.number_input("내 평단가 ($)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
+        with u_col2:
+            user_shares = st.number_input("보유 수량 (주)", min_value=0.0, value=0.0, step=1.0, format="%.1f")
+            
+    st.write("")
+    analyze_btn = st.button("🚀 분석 & 백테스팅 실행", type="primary", use_container_width=True)
+    st.divider()
 
-# -------------------------------------------------------------
-# 3. 메인 화면: 상단 탭 분기 구조 (주식 vs 금/비트코인)
-# -------------------------------------------------------------
-main_tab_stock, main_tab_macro = st.tabs(["📈 주식 종목 종합 분석", "🪙 금 & 비트코인 매크로·수급 분석"])
-
-# =============================================================
-# [TAB 1] 주식 종목 분석 탭
-# =============================================================
-with main_tab_stock:
-    with st.sidebar:
-        st.markdown("#### 📈 **주식 분석 설정**")
-        ticker_input = st.text_input("종목 티커 (Ticker)", value=st.session_state.get("stock_ticker", "TSLA"), key="stock_ticker_input").upper()
-        st.session_state.stock_ticker = ticker_input
+    # 📌 종목별 트레이딩 히스토리
+    st.markdown("#### 📌 **종목별 트레이딩 히스토리**")
+    
+    if st.session_state.history:
+        tab_all, tab_buy, tab_sell, tab_hold = st.tabs(["전체", "🟢매수", "🔴매도", "🟡홀딩"])
         
-        is_holding = st.checkbox("💼 **현재 보유 중인 종목인가요?**", value=False, key="stock_holding")
-        
-        user_avg_price = 0.0
-        user_shares = 0.0
-        
-        if is_holding:
-            u_col1, u_col2 = st.columns(2)
-            with u_col1:
-                user_avg_price = st.number_input("내 평단가 ($)", min_value=0.0, value=0.0, step=0.5, format="%.2f", key="stock_avg")
-            with u_col2:
-                user_shares = st.number_input("보유 수량 (주)", min_value=0.0, value=0.0, step=1.0, format="%.1f", key="stock_shares")
+        def render_history_card(t_code, data):
+            action_badge = "🟢 매수" if data['action'] == "매수" else ("🔴 매도" if data['action'] == "매도" else "🟡 홀딩")
+            with st.expander(f"**{t_code}** (${data['price']}) | {action_badge}", expanded=False):
+                st.markdown(f"- **현재가:** `${data['price']}`")
                 
+                entry_grade_val = data.get('entry_grade', '')
+                if entry_grade_val and entry_grade_val != "분석 리포트 참조":
+                    st.markdown(f"- **🆕 신규 진입 판정:** `{entry_grade_val}`")
+                
+                if data.get('my_avg', 0) > 0:
+                    st.markdown(f"- **💼 내 평단:** `${data['my_avg']}` ({data.get('my_return', 'N/A')})")
+                
+                t1 = data.get('target_1') or data.get('take_profit', '분석 리포트 참조')
+                t2 = data.get('target_2', '')
+                st.markdown(f"- **🎯 1차 목표가:** `{t1}`")
+                if t2:
+                    st.markdown(f"- **🎯 2차 목표가:** `{t2}`")
+                    
+                st.markdown(f"- **📤 매도가 밴드:** `{data.get('sell_target', '분석 리포트 참조')}`")
+                st.markdown(f"- **📥 분할매수 밴드:** `{data.get('buy_band', '분석 리포트 참조')}`")
+                st.markdown(f"- **🛑 손절선:** `{data.get('stop_loss', '분석 리포트 참조')}`")
+                
+                if data.get('pyramiding'):
+                    st.markdown(f"- **🔥 불타기 조건:** `{data['pyramiding']}`")
+                
+                strat_text = data.get('user_strategy', '')
+                if strat_text and strat_text != "분석 리포트 참조":
+                    st.markdown(f"- **💡 대응 전략:** `{strat_text}`")
+                else:
+                    st.markdown(f"- **💡 대응 전략:** `분석 리포트 참조`")
+                    
+                st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
+
+        with tab_all:
+            for t_code, data in list(st.session_state.history.items())[::-1]:
+                render_history_card(t_code, data)
+                
+        with tab_buy:
+            buy_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "매수"]
+            if buy_items:
+                for t_code, data in buy_items:
+                    render_history_card(t_code, data)
+            else:
+                st.caption("매수 판정 종목이 없습니다.")
+
+        with tab_sell:
+            sell_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "매도"]
+            if sell_items:
+                for t_code, data in sell_items:
+                    render_history_card(t_code, data)
+            else:
+                st.caption("매도 판정 종목이 없습니다.")
+
+        with tab_hold:
+            hold_items = [item for item in list(st.session_state.history.items())[::-1] if item[1]['action'] == "홀딩"]
+            if hold_items:
+                for t_code, data in hold_items:
+                    render_history_card(t_code, data)
+            else:
+                st.caption("홀딩/관망 판정 종목이 없습니다.")
+                    
         st.write("")
-        analyze_btn = st.button("🚀 주식 분석 & 백테스팅 실행", type="primary", use_container_width=True, key="stock_btn")
-        st.divider()
+        if st.button("🗑️ 히스토리 전체 삭제", use_container_width=True):
+            st.session_state.history = {}
+            if os.path.exists(HISTORY_FILE):
+                os.remove(HISTORY_FILE)
+            st.rerun()
+    else:
+        st.caption("분석을 실행하면 종목별 매수/매도/홀딩 판정 및 목표가/손절가 밴드가 영구 저장됩니다.")
 
-    st.header(f"📊 [{ticker_input}] 주식 종합 밸류에이션 & 정밀 트레이딩 리포트")
+# -------------------------------------------------------------
+# 3. 메인 분석 화면 & 분석 완료 즉시 렌더링 로직
+# -------------------------------------------------------------
+st.header(f"📊 {ticker_input} 종합 밸류에이션 & 정밀 트레이딩 리포트")
 
-    if analyze_btn:
-        api_key = os.getenv("GEMINI_API_KEY")
+# [1] 분석 버튼 클릭 시 실행
+if analyze_btn:
+    api_key = os.getenv("GEMINI_API_KEY")
+    if not api_key:
+        try:
+            api_key = st.secrets["GEMINI_API_KEY"]
+        except Exception:
+            api_key = None
+            
+    with st.spinner(f"🔍 [{ticker_input}] POC 매물대/헤지펀드 지분/공매도 세력 분석/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
+        tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df, vol_profile = fetch_stock_technical_data(ticker_input)
+        backtest_results = run_strategy_backtest(raw_df)
+        options_data = fetch_nearest_options_data(ticker_input, retries=3)
+        macro_data = fetch_macro_indicators()
+        
+        curr_p = tech_data.get('current_price', 0)
+        fund_data = fetch_fundamentals_and_valuation(ticker_input, curr_p, high_52_calc, low_52_calc)
+        sector_data = fetch_sector_performance()
+        news_data = fetch_news(ticker_input, limit=5)
+        macro_news_data = fetch_macro_news(limit=4)
+        analyst_data = fetch_recent_upgrades_downgrades(ticker_input, months=2)
+        
+        info_source_flag = fund_data.get('info_source', 'stock.info')
+        ownership = fund_data.get('ownership_and_shorts', {})
+        hedge_short_intel = fund_data.get('hedge_and_short_intel', {})
+        earnings_info = fund_data.get('earnings_calendar', {})
+        
+        my_return_str = "N/A"
+        if is_holding and user_avg_price > 0 and user_shares > 0 and curr_p > 0:
+            total_invested = user_avg_price * user_shares
+            total_current = curr_p * user_shares
+            pnl_dollar = total_current - total_invested
+            pnl_pct = ((curr_p - user_avg_price) / user_avg_price) * 100
+            my_return_str = f"{pnl_pct:+.2f}%"
+
+        user_position_text = (
+            f"사용자 보유 현황: 평단가 ${user_avg_price:.2f}, 보유수량 {user_shares:.1f}주, 평가수익률 {my_return_str}"
+            if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
+        )
+
+        # 📌 보유 상태에 따른 대응 전략 프롬프트 가이드 동적 생성
+        if is_holding and user_avg_price > 0:
+            strategy_instruction_text = f"""* **사용자 대응 전략**: [현재 사용자가 평단가 ${user_avg_price:.2f}, 평가수익률 {my_return_str}로 주식을 보유 중인 상태입니다. 반드시 '보유자 관점'의 전략만 단독 작성할 것. 미보유자나 신규 진입 관련 문구는 일절 작성하지 말 것. 1차/2차 목표가 도달 시 구체적인 부분 익절/비중축소 비중(예: 30% 매도) 및 손절선 이탈 시 전량 손절 계획을 명시할 것.]"""
+        else:
+            strategy_instruction_text = """* **사용자 대응 전략**: [현재 사용자가 주식을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것. 보유자 관련 문구는 일절 작성하지 말 것. 상단 [신규 진입 적격성 평가] 및 [분할 매수 밴드]와 100% 일치하는 진입 가격대와 진입 비중(예: 1차 30% 분할 진입 등)을 명확히 제시할 것.]"""
+
+        full_rag_payload = {
+            "meta": {
+                "ticker": ticker_input,
+                "data_source": info_source_flag,
+                "model_used": selected_model_label,
+                "analysis_requested_at": get_current_kst_time_str(),
+                "stock_data_date": stock_date
+            },
+            "technical_vwap_and_squeeze": tech_data,
+            "volume_profile_poc_6m": vol_profile,
+            "one_year_backtesting": backtest_results,
+            "fibonacci_retracement_6m": fib_levels,
+            "options_chain_nearest": options_data,
+            "ownership_and_short_interest": ownership,
+            "hedge_funds_and_short_intel": hedge_short_intel,
+            "earnings_calendar_and_52w": earnings_info,
+            "macro_6_assets": macro_data,
+            "global_macro_news": macro_news_data,
+            "sector_performance_11_sectors": sector_data,
+            "fundamentals_and_6_valuations": fund_data,
+            "user_portfolio_status": user_position_text,
+            "stock_recent_news": news_data,
+            "analyst_upgrades_downgrades_2m": analyst_data
+        }
+
+        full_json_str = json.dumps(full_rag_payload, indent=2, ensure_ascii=False)
+
+        response_content = None
         if not api_key:
-            try:
-                api_key = st.secrets["GEMINI_API_KEY"]
-            except Exception:
-                api_key = None
-                
-        with st.spinner(f"🔍 [{ticker_input}] POC 매물대/헤지펀드 지분/공매도 분석/11개 섹터 수급 분석 및 백테스팅 실행 중..."):
-            tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df, vol_profile = fetch_stock_technical_data(ticker_input)
-            backtest_results = run_strategy_backtest(raw_df)
-            options_data = fetch_nearest_options_data(ticker_input, retries=3)
-            macro_data = fetch_macro_indicators()
-            
-            curr_p = tech_data.get('current_price', 0)
-            fund_data = fetch_fundamentals_and_valuation(ticker_input, curr_p, high_52_calc, low_52_calc)
-            sector_data = fetch_sector_performance()
-            news_data = fetch_news(ticker_input, limit=5)
-            macro_news_data = fetch_macro_news(limit=4)
-            analyst_data = fetch_recent_upgrades_downgrades(ticker_input, months=2)
-            
-            info_source_flag = fund_data.get('info_source', 'stock.info')
-            ownership = fund_data.get('ownership_and_shorts', {})
-            hedge_short_intel = fund_data.get('hedge_and_short_intel', {})
-            earnings_info = fund_data.get('earnings_calendar', {})
-            
-            my_return_str = "N/A"
-            if is_holding and user_avg_price > 0 and user_shares > 0 and curr_p > 0:
-                total_invested = user_avg_price * user_shares
-                total_current = curr_p * user_shares
-                pnl_dollar = total_current - total_invested
-                pnl_pct = ((curr_p - user_avg_price) / user_avg_price) * 100
-                my_return_str = f"{pnl_pct:+.2f}%"
-
-            user_position_text = (
-                f"사용자 보유 현황: 평단가 ${user_avg_price:.2f}, 보유수량 {user_shares:.1f}주, 평가수익률 {my_return_str}"
-                if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
-            )
-
-            if is_holding and user_avg_price > 0:
-                strategy_instruction_text = f"""* **사용자 대응 전략**: [현재 사용자가 평단가 ${user_avg_price:.2f}, 평가수익률 {my_return_str}로 주식을 보유 중인 상태입니다. 반드시 '보유자 관점'의 전략만 단독 작성할 것. 미보유자나 신규 진입 관련 문구는 일절 작성하지 말 것. 1차/2차 목표가 도달 시 구체적인 부분 익절/비중축소 비중(예: 30% 매도) 및 손절선 이탈 시 전량 손절 계획을 명시할 것.]"""
-            else:
-                strategy_instruction_text = """* **사용자 대응 전략**: [현재 사용자가 주식을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것. 보유자 관련 문구는 일절 작성하지 말 것. 상단 [신규 진입 적격성 평가] 및 [분할 매수 밴드]와 100% 일치하는 진입 가격대와 진입 비중(예: 1차 30% 분할 진입 등)을 명확히 제시할 것.]"""
-
-            full_rag_payload = {
-                "meta": {
-                    "ticker": ticker_input,
-                    "data_source": info_source_flag,
-                    "model_used": selected_model_label,
-                    "analysis_requested_at": get_current_kst_time_str(),
-                    "stock_data_date": stock_date
-                },
-                "technical_vwap_and_squeeze": tech_data,
-                "volume_profile_poc_6m": vol_profile,
-                "one_year_backtesting": backtest_results,
-                "fibonacci_retracement_6m": fib_levels,
-                "options_chain_nearest": options_data,
-                "ownership_and_short_interest": ownership,
-                "hedge_funds_and_short_intel": hedge_short_intel,
-                "earnings_calendar_and_52w": earnings_info,
-                "macro_6_assets": macro_data,
-                "global_macro_news": macro_news_data,
-                "sector_performance_11_sectors": sector_data,
-                "fundamentals_and_6_valuations": fund_data,
-                "user_portfolio_status": user_position_text,
-                "stock_recent_news": news_data,
-                "analyst_upgrades_downgrades_2m": analyst_data
-            }
-
-            full_json_str = json.dumps(full_rag_payload, indent=2, ensure_ascii=False)
-
-            response_content = None
-            if not api_key:
-                response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다."
-            else:
-                template = """
+            response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
+        else:
+            # 📌 [POC 매물대 및 보수적 실전 매매 프롬프트]
+            template = """
 [RAG 심층 주입 데이터]
 1. 기술적/수급, VWAP, 볼린저 밴드 스퀴즈 및 6개월 매물대 POC ({ticker}) (기준일: {stock_date}):
 {tech_json}
@@ -1289,7 +1399,7 @@ with main_tab_stock:
 12. 사용자 보유 현황:
 {user_position}
 
-13. 종목 최신 주요 기사 (신규성 및 16가지 체크리스트 검토 대상):
+13. 종목 최신 주요 기사:
 {news_json}
 
 14. 최근 2개월 증권가 투자의견 및 목표가 변동 (기관 신뢰도 티어 포함):
@@ -1297,511 +1407,480 @@ with main_tab_stock:
 
 ---
 
-[지시사항 - 분석 정합성 및 16가지 체크리스트 기반 신규성 검증 규칙]
-위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성하되, **최신 뉴스(항목 13)의 신규성(Newness/Priced-in 여부)**을 엄격히 판정할 것:
+[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 POC 매물벽 검증 규칙]
+위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
-1. **최신 뉴스 신규성 및 가격 변동 요약 (매우 중요)**:
-- 주입된 최신 뉴스 기사들의 내용을 바탕으로, **실질적으로 주가에 단기적 변동을 유발할 만한 강력한 '신규성(Newness)'이 있는지** 엄격히 판정할 것. (이미 며칠 전 반영되었거나 단순 루머/반복성 기사라면 신규성 없음으로 판단).
-- **[신규성 판정 결과]**: 만약 신규성이 부족하거나 이미 시장에 선반영(Priced-in)되어 주가 변동 트리거로서의 의미가 없다고 판단되면, 리포트 내에 **"📰 최신 뉴스 신규성 검토: 시장 선반영 완료 (특이 변동 요인 없음)"**이라고 명시할 것.
-- 반대로, 컨센서스 서프라이즈, 대형 M&A, 규제 변화, 가이던스 상향, 숏스퀴즈 임박 등 **뚜렷한 신규성이 있는 핵심 이벤트가 포착된 경우**, 아래 16가지 체크리스트 관점(서프라이즈 크기, 소스 신뢰도, 거래량 급증, 애널리스트 목표가 상향 등)을 녹여내어 리포트 최상단에 **[🚨 실시간 주가 변동 핵심 트리거 요약]** 섹션으로 별도 요약할 것.
-
-2. 거시환경 및 시장 국면
+1. 거시환경 및 시장 국면
 - **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 요약 명시할 것.
-- 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측].
-- **[자산배분 코멘트 – 근거 없는 수치 생성 금지]**: 구체적인 퍼센트 배분 수치는 절대 임의로 생성하지 말 것.
+- 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측] (현금, 채권, 주식, 코인, 금, 원유).
+- **[자산배분 코멘트 – 근거 없는 수치 생성 금지 (필수)]**: 주입된 데이터(10년물 국채금리, VIX, 달러인덱스, 유가, 금, 비트코인)만을 근거로 방향성(예: "국채 비중 확대 고려" 등)을 서술할 것. "주식 40% : 채권 30%"처럼 **구체적인 퍼센트 배분 수치는 절대 임의로 생성하지 말 것** — 그런 수치를 뒷받침할 데이터가 제공되지 않았으므로, 정량 배분표 대신 정성적 방향성만 제시할 것.
 
-3. 11개 전 섹터 전망 및 자금 순환매 심층 분석
-- 11개 섹터 전수 리스트 작성 후, 반드시 빈 줄을 삽입하여 **자금 순환매 결론** 도출.
+2. 11개 전 섹터 전망 및 자금 순환매 심층 분석 (서식 엄격 준수)
+- **11개 섹터 전수 리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 상태를 11개 모두 글머리 기호(*)로 작성할 것.
+- **자금 순환매 결론 분리 (필수)**: 11개 섹터 글머리 기호 작성이 끝난 후, **반드시 빈 줄(한 줄 공백)을 삽입**하여 아래와 같이 독립된 글머리 기호로 작성할 것:
 
-4. 밸류에이션, 스마트머니(헤지펀드) 및 공매도 세력/옵션 분석 ({ticker})
-- 13F 주요 보유 기관 및 Short Float, Days to Cover를 결합한 숏스퀴즈 리스크 평가.
+  * **자금 순환매 결론**: [방어주 vs 성장주 순환매 방향성과 {ticker}가 속한 섹터의 수혜/소외 여부 및 상대 강도를 명확히 도출]
 
-5. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가
-- POC 매물대 및 VWAP 지지/저항, 백테스팅 성과 정직성 원칙 적용.
+3. 밸류에이션, 스마트머니(헤지펀드) 및 공매도 세력/옵션 분석 ({ticker})
+- **유명 헤지펀드 포지션**: 13F 주요 보유 기관(Top Holders)의 지분 집중도와 스마트머니 매집 특성을 분석할 것.
+- **공매도 세력 및 숏스퀴즈 리스크**: Short Float, Days to Cover(상환 소요 일수), 월간 공매도 증감율을 결합하여 공매도 세력의 하방 압력 강도 및 숏스퀴즈 촉발 가능성을 평가할 것.
+- **IB 투자의견 신뢰도 가중**: Tier 1/2 투자은행의 목표가 변동을 가중 평가하되, 기관 목표가는 중장기 상방 여력 참고용으로만 활용할 것.
 
-6. [신규 진입 적격성 평가] 및 [정밀 매매 시나리오]
-- 가격 밴드 오름차순(낮은 가격 ~ 높은 가격) 정렬 및 보수적 매도가 밴드 설정.
+4. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가 ({ticker})
+- **VWAP & 최다 매물대(POC) 지지/저항 판정**: 현재가가 1Y/20D VWAP 및 6개월 최다 매물대(POC) 상단/하단 중 어디에 위치하며 실제 매물 부담이 적은 구간인지 집중 분석할 것.
+- **볼린저 밴드 스퀴즈 & 백테스팅 시사점**: 스퀴즈 상태(Squeeze On/Off)에 따른 폭발 방향성을 평가할 것.
+- **[백테스팅 성과 정직성 원칙 (필수, 절대 축소·생략 금지)]**: 두 전략의 `total_ret`을 반드시 `benchmark_buy_and_hold`(단순 보유 수익률)와 직접 비교하여 명시할 것.
+  * 전략 수익률이 벤치마크보다 낮으면 "벤치마크 대비 열위"임을 굵은 글씨로 명확히 경고할 것 (승률/손익비만 언급하고 총수익 비교를 생략하는 것 금지).
+  * `total_ret`이 마이너스(손실)인 전략은 "실전 매매 타이밍 시그널로서 신뢰도 낮음"이라고 반드시 명시할 것.
+  * 결론적으로 두 전략 중 하나라도 벤치마크를 밑돌면, "이 종목은 기술적 타이밍 매매보다 단순 보유(Buy & Hold)가 더 유리했다"는 취지의 문장을 반드시 포함할 것.
+- **[밸류에이션 이상치 검증 원칙 (필수)]**: 밸류에이션 모델 값에 "산출불가", "모델 괴리율 과다", "참고용" 등의 문구가 포함되어 있으면 이를 유효한 목표가처럼 서술하지 말고, 왜 신뢰할 수 없는지(예: 저성장/성숙 기업에 성장주 모델 적용, 고PER 성장주에 자산가치/청산가치 모델 적용, 현재가 대비 비현실적 괴리)를 밝히고 해당 모델은 판단에서 제외할 것. PBR이 음수(자사주 매입 등으로 인한 자본잠식)인 경우도 그 원인을 짚고 액면 그대로 해석하지 말 것.
+- 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
+
+5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
+- **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망/리스크 과다) 중 택1]
+- **진입 적합성 종합 판정**: 미보유자 입장에서 현재 시점에 무조건 하방 매수를 기다려야 하는지, 아니면 현재가 부근에서 즉시/분할 진입할 만한 모멘텀과 밸류에이션 메리트가 있는지 객관적이고 냉정하게 평가할 것.
+- **예상 손익비 (Risk/Reward Ratio)**: 1차 목표가까지의 기대 상승률 대비 손절선까지의 하방 리스크 비율을 수치로 명시할 것.
+
+6. [정밀 매매 시나리오]
+- **[매수 밴드 및 진입 가격의 상·하단 논리 일치 규칙 (필수)]**:
+  * **분할 매수 밴드 설정**: 피보나치 지지선, 20일 VWAP, POC 매물대 지지선을 결합하여 실질적 달러 범위를 도출할 것.
+  * **하단 [사용자 대응 전략]과의 가격 일치**: 사용자 대응 전략에서 언급하는 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것.
+
+- **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
+- **[서식 및 가격 표기 엄격 준수 규칙]**: 
+  * **가격 밴드 오름차순 표기 (필수)**: 분할 매수 밴드, 매도가 밴드 등 모든 가격 범위는 반드시 **'낮은 가격 ~ 높은 가격 (하단 ~ 상단)' 오름차순 순서로 정렬**하여 작성할 것 (예: $332.49 ~ $356.98). 절대로 높은 가격을 앞에 적지 말 것.
+  * **보수적 매도가 밴드 설정**: 증권사 기관 목표가 대신 **볼린저 밴드 상단, 52주 고점 저항선, POC 매물대 저항선, 콜옵션 Max OI 저항벽 등 실제 차트/수급상의 실시간 저항선**을 최우선 기준으로 하여 현실적인 차익실현 달러 밴드를 도출할 것.
+  * **피보나치 수치 표기 규칙**: 반드시 **'피보나치 50.0%', '피보나치 38.2%', '피보나치 23.6%', '피보나치 61.8%'**와 같이 소수점과 퍼센트(%) 기호를 붙여 표기할 것.
+  * 비중 언급 시 '30%'처럼 퍼센트(%) 기호를 붙이고 단어와 숫자 사이에 공백을 둘 것.
 
 [신규 진입 적격성 평가]
-* **신규 진입 등급**: [...]
-* **진입 적합성 분석**: [...]
-* **예상 손익비 (Risk/Reward)**: [...]
+* **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망) 중 택1]
+* **진입 적합성 분석**: [미보유자 관점에서 현재 진입의 타당성, 추세 지속성 및 밸류에이션 매력도 분석]
+* **예상 손익비 (Risk/Reward)**: [기대수익 % : 손실 % (비율)]
 
 [정밀 매매 시나리오]
-* **분할 매수 밴드**: [...]
-* **1차 목표가**: [...]
-* **2차 목표가**: [...]
-* **매도가 밴드**: [...]
-* **손절(Stop-loss) 기준선**: [...]
-* **불타기 조건**: [...]
+
+* **분할 매수 밴드**: [피보나치 지지선, VWAP 및 POC 지지선을 결합한 구체적 달러 범위와 근거 (낮은 가격 ~ 높은 가격 순 정렬)]
+* **1차 목표가**: [피보나치 38.2% 또는 50.0% 구간 구체적 달러 가격대와 근거]
+* **2차 목표가**: [피보나치 23.6% 또는 52주 고점 인근 저항 구체적 달러 가격대와 근거]
+* **매도가 밴드**: [볼린저 밴드 상단, POC 저항 및 콜옵션 저항벽을 최우선 반영한 실전 분할 차익실현 구체적 달러 밴드 (낮은 가격 ~ 높은 가격 순 정렬)]
+* **손절(Stop-loss) 기준선**: [2.0x ATR 또는 1Y VWAP 이탈 시 추세 훼손 구체적 달러 가격대]
+* **불타기 조건**: [스퀴즈 상방 돌파 및 상방 저항선 안착 시 추가 매수 검토 기준]
 
 [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
 
 {strategy_guide}
 """
-                prompt = PromptTemplate(
-                    input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json"],
-                    template=template
-                )
-                llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
-                chain = prompt | llm
-                
-                payload = {
-                    "ticker": ticker_input,
-                    "stock_date": stock_date,
-                    "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
-                    "poc_json": json.dumps(vol_profile, indent=2, ensure_ascii=False),
-                    "backtest_json": json.dumps(backtest_results, indent=2, ensure_ascii=False) if backtest_results else "백테스팅 데이터 부족",
-                    "fib_json": json.dumps(fib_levels, indent=2, ensure_ascii=False),
-                    "options_json": json.dumps(options_data, indent=2, ensure_ascii=False) if options_data else "옵션 데이터 없음",
-                    "hedge_short_json": json.dumps(hedge_short_intel, indent=2, ensure_ascii=False),
-                    "earnings_json": json.dumps(earnings_info, indent=2, ensure_ascii=False),
-                    "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
-                    "macro_news_json": json.dumps(macro_news_data, indent=2, ensure_ascii=False),
-                    "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
-                    "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
-                    "user_position": user_position_text,
-                    "strategy_guide": strategy_instruction_text,
-                    "news_json": json.dumps(news_data, indent=2, ensure_ascii=False),
-                    "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
-                }
-                
-                for delay in [0, 5, 10]:
-                    if delay > 0:
-                        time.sleep(delay)
-                    try:
-                        res = chain.invoke(payload)
-                        response_content = extract_clean_text(res.content)
-                        break
-                    except Exception:
-                        continue
-                        
-                if not response_content:
-                    response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다."
-
-            if response_content and not response_content.startswith("⚠️"):
-                act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary = parse_full_trading_scenario(response_content)
-                st.session_state.history[ticker_input] = {
-                    "action": act,
-                    "entry_grade": ent_grade,
-                    "entry_rr": ent_rr,
-                    "price": curr_p,
-                    "my_avg": user_avg_price if is_holding else 0,
-                    "my_return": my_return_str if is_holding else "미보유",
-                    "target_1": t1,
-                    "target_2": t2,
-                    "take_profit": t1,
-                    "sell_target": sell_b,
-                    "buy_band": buy_b,
-                    "stop_loss": sl_b,
-                    "pyramiding": pyr,
-                    "user_strategy": u_strat_summary,
-                    "time": get_current_kst_time_str()
-                }
-                save_history(st.session_state.history)
-
-            st.session_state.last_analysis_result = {
+            prompt = PromptTemplate(
+                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json"],
+                template=template
+            )
+            llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
+            chain = prompt | llm
+            
+            payload = {
                 "ticker": ticker_input,
-                "info_source": info_source_flag,
-                "model_label": selected_model_label,
-                "curr_p": curr_p,
-                "is_holding": is_holding,
-                "user_avg_price": user_avg_price,
-                "user_shares": user_shares,
-                "my_return_str": my_return_str,
-                "tech_data": tech_data,
-                "vol_profile": vol_profile,
-                "backtest_results": backtest_results,
                 "stock_date": stock_date,
-                "fib_levels": fib_levels,
-                "options_data": options_data,
-                "macro_data": macro_data,
-                "fund_data": fund_data,
-                "sector_data": sector_data,
-                "ownership": ownership,
-                "hedge_short_intel": hedge_short_intel,
-                "earnings_info": earnings_info,
-                "response_content": response_content,
-                "full_json_str": full_json_str,
-                "macro_news_data": macro_news_data,
-                "news_data": news_data,
-                "analyst_data": analyst_data
+                "tech_json": json.dumps(tech_data, indent=2, ensure_ascii=False),
+                "poc_json": json.dumps(vol_profile, indent=2, ensure_ascii=False),
+                "backtest_json": json.dumps(backtest_results, indent=2, ensure_ascii=False) if backtest_results else "백테스팅 데이터 부족",
+                "fib_json": json.dumps(fib_levels, indent=2, ensure_ascii=False),
+                "options_json": json.dumps(options_data, indent=2, ensure_ascii=False) if options_data else "옵션 데이터 없음",
+                "hedge_short_json": json.dumps(hedge_short_intel, indent=2, ensure_ascii=False),
+                "earnings_json": json.dumps(earnings_info, indent=2, ensure_ascii=False),
+                "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
+                "macro_news_json": json.dumps(macro_news_data, indent=2, ensure_ascii=False),
+                "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
+                "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
+                "user_position": user_position_text,
+                "strategy_guide": strategy_instruction_text,
+                "news_json": json.dumps(news_data, indent=2, ensure_ascii=False),
+                "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
             }
-            st.rerun()
-
-    if st.session_state.last_analysis_result:
-        res = st.session_state.last_analysis_result
-        curr_p = res["curr_p"]
-        ownership = res["ownership"]
-        hedge_short_intel = res.get("hedge_short_intel", {})
-        earnings_info = res["earnings_info"]
-        tech_data = res["tech_data"]
-        backtest_results = res.get("backtest_results", None)
-        macro_data = res["macro_data"]
-        fib_levels = res["fib_levels"]
-        options_data = res["options_data"]
-        fund_data = res["fund_data"]
-        sector_data = res.get("sector_data", {})
-        resp_text = res.get("response_content", "")
-
-        # 📌 [신규성 판정 기반 알림 팝업 로직]
-        # 리포트 내에 "[🚨 실시간 주가 변동 핵심 트리거 요약]" 섹션이 존재하고, 
-        # "선반영 완료"라는 키워드가 없을 때만 알림 팝업(st.warning)을 띄움
-        if "[🚨 실시간 주가 변동 핵심 트리거 요약]" in resp_text and "선반영 완료" not in resp_text:
-            trigger_block = resp_text.split("[🚨 실시간 주가 변동 핵심 트리거 요약]")[1].split("\n\n")[0].strip()
-            st.warning(f"🚨 **[{res['ticker']}] 실시간 주가 변동 핵심 트리거 포착 (신규성 검증 완료)**\n\n{trigger_block}")
-
-        if res["is_holding"] and res["user_avg_price"] > 0 and res["user_shares"] > 0 and curr_p > 0:
-            total_invested = res["user_avg_price"] * res["user_shares"]
-            total_current = curr_p * res["user_shares"]
-            pnl_dollar = total_current - total_invested
-            pnl_pct = ((curr_p - res["user_avg_price"]) / res["user_avg_price"]) * 100
             
-            with st.container(border=True):
-                st.markdown(f"#### 💼 **내 보유 포지션 분석 ({res['ticker']})**")
-                p_c1, p_c2, p_c3, p_c4 = st.columns(4)
-                p_c1.metric("내 매수 평단가", f"${res['user_avg_price']:,.2f}", f"{res['user_shares']:,.1f}주 보유")
-                p_c2.metric("총 매수 원금", f"${total_invested:,.2f}")
-                p_c3.metric("현재 평가 금액", f"${total_current:,.2f}")
-                p_c4.metric("평가 손익 (수익률)", f"${pnl_dollar:+,.2f}", f"{pnl_pct:+.2f}%")
+            for delay in [0, 5, 10]:
+                if delay > 0:
+                    time.sleep(delay)
+                try:
+                    res = chain.invoke(payload)
+                    response_content = extract_clean_text(res.content)
+                    break
+                except Exception:
+                    continue
+                    
+            if not response_content:
+                response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
+        if response_content and not response_content.startswith("⚠️"):
+            act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary = parse_full_trading_scenario(response_content)
+            st.session_state.history[ticker_input] = {
+                "action": act,
+                "entry_grade": ent_grade,
+                "entry_rr": ent_rr,
+                "price": curr_p,
+                "my_avg": user_avg_price if is_holding else 0,
+                "my_return": my_return_str if is_holding else "미보유",
+                "target_1": t1,
+                "target_2": t2,
+                "take_profit": t1,
+                "sell_target": sell_b,
+                "buy_band": buy_b,
+                "stop_loss": sl_b,
+                "pyramiding": pyr,
+                "user_strategy": u_strat_summary,
+                "time": get_current_kst_time_str()
+            }
+            save_history(st.session_state.history)
+
+        st.session_state.last_analysis_result = {
+            "ticker": ticker_input,
+            "info_source": info_source_flag,
+            "model_label": selected_model_label,
+            "curr_p": curr_p,
+            "is_holding": is_holding,
+            "user_avg_price": user_avg_price,
+            "user_shares": user_shares,
+            "my_return_str": my_return_str,
+            "tech_data": tech_data,
+            "vol_profile": vol_profile,
+            "backtest_results": backtest_results,
+            "stock_date": stock_date,
+            "fib_levels": fib_levels,
+            "options_data": options_data,
+            "macro_data": macro_data,
+            "fund_data": fund_data,
+            "sector_data": sector_data,
+            "ownership": ownership,
+            "hedge_short_intel": hedge_short_intel,
+            "earnings_info": earnings_info,
+            "response_content": response_content,
+            "full_json_str": full_json_str,
+            "macro_news_data": macro_news_data,
+            "news_data": news_data,
+            "analyst_data": analyst_data
+        }
+        st.rerun()
+
+# [2] 캐시된 분석 결과 렌더링
+if st.session_state.last_analysis_result:
+    res = st.session_state.last_analysis_result
+    curr_p = res["curr_p"]
+    ownership = res["ownership"]
+    hedge_short_intel = res.get("hedge_short_intel", {})
+    earnings_info = res["earnings_info"]
+    tech_data = res["tech_data"]
+    vol_profile = res.get("vol_profile", {})
+    backtest_results = res.get("backtest_results", None)
+    macro_data = res["macro_data"]
+    fib_levels = res["fib_levels"]
+    options_data = res["options_data"]
+    fund_data = res["fund_data"]
+    sector_data = res.get("sector_data", {})
+    info_source = res.get("info_source", "stock.info")
+
+    if info_source == "stock.info":
+        st.markdown("📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` (상세 펀더멘털 & 밸류에이션 정상 수집)")
+    else:
+        st.markdown("📡 **데이터 소스:** `🟡 Yahoo Finance stock.fast_info` (야후 서버 지연으로 인한 간이 시세 백업 데이터 적용)")
+
+    # 💼 보유 주식 평가손익 컨테이너
+    if res["is_holding"] and res["user_avg_price"] > 0 and res["user_shares"] > 0 and curr_p > 0:
+        total_invested = res["user_avg_price"] * res["user_shares"]
+        total_current = curr_p * res["user_shares"]
+        pnl_dollar = total_current - total_invested
+        pnl_pct = ((curr_p - res["user_avg_price"]) / res["user_avg_price"]) * 100
+        
         with st.container(border=True):
-            st.markdown("**🏢 핵심 시장 및 재무 지표**")
-            r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
-            r1_c1.metric("현재 주가", f"${curr_p}")
-            r1_c2.metric("시가총액", str(fund_data.get('market_cap_fmt', 'N/A')))
-            r1_c3.metric("PER (선행/후행)", f"{fund_data.get('forward_pe', 'N/A')} / {fund_data.get('trailing_pe', 'N/A')}")
-            r1_c4.metric("PBR / PSR", f"{fund_data.get('pbr', 'N/A')} / {fund_data.get('ps_ratio', 'N/A')}")
-            
-            st.divider()
-            st.markdown("**👥 스마트머니 기본 지분 (내부자 & 기관 지분율 및 내부자 매매)**")
-            own_c1, own_c2, own_c3, own_c4 = st.columns(4)
-            own_c1.metric("Insider Own (내부자 지분)", str(ownership.get('insider_own', 'N/A')))
-            own_c2.metric("Insider Trans (내부자 매매)", str(ownership.get('insider_trans', 'N/A')))
-            own_c3.metric("Inst Own (기관 지분)", str(ownership.get('inst_own', 'N/A')))
-            own_c4.metric("Inst Trans (기관 매매/보유)", str(ownership.get('inst_trans', 'N/A')))
+            st.markdown(f"#### 💼 **내 보유 포지션 분석 ({res['ticker']})**")
+            p_c1, p_c2, p_c3, p_c4 = st.columns(4)
+            p_c1.metric("내 매수 평단가", f"${res['user_avg_price']:,.2f}", f"{res['user_shares']:,.1f}주 보유")
+            p_c2.metric("총 매수 원금", f"${total_invested:,.2f}")
+            p_c3.metric("현재 평가 금액", f"${total_current:,.2f}")
+            p_c4.metric("평가 손익 (수익률)", f"${pnl_dollar:+,.2f}", f"{pnl_pct:+.2f}%")
 
-            st.divider()
-            st.markdown(f"**🐋 13F 헤지펀드 지분 & 공매도(Shorts) 수급 정밀 분석 ({res['ticker']})**")
-            s_intel = hedge_short_intel.get("short_intel", {})
-            sk1, sk2, sk3 = st.columns(3)
-            sk1.metric("공매도 잔고 (Float)", s_intel.get("short_percent_of_float", "N/A"), f"MoM: {s_intel.get('short_mom_change', 'N/A')}")
-            sk2.metric("상환 소요 일수 (DTC)", s_intel.get("short_ratio_days", "N/A"), "Days to Cover")
-            sk3.metric("공매도 총 주수", s_intel.get("shares_short_formatted", "N/A"))
-            
-            st.markdown(f"**🎯 숏스퀴즈 리스크 등급:** `{s_intel.get('squeeze_risk_level', 'N/A')}`")
-            high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
-            diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
-            e_date = earnings_info.get('earnings_date', '미정')
-            e_dday = earnings_info.get('d_day', '')
-            st.caption(f"📅 차기 실적 발표: **{e_date} ({e_dday})** | 52주 고점 괴리율: **{diff_52h:+.1f}%**" if diff_52h is not None else f"📅 차기 실적 발표: **{e_date}**")
-            
-            holders_list = hedge_short_intel.get("top_holders", [])
-            if holders_list:
-                df_holders = pd.DataFrame(holders_list)
-                df_holders.columns = ["기관/펀드명", "보유 주식수", "지분율 (% Out)", "평가 가치"]
-                st.dataframe(df_holders, use_container_width=True, hide_index=True)
+    # 1. 상단 핵심 시장/재무 메트릭
+    with st.container(border=True):
+        st.markdown("**🏢 핵심 시장 및 재무 지표**")
+        r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
+        r1_c1.metric("현재 주가", f"${curr_p}")
+        r1_c2.metric("시가총액", str(fund_data.get('market_cap_fmt', 'N/A')))
+        r1_c3.metric("PER (선행/후행)", f"{fund_data.get('forward_pe', 'N/A')} / {fund_data.get('trailing_pe', 'N/A')}")
+        r1_c4.metric("PBR / PSR", f"{fund_data.get('pbr', 'N/A')} / {fund_data.get('ps_ratio', 'N/A')}")
+        
+        st.divider()
+        
+        # 📌 스마트머니 기본 지분
+        st.markdown("**👥 스마트머니 기본 지분 (내부자 & 기관 지분율 및 내부자 매매)**")
+        own_c1, own_c2, own_c3, own_c4 = st.columns(4)
+        own_c1.metric("Insider Own (내부자 지분)", str(ownership.get('insider_own', 'N/A')))
+        own_c2.metric("Insider Trans (내부자 매매)", str(ownership.get('insider_trans', 'N/A')))
+        own_c3.metric("Inst Own (기관 지분)", str(ownership.get('inst_own', 'N/A')))
+        own_c4.metric("Inst Trans (기관 매매/보유)", str(ownership.get('inst_trans', 'N/A')))
 
-            st.divider()
-            st.markdown("**📅 차기 실적 발표 일정, 52주 가격 범위 & ATR/모멘텀**")
-            s_c1, s_c2, s_c3, s_c4 = st.columns(4)
-            s_c1.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
-            low_52 = earnings_info.get('fiftyTwoWeekLow', 'N/A')
-            s_c2.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
-            s_c3.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
-            s_c4.metric("MACD (Signal)", f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None)
-
-        if sector_data:
-            with st.expander("🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 (11 Sectors Rotation) [클릭하여 펼치기]**", expanded=False):
-                s_rows = []
-                for etf, s_info in sector_data.items():
-                    s_rows.append({
-                        "티커": etf,
-                        "섹터명": s_info.get("sector_name", ""),
-                        "5일 등락률": s_info.get("return_5d", "N/A"),
-                        "1개월 등락률": s_info.get("return_1m", "N/A"),
-                        "현재가 ($)": f"${s_info.get('latest_close', 'N/A')}"
-                    })
-                st.dataframe(pd.DataFrame(s_rows), use_container_width=True, hide_index=True)
-
-        with st.container(border=True):
-            st.markdown("##### 🧪 **퀀트 모멘텀, 스마트머니 VWAP & 6개월 최다 매물대 (POC)**")
-            q_c1, q_c2, q_c3, q_c4 = st.columns(4)
-            vwap_1y = tech_data.get('vwap_1y', 'N/A')
-            diff_vwap1y = round(((curr_p - vwap_1y) / vwap_1y) * 100, 1) if isinstance(vwap_1y, (int, float)) and curr_p else None
-            q_c1.metric("1Y 누적 VWAP (장기 평단)", f"${vwap_1y}", f"현재가 {diff_vwap1y:+.1f}%" if diff_vwap1y is not None else None)
-
-            vwap_20d = tech_data.get('vwap_20d', 'N/A')
-            diff_vwap20 = round(((curr_p - vwap_20d) / vwap_20d) * 100, 1) if isinstance(vwap_20d, (int, float)) and curr_p else None
-            q_c2.metric("20일 단기 VWAP (스마트머니)", f"${vwap_20d}", f"현재가 {diff_vwap20:+.1f}%" if diff_vwap20 is not None else None)
-
-            poc_val = tech_data.get('poc_price_6m', 'N/A')
-            diff_poc = round(((poc_val - curr_p) / curr_p) * 100, 1) if isinstance(poc_val, (int, float)) and curr_p else None
-            q_c3.metric("6M 최다 매물대 (POC)", f"${poc_val}", f"현재가 대비 {diff_poc:+.1f}%" if diff_poc is not None else "최대 거래량 구간")
-
-            bb_w = tech_data.get('bb_width_pct', 'N/A')
-            q_c4.metric("볼린저 밴드폭 (Bandwidth)", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
-            st.markdown(f"**⚡ 변동성 국면 판정:** `{tech_data.get('bb_squeeze_status', 'N/A')}` | **🧱 70% 핵심 매물대 밴드:** `{tech_data.get('value_area_range_6m', 'N/A')}`")
-
-        if backtest_results:
-            with st.container(border=True):
-                st.markdown("##### 🔬 **과거 1년 퀀트 전략 백테스팅 시뮬레이션 (1-Year Backtest)**")
-                bh_ret = backtest_results.get("benchmark_buy_and_hold", 0.0)
-                st.caption(f"📌 **벤치마크 (단순 보유 Buy & Hold 1년 수익률):** `{bh_ret:+.2f}%`")
-                bt_col1, bt_col2 = st.columns(2)
-                with bt_col1:
-                    st.markdown("**🚀 전략 A: 모멘텀 스퀴즈 돌파 (Momentum Squeeze Breakout)**")
-                    s1 = backtest_results.get("strategy_1_momentum_squeeze", {})
-                    m1_1, m1_2, m1_3 = st.columns(3)
-                    m1_1.metric("총 누적 수익률", f"{s1.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s1.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
-                    m1_2.metric("승률 (Win Rate)", f"{s1.get('win_rate', 0)}%", f"총 {s1.get('trades_count', 0)}회 매매")
-                    m1_3.metric("Profit Factor / MDD", f"{s1.get('profit_factor', 0)}", f"MDD: -{s1.get('mdd', 0)}%")
-                with bt_col2:
-                    st.markdown("**🔄 전략 B: 1Y VWAP + RSI 밸류 되돌림 (Mean Reversion)**")
-                    s2 = backtest_results.get("strategy_2_vwap_mean_reversion", {})
-                    m2_1, m2_2, m2_3 = st.columns(3)
-                    m2_1.metric("총 누적 수익률", f"{s2.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s2.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
-                    m2_2.metric("승률 (Win Rate)", f"{s2.get('win_rate', 0)}%", f"총 {s2.get('trades_count', 0)}회 매매")
-                    m2_3.metric("Profit Factor / MDD", f"{s2.get('profit_factor', 0)}", f"MDD: -{s2.get('mdd', 0)}%")
-
-        with st.container(border=True):
-            st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
-            fb1, fb2, fb3, fb4 = st.columns(4)
-            f236, f382, f500, f618 = fib_levels.get('fib_23.6%', 'N/A'), fib_levels.get('fib_38.2%', 'N/A'), fib_levels.get('fib_50.0%', 'N/A'), fib_levels.get('fib_61.8%', 'N/A')
-            fb1.metric("23.6% 되돌림 (단기 지지)", f"${f236}", f"{round(((f236-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f236, (int, float)) and curr_p else None)
-            fb2.metric("38.2% 되돌림 (1차 매수 지지)", f"${f382}", f"{round(((f382-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f382, (int, float)) and curr_p else None)
-            fb3.metric("50.0% 하프라인 (추세 기준선)", f"${f500}", f"{round(((f500-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f500, (int, float)) and curr_p else None)
-            fb4.metric("61.8% 되돌림 (강력한 2차 지지)", f"${f618}", f"{round(((f618-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f618, (int, float)) and curr_p else None)
-
-        with st.container(border=True):
-            if options_data:
-                exp_date, pc_rat = options_data['expiration_date'], options_data['pc_volume_ratio']
-                st.markdown(f"##### 🎯 **가장 빠른 만기 옵션 체인 스마트머니 포지션** `만기일: {exp_date}` `P/C Ratio: {pc_rat}`")
-                op_c1, op_c2, op_c3, op_c4 = st.columns(4)
-                c_oi = options_data['call_max_oi']
-                diff_c_oi = round(((c_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_oi['strike'], (int, float)) else None
-                op_c1.metric("콜옵션 Max OI (상방 저항벽)", f"${c_oi['strike']}", f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}")
-                c_vol = options_data['call_max_vol']
-                diff_c_vol = round(((c_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_vol['strike'], (int, float)) else None
-                op_c2.metric("콜옵션 Max Vol (당일 상방 수급)", f"${c_vol['strike']}", f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}")
-                p_oi = options_data['put_max_oi']
-                diff_p_oi = round(((p_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_oi['strike'], (int, float)) else None
-                op_c3.metric("풋옵션 Max OI (하방 지지벽)", f"${p_oi['strike']}", f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}")
-                p_vol = options_data['put_max_vol']
-                diff_p_vol = round(((p_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_vol['strike'], (int, float)) else None
-                op_c4.metric("풋옵션 Max Vol (당일 하방 헤지)", f"${p_vol['strike']}", f"{diff_p_vol:+.1f}% (Vol: {p_vol['volume']:,})" if diff_p_vol is not None else f"Vol: {p_vol['volume']:,}")
-            else:
-                st.markdown("##### 🎯 **옵션 체인 스마트머니 포지션**")
-                st.info("해당 종목은 옵션 체인 거래 데이터가 없거나 수집되지 않았습니다.")
-
-        with st.container(border=True):
-            st.markdown("##### 🚀 **성장주/빅테크 맞춤형 밸류에이션 모델 (Growth Models)**")
-            g_models = fund_data.get('growth_models', {})
-            g1, g2, g3, g4 = st.columns(4)
-            target_p = fund_data.get('target_mean_price', 'N/A')
-            diff_t = round(((target_p - curr_p) / curr_p) * 100, 1) if isinstance(target_p, (int, float)) and curr_p else None
-            g1.metric("IB 컨센서스 목표가", f"${target_p}" if isinstance(target_p, (int, float)) else str(target_p), f"{diff_t:+.1f}%" if diff_t is not None else None)
-            g2.metric("Forward PEG 1.5 모델", str(g_models.get('forward_peg', 'N/A')))
-            g3.metric("PSR 타깃 매출가치 (5배)", str(g_models.get('psr_target', 'N/A')))
-            g4.metric("2단계 DCF 현금흐름 모델", str(g_models.get('dcf_growth', 'N/A')))
-
-        with st.container(border=True):
-            st.markdown("##### 🏛️ **전통 제조업/자산가치 기반 3대 모델 (Value Models - 청산/장부가치 기준)**")
-            v_models = fund_data.get('value_models', {})
-            v1, v2, v3 = st.columns(3)
-            v1.metric("그레이엄 청산가치", str(v_models.get('graham', 'N/A')))
-            v2.metric("피터 린치 가치모델", str(v_models.get('peter_lynch', 'N/A')))
-            v3.metric("ROE-PBR 자본가치", str(v_models.get('roe_pbr', 'N/A')))
-
-        with st.container(border=True):
-            head_col1, head_col2 = st.columns([0.65, 0.35])
-            with head_col1:
-                st.markdown(f"### 📝 **{res['model_label']} 종합 분석 브리핑**")
-            with head_col2:
-                st.download_button(
-                    label=f"📥 {res['ticker']} 분석용 JSON 다운로드",
-                    data=res["full_json_str"],
-                    file_name=f"{res['ticker']}_rag_analysis_data_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-            clean_rendered_content = re.sub(r'(?<!\\)\$', r'\$', res["response_content"])
-            st.markdown(clean_rendered_content)
-
-# =============================================================
-# [TAB 2] 금 & 비트코인 매크로·수급 분석 탭
-# =============================================================
-with main_tab_macro:
-    with st.sidebar:
-        st.markdown("#### 🪙 **매크로 자산 분석 설정**")
-        macro_asset_choice = st.selectbox(
-            "🪙 **분석 대상 자산 선택**",
-            options=["금 (Gold Futures: GC=F)", "비트코인 (Bitcoin: BTC-USD)"],
-            index=0,
-            key="macro_asset_select"
-        )
-        macro_ticker = "GC=F" if "금" in macro_asset_choice else "BTC-USD"
-        macro_analyze_btn = st.button("🚀 매크로 차트 & 백테스팅 실행", type="primary", use_container_width=True, key="macro_btn")
         st.divider()
 
-    st.header(f"🪙 [{macro_asset_choice}] 거시 유동성 & 정밀 트레이딩 리포트")
+        # 📌 13F 헤지펀드 지분 & 공매도 수급 정밀 분석
+        st.markdown(f"**🐋 13F 헤지펀드 지분 & 공매도(Shorts) 수급 정밀 분석 ({res['ticker']})**")
+        s_intel = hedge_short_intel.get("short_intel", {})
+        
+        sk1, sk2, sk3 = st.columns(3)
+        sk1.metric("공매도 잔고 (Float)", s_intel.get("short_percent_of_float", "N/A"), f"MoM: {s_intel.get('short_mom_change', 'N/A')}")
+        sk2.metric("상환 소요 일수 (DTC)", s_intel.get("short_ratio_days", "N/A"), "Days to Cover")
+        sk3.metric("공매도 총 주수", s_intel.get("shares_short_formatted", "N/A"))
+        
+        st.markdown(f"**🎯 숏스퀴즈 리스크 등급:** `{s_intel.get('squeeze_risk_level', 'N/A')}`")
+        
+        high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
+        diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
+        e_date = earnings_info.get('earnings_date', '미정')
+        e_dday = earnings_info.get('d_day', '')
+        st.caption(f"📅 차기 실적 발표: **{e_date} ({e_dday})** | 52주 고점 괴리율: **{diff_52h:+.1f}%**" if diff_52h is not None else f"📅 차기 실적 발표: **{e_date}**")
+        
+        holders_list = hedge_short_intel.get("top_holders", [])
+        if holders_list:
+            df_holders = pd.DataFrame(holders_list)
+            df_holders.columns = ["기관/펀드명", "보유 주식수", "지분율 (% Out)", "평가 가치"]
+            st.dataframe(df_holders, use_container_width=True, hide_index=True)
 
-    if macro_analyze_btn:
-        api_key = os.getenv("GEMINI_API_KEY")
-        if not api_key:
-            try:
-                api_key = st.secrets["GEMINI_API_KEY"]
-            except Exception:
-                api_key = None
+        st.divider()
 
-        with st.spinner(f"🔍 [{macro_asset_choice}] 기술적 지표, POC 매물대 및 거시경제 연동 분석 중..."):
-            macro_tech, macro_date, macro_fib, m_high, m_low, macro_df, macro_vol = fetch_stock_technical_data(macro_ticker)
-            macro_backtest = run_strategy_backtest(macro_df)
-            macro_options = fetch_nearest_options_data(macro_ticker, retries=2)
-            macro_indicators_data = fetch_macro_indicators()
+        st.markdown("**📅 차기 실적 발표 일정, 52주 가격 범위 & ATR/모멘텀**")
+        s_c1, s_c2, s_c3, s_c4 = st.columns(4)
+        s_c1.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
+        
+        low_52 = earnings_info.get('fiftyTwoWeekLow', 'N/A')
+        s_c2.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
+        
+        s_c3.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
+        s_c4.metric(
+            "MACD (Signal)", 
+            f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", 
+            f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None
+        )
 
-            macro_curr_p = macro_tech.get('current_price', 0)
+    # S&P 500 11개 전 섹터 실시간 등락 현황판 (기본 접기: expanded=False)
+    if sector_data:
+        with st.expander("🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 (11 Sectors Rotation) [클릭하여 펼치기]**", expanded=False):
+            s_rows = []
+            for etf, s_info in sector_data.items():
+                s_rows.append({
+                    "티커": etf,
+                    "섹터명": s_info.get("sector_name", ""),
+                    "5일 등락률": s_info.get("return_5d", "N/A"),
+                    "1개월 등락률": s_info.get("return_1m", "N/A"),
+                    "현재가 ($)": f"${s_info.get('latest_close', 'N/A')}"
+                })
+            
+            df_sec = pd.DataFrame(s_rows)
+            st.dataframe(df_sec, use_container_width=True, hide_index=True)
 
-            macro_payload = {
-                "meta": {
-                    "asset": macro_asset_choice,
-                    "ticker": macro_ticker,
-                    "analysis_requested_at": get_current_kst_time_str(),
-                    "data_date": macro_date
-                },
-                "technical_and_poc": macro_tech,
-                "volume_profile": macro_vol,
-                "backtesting": macro_backtest,
-                "fibonacci": macro_fib,
-                "options_chain": macro_options,
-                "macro_economic_environment": macro_indicators_data
-            }
+    # 📌 2. 퀀트 모멘텀, 스마트머니 VWAP, 매물대 POC & 볼린저 밴드 스퀴즈 컨테이너
+    with st.container(border=True):
+        st.markdown("##### 🧪 **퀀트 모멘텀, 스마트머니 VWAP & 6개월 최다 매물대 (POC)**")
+        
+        q_c1, q_c2, q_c3, q_c4 = st.columns(4)
+        
+        vwap_1y = tech_data.get('vwap_1y', 'N/A')
+        diff_vwap1y = round(((curr_p - vwap_1y) / vwap_1y) * 100, 1) if isinstance(vwap_1y, (int, float)) and curr_p else None
+        q_c1.metric("1Y 누적 VWAP (장기 평단)", f"${vwap_1y}", f"현재가 {diff_vwap1y:+.1f}%" if diff_vwap1y is not None else None)
 
-            macro_json_str = json.dumps(macro_payload, indent=2, ensure_ascii=False)
+        vwap_20d = tech_data.get('vwap_20d', 'N/A')
+        diff_vwap20 = round(((curr_p - vwap_20d) / vwap_20d) * 100, 1) if isinstance(vwap_20d, (int, float)) and curr_p else None
+        q_c2.metric("20일 단기 VWAP (스마트머니)", f"${vwap_20d}", f"현재가 {diff_vwap20:+.1f}%" if diff_vwap20 is not None else None)
 
-            macro_response = None
-            if not api_key:
-                macro_response = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다."
+        # POC 매물대
+        poc_val = tech_data.get('poc_price_6m', 'N/A')
+        diff_poc = round(((poc_val - curr_p) / curr_p) * 100, 1) if isinstance(poc_val, (int, float)) and curr_p else None
+        q_c3.metric("6M 최다 매물대 (POC)", f"${poc_val}", f"현재가 대비 {diff_poc:+.1f}%" if diff_poc is not None else "최대 거래량 구간")
+
+        bb_w = tech_data.get('bb_width_pct', 'N/A')
+        q_c4.metric("볼린저 밴드폭 (Bandwidth)", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
+        
+        st.markdown(f"**⚡ 변동성 국면 판정:** `{tech_data.get('bb_squeeze_status', 'N/A')}` | **🧱 70% 핵심 매물대 밴드:** `{tech_data.get('value_area_range_6m', 'N/A')}`")
+
+    # 3. 1년 과거 데이터 기반 듀얼 전략 백테스팅 컨테이너
+    if backtest_results:
+        with st.container(border=True):
+            st.markdown("##### 🔬 **과거 1년 퀀트 전략 백테스팅 시뮬레이션 (1-Year Backtest)**")
+            
+            bh_ret = backtest_results.get("benchmark_buy_and_hold", 0.0)
+            st.caption(f"📌 **벤치마크 (단순 보유 Buy & Hold 1년 수익률):** `{bh_ret:+.2f}%`")
+            
+            bt_col1, bt_col2 = st.columns(2)
+            
+            with bt_col1:
+                st.markdown("**🚀 전략 A: 모멘텀 스퀴즈 돌파 (Momentum Squeeze Breakout)**")
+                st.caption("진입: MACD 상방전환 + 20일 이평 및 20일 VWAP 상회 시 | 청산: MACD 꺾임 또는 1.5x ATR 이탈")
+                s1 = backtest_results.get("strategy_1_momentum_squeeze", {})
+                
+                m1_1, m1_2, m1_3 = st.columns(3)
+                m1_1.metric("총 누적 수익률", f"{s1.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s1.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
+                m1_2.metric("승률 (Win Rate)", f"{s1.get('win_rate', 0)}%", f"총 {s1.get('trades_count', 0)}회 매매")
+                m1_3.metric("Profit Factor / MDD", f"{s1.get('profit_factor', 0)}", f"MDD: -{s1.get('mdd', 0)}%")
+
+            with bt_col2:
+                st.markdown("**🔄 전략 B: 1Y VWAP + RSI 밸류 되돌림 (Mean Reversion)**")
+                st.caption("진입: 1Y 누적 VWAP 하회 + RSI 42 이하 + 볼린저 하단 지지 | 청산: VWAP 도달 또는 RSI 65")
+                s2 = backtest_results.get("strategy_2_vwap_mean_reversion", {})
+                
+                m2_1, m2_2, m2_3 = st.columns(3)
+                m2_1.metric("총 누적 수익률", f"{s2.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s2.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
+                m2_2.metric("승률 (Win Rate)", f"{s2.get('win_rate', 0)}%", f"총 {s2.get('trades_count', 0)}회 매매")
+                m2_3.metric("Profit Factor / MDD", f"{s2.get('profit_factor', 0)}", f"MDD: -{s2.get('mdd', 0)}%")
+
+    # 4. 피보나치 되돌림 컨테이너
+    with st.container(border=True):
+        st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
+        fb1, fb2, fb3, fb4 = st.columns(4)
+        
+        f236 = fib_levels.get('fib_23.6%', 'N/A')
+        f382 = fib_levels.get('fib_38.2%', 'N/A')
+        f500 = fib_levels.get('fib_50.0%', 'N/A')
+        f618 = fib_levels.get('fib_61.8%', 'N/A')
+        
+        fb1.metric("23.6% 되돌림 (단기 지지)", f"${f236}", f"{round(((f236-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f236, (int, float)) and curr_p else None)
+        fb2.metric("38.2% 되돌림 (1차 매수 지지)", f"${f382}", f"{round(((f382-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f382, (int, float)) and curr_p else None)
+        fb3.metric("50.0% 하프라인 (추세 기준선)", f"${f500}", f"{round(((f500-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f500, (int, float)) and curr_p else None)
+        fb4.metric("61.8% 되돌림 (강력한 2차 지지)", f"${f618}", f"{round(((f618-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f618, (int, float)) and curr_p else None)
+
+    # 5. 옵션 체인 컨테이너
+    with st.container(border=True):
+        if options_data:
+            exp_date = options_data['expiration_date']
+            pc_rat = options_data['pc_volume_ratio']
+            st.markdown(f"##### 🎯 **가장 빠른 만기 옵션 체인 스마트머니 포지션** `만기일: {exp_date}` `P/C Ratio: {pc_rat}`")
+            
+            op_c1, op_c2, op_c3, op_c4 = st.columns(4)
+            c_oi = options_data['call_max_oi']
+            diff_c_oi = round(((c_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_oi['strike'], (int, float)) else None
+            op_c1.metric(
+                "콜옵션 Max OI (상방 저항벽)",
+                f"${c_oi['strike']}",
+                f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,} / ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}"
+            )
+            
+            c_vol = options_data['call_max_vol']
+            diff_c_vol = round(((c_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_vol['strike'], (int, float)) else None
+            op_c2.metric(
+                "콜옵션 Max Vol (당일 상방 수급)",
+                f"${c_vol['strike']}",
+                f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,} / ${c_vol['price']})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}"
+            )
+            
+            p_oi = options_data['put_max_oi']
+            diff_p_oi = round(((p_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_oi['strike'], (int, float)) else None
+            op_c3.metric(
+                "풋옵션 Max OI (하방 지지벽)",
+                f"${p_oi['strike']}",
+                f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,} / ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}"
+            )
+            
+            p_vol = options_data['put_max_vol']
+            diff_p_vol = round(((p_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_vol['strike'], (int, float)) else None
+            op_c4.metric(
+                "풋옵션 Max Vol (당일 하방 헤지)",
+                f"${p_vol['strike']}",
+                f"{diff_p_vol:+.1f}% (Vol: {p_vol['volume']:,} / ${p_vol['price']})" if diff_p_vol is not None else f"Vol: {p_vol['volume']:,}"
+            )
+        else:
+            st.markdown("##### 🎯 **옵션 체인 스마트머니 포지션**")
+            st.info("해당 종목은 옵션 체인 거래 데이터가 없거나 수집되지 않았습니다.")
+
+    # 6. 성장주 3대 밸류에이션 모델
+    with st.container(border=True):
+        st.markdown("##### 🚀 **성장주/빅테크 맞춤형 밸류에이션 모델 (Growth Models)**")
+        g_models = fund_data.get('growth_models', {})
+        g1, g2, g3, g4 = st.columns(4)
+        
+        target_p = fund_data.get('target_mean_price', 'N/A')
+        diff_t = round(((target_p - curr_p) / curr_p) * 100, 1) if isinstance(target_p, (int, float)) and curr_p else None
+        g1.metric("IB 컨센서스 목표가", f"${target_p}" if isinstance(target_p, (int, float)) else str(target_p), f"{diff_t:+.1f}%" if diff_t is not None else None)
+        
+        peg_p = g_models.get('forward_peg', 'N/A')
+        diff_peg = round(((peg_p - curr_p) / curr_p) * 100, 1) if isinstance(peg_p, (int, float)) and curr_p else None
+        g2.metric("Forward PEG 1.5 모델", f"${peg_p}" if isinstance(peg_p, (int, float)) else str(peg_p), f"{diff_peg:+.1f}%" if diff_peg is not None else None)
+        
+        psr_p = g_models.get('psr_target', 'N/A')
+        diff_psr = round(((psr_p - curr_p) / curr_p) * 100, 1) if isinstance(psr_p, (int, float)) and curr_p else None
+        g3.metric("PSR 타깃 매출가치 (5배)", f"${psr_p}" if isinstance(psr_p, (int, float)) else str(psr_p), f"{diff_psr:+.1f}%" if diff_psr is not None else None)
+        
+        dcf_p = g_models.get('dcf_growth', 'N/A')
+        diff_dcf = round(((dcf_p - curr_p) / curr_p) * 100, 1) if isinstance(dcf_p, (int, float)) and curr_p else None
+        g4.metric("2단계 DCF 현금흐름 모델", f"${dcf_p}" if isinstance(dcf_p, (int, float)) else str(dcf_p), f"{diff_dcf:+.1f}%" if diff_dcf is not None else None)
+
+    # 7. 전통 가치투자 모델
+    with st.container(border=True):
+        st.markdown("##### 🏛️ **전통 제조업/자산가치 기반 3대 모델 (Value Models - 청산/장부가치 기준)**")
+        v_models = fund_data.get('value_models', {})
+        v1, v2, v3 = st.columns(3)
+        
+        g_val = v_models.get('graham', 'N/A')
+        diff_g = round(((g_val - curr_p) / curr_p) * 100, 1) if isinstance(g_val, (int, float)) and curr_p else None
+        v1.metric("그레이엄 청산가치", f"${g_val}" if isinstance(g_val, (int, float)) else str(g_val), f"{diff_g:+.1f}%" if diff_g is not None else None)
+        
+        l_val = v_models.get('peter_lynch', 'N/A')
+        diff_l = round(((l_val - curr_p) / curr_p) * 100, 1) if isinstance(l_val, (int, float)) and curr_p else None
+        v2.metric("피터 린치 가치모델", f"${l_val}" if isinstance(l_val, (int, float)) else str(l_val), f"{diff_l:+.1f}%" if diff_l is not None else None)
+        
+        r_val = v_models.get('roe_pbr', 'N/A')
+        diff_r = round(((r_val - curr_p) / curr_p) * 100, 1) if isinstance(r_val, (int, float)) and curr_p else None
+        v3.metric("ROE-PBR 자본가치", f"${r_val}" if isinstance(r_val, (int, float)) else str(r_val), f"{diff_r:+.1f}%" if diff_r is not None else None)
+
+    st.caption(f"🕒 데이터 수집 기준일자: 주가/재무제표 ({res['stock_date']}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
+
+    # 8. AI 종합 분석 브리핑 & JSON 다운로드 버튼
+    with st.container(border=True):
+        head_col1, head_col2 = st.columns([0.65, 0.35])
+        with head_col1:
+            st.markdown(f"### 📝 **{res['model_label']} 종합 분석 브리핑**")
+        with head_col2:
+            st.download_button(
+                label=f"📥 {res['ticker']} 분석용 JSON 다운로드",
+                data=res["full_json_str"],
+                file_name=f"{res['ticker']}_rag_analysis_data_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.json",
+                mime="application/json",
+                use_container_width=True
+            )
+        clean_rendered_content = re.sub(r'(?<!\\)\$', r'\$', res["response_content"])
+        st.markdown(clean_rendered_content)
+
+    with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
+        if res.get("macro_news_data"):
+            for m_item in res.get("macro_news_data", []):
+                st.markdown(f"- **[{m_item['title']}]({m_item['link']})**")
+                if m_item.get("summary"):
+                    st.caption(f"> {m_item['summary']}")
+                st.caption(f"출처: {m_item['publisher']} | 게시일: {m_item['date']}")
+                st.write("")
+        else:
+            st.info("수집된 거시경제 기사가 없습니다.")
+    
+    st.write("")
+
+    col_left, col_right = st.columns([0.9, 1.1])
+    
+    with col_left:
+        with st.container(border=True):
+            st.markdown(f"##### 📰 **{res['ticker']} 최신 주요 뉴스 및 기사 원문**")
+            if res.get("news_data"):
+                for item in res.get("news_data", []):
+                    st.markdown(f"**[{item['title']}]({item['link']})**")
+                    if item.get("summary"):
+                        st.markdown(f"> *{item['summary']}*")
+                    st.caption(f"출처: {item['publisher']} | {item['date']}")
+                    st.divider()
             else:
-                macro_template = """
-[매크로 자산 심층 분석 데이터 ({asset} / {ticker})]
-1. 기술적 지표, VWAP, 볼린저 밴드 스퀴즈 및 6개월 최다 매물대(POC):
-{macro_tech_json}
-
-2. 백테스팅 결과 (1년 B&H 대비 듀얼 전략):
-{macro_backtest_json}
-
-3. 피보나치 되돌림 및 매물대 밴드:
-{macro_fib_json}
-
-4. 거시경제 지표 (미 10년물 실질금리, VIX, 달러인덱스, 금, 비트코인):
-{macro_env_json}
-
----
-[지시사항]
-위 데이터를 바탕으로 글로벌 매크로 헤지 자산 및 퀀트 관점에서 전문적인 정밀 리포트를 작성할 것:
-1. **거시 유동성 환경 분석**: 현재 미국 실질금리(DGS10)와 달러인덱스, VIX 변동성이 {asset}의 가격 변동에 미치는 영향 분석.
-2. **기술적 지표 및 POC 매물대 분석**: 현재가(${current_price})와 6개월 최다 매물대(POC), VWAP 간의 상관관계 및 단기/중기 지지·저항선 평가.
-3. **매매 시나리오**: 미보유자 관점에서의 **분할 매수 밴드**, **1차/2차 목표가**, **매도가 밴드**, **손절선**을 구체적 달러 가격으로 명시할 것 (가격 범위는 반드시 낮은 가격 ~ 높은 가격 오름차순 정렬).
-"""
-                macro_prompt = PromptTemplate(
-                    input_variables=["asset", "ticker", "current_price", "macro_tech_json", "macro_backtest_json", "macro_fib_json", "macro_env_json"],
-                    template=macro_template
-                )
-                llm_macro = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
-                macro_chain = macro_prompt | llm_macro
-
-                try:
-                    res_m = macro_chain.invoke({
-                        "asset": macro_asset_choice,
-                        "ticker": macro_ticker,
-                        "current_price": macro_curr_p,
-                        "macro_tech_json": json.dumps(macro_tech, indent=2, ensure_ascii=False),
-                        "macro_backtest_json": json.dumps(macro_backtest, indent=2, ensure_ascii=False) if macro_backtest else "데이터 부족",
-                        "macro_fib_json": json.dumps(macro_fib, indent=2, ensure_ascii=False),
-                        "macro_env_json": json.dumps(macro_indicators_data, indent=2, ensure_ascii=False)
-                    })
-                    macro_response = extract_clean_text(res_m.content)
-                except Exception as e:
-                    macro_response = f"⚠️ 분석 생성 중 오류 발생: {str(e)}"
-
-            st.session_state.last_macro_analysis_result = {
-                "asset_name": macro_asset_choice,
-                "ticker": macro_ticker,
-                "curr_p": macro_curr_p,
-                "tech_data": macro_tech,
-                "vol_profile": macro_vol,
-                "fib_levels": macro_fib,
-                "backtest": macro_backtest,
-                "macro_indicators": macro_indicators_data,
-                "response_content": macro_response,
-                "json_str": macro_json_str,
-                "date": macro_date
-            }
-            st.rerun()
-
-    if st.session_state.get("last_macro_analysis_result"):
-        m_res = st.session_state.last_macro_analysis_result
-        m_curr_p = m_res["curr_p"]
-        m_tech = m_res["tech_data"]
-        m_fib = m_res["fib_levels"]
-        m_bt = m_res["backtest"]
-        m_env = m_res["macro_indicators"]
-
+                st.info("수집된 최신 뉴스가 없습니다.")
+                
+    with col_right:
+        # 최근 2개월 증권가 투자의견 변동
         with st.container(border=True):
-            st.markdown(f"**🪙 [{m_res['asset_name']}] 실시간 시세 및 매크로 헤지 지표**")
-            mc1, mc2, mc3, mc4 = st.columns(4)
-            mc1.metric("현재 시세", f"${m_curr_p:,.2f}")
-            mc2.metric("미 10년물 국채금리", str(m_env.get('us_10y_yield', {}).get('value', 'N/A')))
-            mc3.metric("달러 인덱스 (DXY)", str(m_env.get('dollar_index', {}).get('value', 'N/A')))
-            mc4.metric("변동성 지수 (VIX)", str(m_env.get('vix', {}).get('value', 'N/A')))
-
-        with st.container(border=True):
-            st.markdown("##### 🧪 **기술적 지표, 스마트머니 VWAP & 6개월 최다 매물대 (POC)**")
-            mq1, mq2, mq3, mq4 = st.columns(4)
-            vwap_1y_m = m_tech.get('vwap_1y', 'N/A')
-            mq1.metric("1Y 누적 VWAP", f"${vwap_1y_m}")
-            vwap_20d_m = m_tech.get('vwap_20d', 'N/A')
-            mq2.metric("20일 단기 VWAP", f"${vwap_20d_m}")
-            poc_m = m_tech.get('poc_price_6m', 'N/A')
-            mq3.metric("6M 최다 매물대 (POC)", f"${poc_m}")
-            mq4.metric("RSI(14) / MFI", f"{m_tech.get('rsi_14', 'N/A')} / {m_tech.get('mfi_14', 'N/A')}")
-            st.markdown(f"**⚡ 변동성 국면:** `{m_tech.get('bb_squeeze_status', 'N/A')}` | **🧱 70% 핵심 매물대 밴드:** `{m_tech.get('value_area_range_6m', 'N/A')}`")
-
-        with st.container(border=True):
-            st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (고점: `${m_fib.get('high_6m', 'N/A')}` / 저점: `${m_fib.get('low_6m', 'N/A')}`)")
-            mfb1, mfb2, mfb3, mfb4 = st.columns(4)
-            mfb1.metric("23.6% 되돌림", f"${m_fib.get('fib_23.6%', 'N/A')}")
-            mfb2.metric("38.2% 되돌림", f"${m_fib.get('fib_38.2%', 'N/A')}")
-            mfb3.metric("50.0% 하프라인", f"${m_fib.get('fib_50.0%', 'N/A')}")
-            mfb4.metric("61.8% 되돌림", f"${m_fib.get('fib_61.8%', 'N/A')}")
-
-        if m_bt:
-            with st.container(border=True):
-                st.markdown("##### 🔬 **과거 1년 퀀트 전략 백테스팅 시뮬레이션**")
-                mbh_ret = m_bt.get("benchmark_buy_and_hold", 0.0)
-                st.caption(f"📌 **벤치마크 (단순 보유 Buy & Hold 1년 수익률):** `{mbh_ret:+.2f}%`")
-                mbt1, mbt2 = st.columns(2)
-                with mbt1:
-                    s_m1 = m_bt.get("strategy_1_momentum_squeeze", {})
-                    st.markdown("**🚀 전략 A: 모멘텀 스퀴즈 돌파**")
-                    st.metric("총 누적 수익률", f"{s_m1.get('total_ret', 0):+.2f}%", f"승률: {s_m1.get('win_rate', 0)}%")
-                with mbt2:
-                    s_m2 = m_bt.get("strategy_2_vwap_mean_reversion", {})
-                    st.markdown("**🔄 전략 B: 1Y VWAP + RSI 되돌림**")
-                    st.metric("총 누적 수익률", f"{s_m2.get('total_ret', 0):+.2f}%", f"승률: {s_m2.get('win_rate', 0)}%")
-
-        with st.container(border=True):
-            m_head1, m_head2 = st.columns([0.65, 0.35])
-            with m_head1:
-                st.markdown(f"### 📝 **{m_res['asset_name']} 매크로 AI 분석 브리핑**")
-            with m_head2:
-                st.download_button(
-                    label=f"📥 {m_res['ticker']} 분석용 JSON 다운로드",
-                    data=m_res["json_str"],
-                    file_name=f"{m_res['ticker']}_macro_analysis_{datetime.now(KST).strftime('%Y%m%d_%H%M')}.json",
-                    mime="application/json",
-                    use_container_width=True
-                )
-            clean_macro_content = re.sub(r'(?<!\\)\$', r'\$', m_res["response_content"])
-            st.markdown(clean_macro_content)
+            st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 및 목표가 변동**")
+            if res.get("analyst_data"):
+                df_analyst = pd.DataFrame(res.get("analyst_data", []))
+                display_cols = ["date", "firm", "tier", "action", "grade_change", "target_price"]
+                df_analyst = df_analyst[[c for c in display_cols if c in df_analyst.columns]]
+                df_analyst.columns = ["일자", "증권사", "기관 신뢰도 등급", "구분", "투자의견 변동", "제시 목표가"]
+                st.dataframe(df_analyst, use_container_width=True, hide_index=True)
+            else:
+                st.info("최근 2개월간 등록된 투자의견 변동 내역이 없습니다.")
