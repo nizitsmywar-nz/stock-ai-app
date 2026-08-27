@@ -123,21 +123,6 @@ if "last_analysis_result" not in st.session_state:
     st.session_state.last_analysis_result = None
 
 # -------------------------------------------------------------
-# 📌 티커 정규화 함수 (GOLD, BTC 지원)
-# -------------------------------------------------------------
-def normalize_ticker(user_input: str) -> str:
-    cleaned = user_input.strip().upper()
-    if cleaned in ["GOLD", "금"]:
-        return "GC=F"
-    elif cleaned in ["BTC", "비트코인", "BITCOIN"]:
-        return "BTC-USD"
-    elif cleaned in ["OIL", "WTI", "유가"]:
-        return "CL=F"
-    elif cleaned in ["SILVER", "은"]:
-        return "SI=F"
-    return cleaned
-
-# -------------------------------------------------------------
 # 1. RAG 데이터 수집 모듈 (기술적 지표, BB Squeeze, VWAP, Volume Profile POC 등)
 # -------------------------------------------------------------
 def get_stock_info_with_retry(stock, retries=3):
@@ -544,7 +529,6 @@ def fetch_hedge_funds_and_short_intel(ticker: str, stock, info):
         "short_intel": {}
     }
     
-    # 원자재 선물이나 암호화폐인 경우 공매도/기관지분 데이터가 없으므로 N/A 처리
     if "=F" in ticker or "-USD" in ticker:
         intel["short_intel"] = {
             "short_percent_of_float": "해당 없음 (원자재/코인)",
@@ -1202,8 +1186,8 @@ with st.sidebar:
     selected_model_id = MODEL_OPTIONS[selected_model_label]
     
     st.markdown("---")
-    raw_ticker_input = st.text_input("종목/자산 티커 (예: TSLA, GOLD, BTC)", value=st.session_state.get("selected_ticker", "TSLA"))
-    ticker_input = normalize_ticker(raw_ticker_input)
+    # 사용자가 입력한 티커를 그대로 반영 (GOLD는 Barrick Gold, 금 시세는 GC=F 직접 입력)
+    ticker_input = st.text_input("종목/자산 티커 (예: TSLA, GOLD, GC=F, BTC-USD)", value=st.session_state.get("selected_ticker", "TSLA")).upper().strip()
     
     is_holding = st.checkbox("💼 **현재 보유 중인 자산인가요?**", value=False)
     
@@ -1692,8 +1676,8 @@ if st.session_state.last_analysis_result:
             op_c3.metric("풋옵션 Max OI", f"${p_oi['strike']}", f"OI: {p_oi['oi']:,}")
             op_c4.metric("풋옵션 Max Vol", f"${p_vol['strike']}", f"Vol: {p_vol['volume']:,}")
         else:
-            st.markdown("##### 🎯 **옵션 체인 포지션**")
-            st.info("해당 자산(원자재/코인)은 옵션 체인 거래가 지원되지 않습니다.")
+            st.markdown(f"##### 🎯 **옵션 체인 포지션**")
+            st.info("해당 자산은 옵션 체인 거래가 지원되지 않습니다.")
 
     with st.container(border=True):
         head_col1, head_col2 = st.columns([0.65, 0.35])
