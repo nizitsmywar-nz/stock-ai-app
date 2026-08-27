@@ -973,12 +973,11 @@ def extract_clean_text(content):
 def summarize_user_strategy(raw_text: str) -> str:
     if not raw_text or raw_text == "분석 리포트 참조":
         return "분석 리포트 참조"
-    # 📌 [수정] 대응 전략이 잘리지 않고 충분히 노출되도록 250자로 글자수 완화
     text = raw_text.replace("\n", " ").strip()
     return text[:250] + "..." if len(text) > 250 else text
 
 # -------------------------------------------------------------
-# 📌 정밀 파서 함수 (손절선 가격만 깔끔하게 추출하도록 보완)
+# 📌 정밀 파서 함수 (들여쓰기 구조 및 멀티라인 대응 완벽 보완)
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -1025,62 +1024,84 @@ def parse_full_trading_scenario(text):
     if match_entry_grade:
         entry_grade = match_entry_grade.group(1).strip()
     
-    # 2. 최종 투자의견 하위 항목인 [사용자 대응 전략] 파싱
-    if "[사용자 대응 전략]" in text:
-        strat_part = text.split("[사용자 대응 전략]")[1]
-        if "[" in strat_part:
-            strat_part = strat_part.split("[")[0]
-        user_strategy_raw = strat_part.replace("*", "").replace("-", "").replace("•", "").strip()
-    
-    if not user_strategy_raw:
-        for line in text.split("\n"):
-            line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
-            if "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
-                if ":" in line_clean:
-                    user_strategy_raw = ":".join(line_clean.split(":")[1:]).strip()
-                else:
-                    user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
-                break
+    # 2. [최종 투자의견] 하위의 [사용자 대응 전략] 파싱
+    if "사용자 대응 전략" in text:
+        try:
+            strat_part = text.split("사용자 대응 전략")[1]
+            if "[" in strat_part:
+                strat_part = strat_part.split("[")[0]
+            user_strategy_raw = strat_part.replace(":", "").replace("*", "").replace("-", "").replace("•", "").strip()
+        except Exception:
+            pass
 
-    # 3. 정밀 매매 시나리오 파싱
+    # 3. 정밀 매매 시나리오 파싱 (들여쓰기 및 멀티라인 완벽 대응)
     scenario_block = text
-    if "[정밀 매매 시나리오]" in text:
-        after_header = text.split("[정밀 매매 시나리오]")[1]
+    if "[정밀 매매 시나리오" in text:
+        after_header = text.split("[정밀 매매 시나리오")[1]
         if "[최종 투자의견" in after_header:
             scenario_block = after_header.split("[최종 투자의견")[0]
         else:
             scenario_block = after_header
 
-    for line in scenario_block.split("\n"):
+    lines = scenario_block.split("\n")
+    current_key = None
+
+    for line in lines:
         line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
-        
-        if "1차 목표가" in line_clean or "1차목표가" in line_clean:
-            if ":" in line_clean:
-                target_1 = ":".join(line_clean.split(":")[1:]).strip()
+        if not line_clean:
+            continue
+
+        # 키워드 감지
+        if "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean:
+            current_key = "buy_band"
+            parts = line_clean.split(":")
+            if len(parts) > 1 and parts[1].strip():
+                buy_band = parts[1].strip()
+            else:
+                buy_band = ""
+            continue
+        elif "1차 목표가" in line_clean or "1차목표가" in line_clean:
+            current_key = "target_1"
+            parts = line_clean.split(":")
+            if len(parts) > 1:
+                target_1 = ":".join(parts[1:]).strip()
+            continue
         elif "2차 목표가" in line_clean or "2차목표가" in line_clean:
-            if ":" in line_clean:
-                target_2 = ":".join(line_clean.split(":")[1:]).strip()
-        elif ("목표가" in line_clean or "익절 라인" in line_clean) and target_1 == "분석 리포트 참조":
-            if ":" in line_clean:
-                target_1 = ":".join(line_clean.split(":")[1:]).strip()
-        elif "매도가 밴드" in line_clean or "비중축소" in line_clean or "매도가" in line_clean:
-            if ":" in line_clean:
-                sell_target = ":".join(line_clean.split(":")[1:]).strip()
-        elif "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean:
-            if ":" in line_clean:
-                buy_band = ":".join(line_clean.split(":")[1:]).strip()
+            current_key = "target_2"
+            parts = line_clean.split(":")
+            if len(parts) > 1:
+                target_2 = ":".join(parts[1:]).strip()
+            continue
+        elif "매도가 밴드" in line_clean or "매도가" in line_clean:
+            current_key = "sell_target"
+            parts = line_clean.split(":")
+            if len(parts) > 1:
+                sell_target = ":".join(parts[1:]).strip()
+            continue
         elif "손절" in line_clean or "Stop-loss" in line_clean:
-            if ":" in line_clean:
-                raw_sl = ":".join(line_clean.split(":")[1:]).strip()
-                # 📌 [수정] 달러 기호와 가격 부근만 추출하도록 정규식 적용 (긴 문장 유입 방지)
+            current_key = "stop_loss"
+            parts = line_clean.split(":")
+            if len(parts) > 1:
+                raw_sl = ":".join(parts[1:]).strip()
                 dollar_match = re.search(r"(\$[0-9,]+(?:\.\d+)?(?:\s*~\s*\$[0-9,]+(?:\.\d+)?)?)", raw_sl)
                 if dollar_match:
                     stop_loss = dollar_match.group(1)
                 else:
-                    stop_loss = raw_sl.split("(")[0].strip() # 괄호 설명 전까지만 자르기
+                    stop_loss = raw_sl.split("(")[0].strip()
+            continue
         elif "불타기 조건" in line_clean or "불타기" in line_clean:
-            if ":" in line_clean:
-                pyramiding = ":".join(line_clean.split(":")[1:]).strip()
+            current_key = "pyramiding"
+            parts = line_clean.split(":")
+            if len(parts) > 1:
+                pyramiding = ":".join(parts[1:]).strip()
+            continue
+
+        # 들여쓰기된 서브 라인 처리 (분할매수 1차, 2차 등)
+        if line.startswith(" ") or line.startswith("\t") or "°" in line or "o " in line:
+            if current_key == "buy_band":
+                sub_text = line_clean.replace("o", "").strip()
+                if sub_text:
+                    buy_band = f"{buy_band} | {sub_text}" if buy_band else sub_text
 
     user_strategy_summary = summarize_user_strategy(user_strategy_raw)
     return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
@@ -1410,7 +1431,9 @@ if analyze_btn:
 * **예상 손익비 (Risk/Reward)**: [...]
 
 [정밀 매매 시나리오]
-* **분할 매수 밴드**: [...]
+* **분할 매수 밴드**: 
+  - 1차: [...]
+  - 2차: [...]
 * **1차 목표가**: [...]
 * **2차 목표가**: [...]
 * **매도가 밴드**: [...]
@@ -1418,7 +1441,7 @@ if analyze_btn:
 * **불타기 조건**: [...]
 
 [최종 투자의견]
-- [최종 투자의견: 적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
+- **최종 투자의견**: [적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
 - **사용자 대응 전략**: [...]
 
 [최종 투자의견 규칙 (엄격 준수)]:
@@ -1682,7 +1705,7 @@ if st.session_state.last_analysis_result:
             op_c3.metric("풋옵션 Max OI", f"${p_oi['strike']}", f"OI: {p_oi['oi']:,}")
             op_c4.metric("풋옵션 Max Vol", f"${p_vol['strike']}", f"Vol: {p_vol['volume']:,}")
         else:
-            st.markdown("##### 🎯 **옵션 체인 포지션**")
+            st.markdown(f"##### 🎯 **옵션 체인 포지션**")
             st.info("해당 자산은 옵션 체인 거래가 지원되지 않습니다.")
 
     with st.container(border=True):
