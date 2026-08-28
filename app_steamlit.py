@@ -1203,7 +1203,7 @@ with st.sidebar:
     
     MODEL_OPTIONS = {
         "Gemini 3.1 Flash Lite": "gemini-3.1-flash-lite",
-        "Gemini 3.6 Flash Lite": "gemini-3.6-flash-lite",
+        "Gemini 3.5 Flash Lite": "gemini-3.5-flash-lite",
         "Gemini 3.6 Flash": "gemini-3.6-flash"
     }
     
