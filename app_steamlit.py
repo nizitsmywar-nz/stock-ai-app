@@ -1032,7 +1032,7 @@ def parse_full_trading_scenario(text):
             action = "홀딩"
     else:
         for line in text.split("\n"):
-            line_str = line.replace("*", "").replace("#", "").replace("-", "").replace("•", "").strip()
+            line_str = line.replace("*", "").replace("#", "").replace("-", "").replace("•", "").replace("◦", "").strip()
             if "최종 투자 의견" in line_str or "최종 투자의견" in line_str:
                 if "적극매수" in line_str or "분할매수" in line_str:
                     action = "매수"
@@ -1046,19 +1046,39 @@ def parse_full_trading_scenario(text):
     if match_entry_grade:
         entry_grade = match_entry_grade.group(1).strip()
     
-    for line in text.split("\n"):
-        line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
+    lines = text.split("\n")
+    collecting_strategy = False
+    strategy_lines = []
+
+    for i, line in enumerate(lines):
+        line_clean = line.replace("*", "").replace("-", "").replace("•", "").replace("◦", "").strip()
+        
         if ("신규 진입 등급" in line_clean or "진입 등급" in line_clean) and entry_grade == "분석 리포트 참조":
             if ":" in line_clean:
                 entry_grade = ":".join(line_clean.split(":")[1:]).strip()
         elif "예상 손익비" in line_clean or "손익비" in line_clean:
             if ":" in line_clean:
                 entry_rr = ":".join(line_clean.split(":")[1:]).strip()
-        elif "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
-            if ":" in line_clean:
-                user_strategy_raw = ":".join(line_clean.split(":")[1:]).strip()
-            else:
-                user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
+        
+        # 사용자 대응 전략 다중 라인 수집 로직
+        if "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
+            content_after = ":".join(line_clean.split(":")[1:]).strip() if ":" in line_clean else ""
+            if content_after:
+                strategy_lines.append(content_after)
+            collecting_strategy = True
+            continue
+            
+        if collecting_strategy:
+            # 새로운 대분류 섹션이 나오면 수집 종료
+            if line.strip().startswith("[") or line.strip().startswith("#") or "최종 투자의견" in line_clean:
+                collecting_strategy = False
+            elif line_clean:
+                strategy_lines.append(line_clean)
+            elif not line_clean and len(strategy_lines) >= 2:
+                collecting_strategy = False
+
+    if strategy_lines:
+        user_strategy_raw = " ".join(strategy_lines)
 
     scenario_block = text
     if "[정밀 매매 시나리오]" in text:
@@ -1069,7 +1089,7 @@ def parse_full_trading_scenario(text):
             scenario_block = after_header
 
     for line in scenario_block.split("\n"):
-        line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
+        line_clean = line.replace("*", "").replace("-", "").replace("•", "").replace("◦", "").strip()
         
         if "1차 목표가" in line_clean or "1차목표가" in line_clean:
             if ":" in line_clean:
