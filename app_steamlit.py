@@ -1,3 +1,6 @@
+# =============================================================================
+# [BLOCK 01] 라이브러리 임포트 및 전역 환경 설정
+# =============================================================================
 import os
 import json
 import math
@@ -33,6 +36,9 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
+# =============================================================================
+# [BLOCK 02] 커스텀 CSS 및 UI 스타일링
+# =============================================================================
 # -------------------------------------------------------------
 # 📌 모바일 반응형 & 텍스트 넘침 방지 커스텀 CSS 주입
 # -------------------------------------------------------------
@@ -91,6 +97,9 @@ st.markdown("""
 </style>
 """, unsafe_allow_html=True)
 
+# =============================================================================
+# [BLOCK 03] 데이터 영구 저장소 및 세션 상태 관리
+# =============================================================================
 # -------------------------------------------------------------
 # 0. 영구 저장소 (history.json) 관리 함수
 # -------------------------------------------------------------
@@ -122,6 +131,9 @@ if "selected_ticker" not in st.session_state:
 if "last_analysis_result" not in st.session_state:
     st.session_state.last_analysis_result = None
 
+# =============================================================================
+# [BLOCK 04] 기술적 지표 & 퀀트 매물대 연산 엔진
+# =============================================================================
 # -------------------------------------------------------------
 # 1. RAG 데이터 수집 모듈 (기술적 지표, BB Squeeze, VWAP, Volume Profile POC 등)
 # -------------------------------------------------------------
@@ -129,7 +141,7 @@ def get_stock_info_with_retry(stock, retries=3):
     for attempt in range(retries):
         try:
             info = stock.info
-            if isinstance(info, dict) and len(info) > 10 and any(k in info for k in ['marketCap', 'trailingPE', 'forwardPE', 'trailingEps', 'bookValue', 'currentPrice', 'regularMarketPrice', 'previousClose']):
+            if isinstance(info, dict) and len(info) > 10 and any(k in info for k in ['marketCap', 'trailingPE', 'forwardPE', 'trailingEps', 'bookValue', 'currentPrice']):
                 return info, "stock.info"
         except Exception:
             pass
@@ -164,13 +176,15 @@ def fetch_stock_technical_data(ticker: str):
     
     try:
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
+        has_valid_atr = df['ATR'].notna().any()
     except Exception:
-        df['ATR'] = None
+        df['ATR'] = np.nan
+        has_valid_atr = False
 
     try:
         df['MFI'] = ta.volume.money_flow_index(df['High'], df['Low'], df['Close'], df['Volume'], window=14)
     except Exception:
-        df['MFI'] = None
+        df['MFI'] = np.nan
 
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
     df['BB_High'] = bb.bollinger_hband()
@@ -178,12 +192,13 @@ def fetch_stock_technical_data(ticker: str):
     df['BB_Mid'] = bb.bollinger_mavg()
     df['BB_Width'] = (df['BB_High'] - df['BB_Low']) / df['BB_Mid'] * 100
 
-    # 버그 수정: DataFrame Series 객체 판정 오류 방지를 위해 notna().any() 활용
-    if df['ATR'] is not None and df['ATR'].notna().any():
+    if has_valid_atr:
         df['KC_High'] = df['SMA_20'] + (1.5 * df['ATR'])
         df['KC_Low'] = df['SMA_20'] - (1.5 * df['ATR'])
         df['BB_Squeeze_On'] = (df['BB_High'] < df['KC_High']) & (df['BB_Low'] > df['KC_Low'])
     else:
+        df['KC_High'] = np.nan
+        df['KC_Low'] = np.nan
         df['BB_Squeeze_On'] = False
 
     df['Typical_Price'] = (df['High'] + df['Low'] + df['Close']) / 3
@@ -203,6 +218,7 @@ def fetch_stock_technical_data(ticker: str):
     low_6m = float(df_6m['Low'].min())
     diff_hl = high_6m - low_6m
     
+    # 📌 피보나치 되돌림 밴드
     fibonacci_levels = {
         "high_6m": round(high_6m, 2),
         "low_6m": round(low_6m, 2),
@@ -212,6 +228,7 @@ def fetch_stock_technical_data(ticker: str):
         "fib_61.8%": round(high_6m - (0.618 * diff_hl), 2)
     }
     
+    # 📌 최근 6개월 매물대 프로파일 및 POC (Point of Control) 연산
     volume_profile = {}
     try:
         num_bins = 30
@@ -226,6 +243,7 @@ def fetch_stock_technical_data(ticker: str):
         poc_idx = int(np.argmax(vol_by_bin))
         poc_price = round(float((price_bins[poc_idx] + price_bins[poc_idx + 1]) / 2), 2)
         
+        # 70% Value Area (VAH / VAL)
         tot_vol = np.sum(vol_by_bin)
         target_va_vol = tot_vol * 0.70
         sorted_indices = np.argsort(vol_by_bin)[::-1]
@@ -294,6 +312,9 @@ def fetch_stock_technical_data(ticker: str):
     }
     return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc, df, volume_profile
 
+# =============================================================================
+# [BLOCK 05] 퀀트 전략 백테스팅 엔진
+# =============================================================================
 # -------------------------------------------------------------
 # 📌 정밀 전략 백테스팅 모듈 (1Y 일봉 기반)
 # -------------------------------------------------------------
@@ -399,13 +420,13 @@ def run_strategy_backtest(df: pd.DataFrame):
         "strategy_2_vwap_mean_reversion": calc_stats(trades2)
     }
 
+# =============================================================================
+# [BLOCK 06] 시장 수급 & 외부 데이터 수집기 (옵션/매크로/섹터/뉴스/지분)
+# =============================================================================
 # -------------------------------------------------------------
 # 📌 옵션 체인 스마트머니 수급 수집기
 # -------------------------------------------------------------
 def fetch_nearest_options_data(ticker: str, retries: int = 3):
-    if "=F" in ticker or "-USD" in ticker:
-        return None
-
     for attempt in range(retries):
         try:
             stock = yf.Ticker(ticker)
@@ -520,22 +541,15 @@ def format_market_cap(market_cap):
     except Exception:
         return str(market_cap)
 
-def fetch_hedge_funds_and_short_intel(ticker: str, stock, info):
+# -------------------------------------------------------------
+# 📌 유명 헤지펀드 보유 내역 & 공매도 세력 분석 데이터 수집기
+# -------------------------------------------------------------
+def fetch_hedge_funds_and_short_intel(stock, info):
     intel = {
         "top_holders": [],
         "short_intel": {}
     }
     
-    if "=F" in ticker or "-USD" in ticker:
-        intel["short_intel"] = {
-            "short_percent_of_float": "해당 없음 (원자재/코인)",
-            "short_ratio_days": "해당 없음",
-            "shares_short_formatted": "해당 없음",
-            "short_mom_change": "해당 없음",
-            "squeeze_risk_level": "🟢 비주식 자산 (해당 없음)"
-        }
-        return intel
-
     try:
         inst_df = stock.institutional_holders
         if inst_df is not None and not inst_df.empty:
@@ -604,20 +618,13 @@ def fetch_hedge_funds_and_short_intel(ticker: str, stock, info):
 
     return intel
 
-def fetch_ownership_and_shorts(ticker: str, stock, info):
+def fetch_ownership_and_shorts(stock, info):
     data = {
         "insider_own": "N/A",
         "insider_trans": "N/A",
         "inst_own": "N/A",
         "inst_trans": "N/A"
     }
-    if "=F" in ticker or "-USD" in ticker:
-        data["insider_own"] = "해당 없음"
-        data["insider_trans"] = "해당 없음"
-        data["inst_own"] = "해당 없음"
-        data["inst_trans"] = "해당 없음"
-        return data
-
     try:
         ins_own_val = info.get("heldPercentInsiders", None)
         if ins_own_val is not None:
@@ -656,30 +663,28 @@ def fetch_ownership_and_shorts(ticker: str, stock, info):
 
     return data
 
-def fetch_earnings_calendar(ticker: str, stock, info, high_52_calc, low_52_calc):
-    earnings_date_str = "해당 없음 (원자재/코인)" if ("=F" in ticker or "-USD" in ticker) else "미정"
+def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
+    earnings_date_str = "미정"
     d_day_str = ""
-    
-    if "=F" not in ticker and "-USD" not in ticker:
-        try:
-            cal = stock.calendar
-            if cal is not None and isinstance(cal, dict) and 'Earnings Date' in cal:
-                e_dates = cal['Earnings Date']
-                if isinstance(e_dates, list) and e_dates:
-                    e_date = pd.to_datetime(e_dates[0])
-                    earnings_date_str = e_date.strftime("%Y-%m-%d")
-                    now = datetime.now()
-                    days_diff = (e_date - now).days
-                    if days_diff >= 0:
-                        d_day_str = f"D-{days_diff}일"
-                    else:
-                        d_day_str = f"최근 발표완료 ({abs(days_diff)}일 전)"
-            elif cal is not None and isinstance(cal, pd.DataFrame) and not cal.empty:
-                if 'Earnings Date' in cal.index:
-                    val = cal.loc['Earnings Date'].iloc[0]
-                    earnings_date_str = str(val)[:10]
-        except Exception:
-            pass
+    try:
+        cal = stock.calendar
+        if cal is not None and isinstance(cal, dict) and 'Earnings Date' in cal:
+            e_dates = cal['Earnings Date']
+            if isinstance(e_dates, list) and e_dates:
+                e_date = pd.to_datetime(e_dates[0])
+                earnings_date_str = e_date.strftime("%Y-%m-%d")
+                now = datetime.now()
+                days_diff = (e_date - now).days
+                if days_diff >= 0:
+                    d_day_str = f"D-{days_diff}일"
+                else:
+                    d_day_str = f"최근 발표완료 ({abs(days_diff)}일 전)"
+        elif cal is not None and isinstance(cal, pd.DataFrame) and not cal.empty:
+            if 'Earnings Date' in cal.index:
+                val = cal.loc['Earnings Date'].iloc[0]
+                earnings_date_str = str(val)[:10]
+    except Exception:
+        pass
 
     high_52w = info.get("fiftyTwoWeekHigh", None) or high_52_calc
     low_52w = info.get("fiftyTwoWeekLow", None) or low_52_calc
@@ -706,24 +711,22 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     if not market_cap and fast_info:
         market_cap = getattr(fast_info, 'market_cap', None) or fast_info.get('market_cap', "N/A")
 
-    is_commodity_or_crypto = ("=F" in ticker or "-USD" in ticker)
-
-    trailing_pe = "해당 없음" if is_commodity_or_crypto else info.get("trailingPE", "N/A")
-    forward_pe = "해당 없음" if is_commodity_or_crypto else info.get("forwardPE", "N/A")
-    pbr = "해당 없음" if is_commodity_or_crypto else info.get("priceToBook", "N/A")
-    ps_ratio = "해당 없음" if is_commodity_or_crypto else info.get("priceToSalesTrailing12Months", "N/A")
+    trailing_pe = info.get("trailingPE", "N/A")
+    forward_pe = info.get("forwardPE", "N/A")
+    pbr = info.get("priceToBook", "N/A")
+    ps_ratio = info.get("priceToSalesTrailing12Months", "N/A")
     
     roe_raw = info.get("returnOnEquity", None)
-    roe_pct = "해당 없음" if is_commodity_or_crypto else (round(roe_raw * 100, 2) if roe_raw is not None else "N/A")
-    eps = None if is_commodity_or_crypto else info.get("trailingEps", None)
-    forward_eps = None if is_commodity_or_crypto else info.get("forwardEps", None)
-    bps = None if is_commodity_or_crypto else info.get("bookValue", None)
-    revenue_per_share = None if is_commodity_or_crypto else info.get("revenuePerShare", None)
-    target_mean_price = "해당 없음" if is_commodity_or_crypto else info.get("targetMeanPrice", "N/A")
+    roe_pct = round(roe_raw * 100, 2) if roe_raw is not None else "N/A"
+    eps = info.get("trailingEps", None)
+    forward_eps = info.get("forwardEps", None)
+    bps = info.get("bookValue", None)
+    revenue_per_share = info.get("revenuePerShare", None)
+    target_mean_price = info.get("targetMeanPrice", "N/A")
 
-    ownership_and_shorts = fetch_ownership_and_shorts(ticker, stock, info)
-    hedge_and_short_intel = fetch_hedge_funds_and_short_intel(ticker, stock, info)
-    earnings_cal = fetch_earnings_calendar(ticker, stock, info, high_52_calc, low_52_calc)
+    ownership_and_shorts = fetch_ownership_and_shorts(stock, info)
+    hedge_and_short_intel = fetch_hedge_funds_and_short_intel(stock, info)
+    earnings_cal = fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc)
 
     earnings_growth = info.get("earningsGrowth", None)
     if earnings_growth and earnings_growth > 0:
@@ -732,8 +735,6 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         est_growth = 15.0
 
     def _value_model_sanity(value, label):
-        if is_commodity_or_crypto:
-            return "산출불가 (원자재/코인)"
         try:
             if not isinstance(value, (int, float)):
                 return "산출불가"
@@ -750,41 +751,36 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
             return "산출불가"
 
     value_models = {}
-    if is_commodity_or_crypto:
-        value_models = {"graham": "해당 없음", "peter_lynch": "해당 없음", "roe_pbr": "해당 없음"}
-    else:
-        try:
-            if eps and bps and eps > 0 and bps > 0:
-                raw_graham = round(math.sqrt(22.5 * float(eps) * float(bps)), 2)
-                value_models["graham"] = _value_model_sanity(raw_graham, "graham")
-            else:
-                value_models["graham"] = "산출불가"
-        except Exception:
+    try:
+        if eps and bps and eps > 0 and bps > 0:
+            raw_graham = round(math.sqrt(22.5 * float(eps) * float(bps)), 2)
+            value_models["graham"] = _value_model_sanity(raw_graham, "graham")
+        else:
             value_models["graham"] = "산출불가"
+    except Exception:
+        value_models["graham"] = "산출불가"
 
-        try:
-            if eps and eps > 0 and roe_raw and roe_raw > 0:
-                raw_lynch = round(float(eps) * min(float(roe_raw) * 100, 25.0), 2)
-                value_models["peter_lynch"] = _value_model_sanity(raw_lynch, "peter_lynch")
-            else:
-                value_models["peter_lynch"] = "산출불가"
-        except Exception:
+    try:
+        if eps and eps > 0 and roe_raw and roe_raw > 0:
+            raw_lynch = round(float(eps) * min(float(roe_raw) * 100, 25.0), 2)
+            value_models["peter_lynch"] = _value_model_sanity(raw_lynch, "peter_lynch")
+        else:
             value_models["peter_lynch"] = "산출불가"
+    except Exception:
+        value_models["peter_lynch"] = "산출불가"
 
-        try:
-            if bps and bps > 0 and roe_raw and roe_raw > 0:
-                raw_roe_pbr = round(float(bps) * (float(roe_raw) / 0.10), 2)
-                value_models["roe_pbr"] = _value_model_sanity(raw_roe_pbr, "roe_pbr")
-            else:
-                value_models["roe_pbr"] = "산출불가"
-        except Exception:
+    try:
+        if bps and bps > 0 and roe_raw and roe_raw > 0:
+            raw_roe_pbr = round(float(bps) * (float(roe_raw) / 0.10), 2)
+            value_models["roe_pbr"] = _value_model_sanity(raw_roe_pbr, "roe_pbr")
+        else:
             value_models["roe_pbr"] = "산출불가"
+    except Exception:
+        value_models["roe_pbr"] = "산출불가"
 
     used_growth_fallback = not (earnings_growth and earnings_growth > 0)
 
     def _sanity_capped(value, label):
-        if is_commodity_or_crypto:
-            return "산출불가 (원자재/코인)"
         try:
             if not isinstance(value, (int, float)) or not curr_price or curr_price <= 0:
                 return "산출불가"
@@ -798,54 +794,51 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
             return "산출불가"
 
     growth_models = {}
-    if is_commodity_or_crypto:
-        growth_models = {"forward_peg": "해당 없음", "psr_target": "해당 없음", "dcf_growth": "해당 없음"}
-    else:
-        f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
-        try:
-            if f_eps and f_eps > 0:
-                raw_peg = round(float(f_eps) * (est_growth * 1.5), 2)
-                growth_models["forward_peg"] = _sanity_capped(raw_peg, "forward_peg")
-            else:
-                growth_models["forward_peg"] = "산출불가"
-        except Exception:
+    f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
+    try:
+        if f_eps and f_eps > 0:
+            raw_peg = round(float(f_eps) * (est_growth * 1.5), 2)
+            growth_models["forward_peg"] = _sanity_capped(raw_peg, "forward_peg")
+        else:
             growth_models["forward_peg"] = "산출불가"
+    except Exception:
+        growth_models["forward_peg"] = "산출불가"
 
-        try:
-            if revenue_per_share and revenue_per_share > 0:
-                raw_psr = round(float(revenue_per_share) * 5.0, 2)
-                growth_models["psr_target"] = _sanity_capped(raw_psr, "psr_target")
-            else:
-                growth_models["psr_target"] = "산출불가"
-        except Exception:
+    try:
+        if revenue_per_share and revenue_per_share > 0:
+            raw_psr = round(float(revenue_per_share) * 5.0, 2)
+            growth_models["psr_target"] = _sanity_capped(raw_psr, "psr_target")
+        else:
             growth_models["psr_target"] = "산출불가"
+    except Exception:
+        growth_models["psr_target"] = "산출불가"
 
-        try:
-            if f_eps and f_eps > 0:
-                wacc = 0.09
-                g_long = 0.025
-                pv_sum = 0
-                cur_cf = float(f_eps)
-                for y in range(1, 6):
-                    cur_cf *= (1 + est_growth / 100)
-                    pv_sum += cur_cf / ((1 + wacc) ** y)
-                terminal_val = (cur_cf * (1 + g_long)) / (wacc - g_long)
-                pv_terminal = terminal_val / ((1 + wacc) ** 5)
-                raw_dcf = round(pv_sum + pv_terminal, 2)
-                growth_models["dcf_growth"] = _sanity_capped(raw_dcf, "dcf_growth")
-            else:
-                growth_models["dcf_growth"] = "산출불가"
-        except Exception:
+    try:
+        if f_eps and f_eps > 0:
+            wacc = 0.09
+            g_long = 0.025
+            pv_sum = 0
+            cur_cf = float(f_eps)
+            for y in range(1, 6):
+                cur_cf *= (1 + est_growth / 100)
+                pv_sum += cur_cf / ((1 + wacc) ** y)
+            terminal_val = (cur_cf * (1 + g_long)) / (wacc - g_long)
+            pv_terminal = terminal_val / ((1 + wacc) ** 5)
+            raw_dcf = round(pv_sum + pv_terminal, 2)
+            growth_models["dcf_growth"] = _sanity_capped(raw_dcf, "dcf_growth")
+        else:
             growth_models["dcf_growth"] = "산출불가"
+    except Exception:
+        growth_models["dcf_growth"] = "산출불가"
 
     return {
         "info_source": info_source,
         "market_cap_fmt": format_market_cap(market_cap),
-        "trailing_pe": trailing_pe,
-        "forward_pe": forward_pe,
-        "pbr": pbr,
-        "ps_ratio": ps_ratio,
-        "roe": roe_pct,
+        "trailing_pe": round(trailing_pe, 2) if isinstance(trailing_pe, (int, float)) else trailing_pe,
+        "forward_pe": round(forward_pe, 2) if isinstance(forward_pe, (int, float)) else forward_pe,
+        "pbr": round(pbr, 2) if isinstance(pbr, (int, float)) else pbr,
+        "ps_ratio": round(ps_ratio, 2) if isinstance(ps_ratio, (int, float)) else ps_ratio,
+        "roe": f"{roe_pct}%" if roe_pct != "N/A" else "N/A",
         "target_mean_price": target_mean_price,
         "ownership_and_shorts": ownership_and_shorts,
         "hedge_and_short_intel": hedge_and_short_intel,
@@ -854,6 +847,9 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         "growth_models": growth_models
     }
 
+# -------------------------------------------------------------
+# 📌 S&P 500 11개 전 섹터 5일/1개월 수익률 수집
+# -------------------------------------------------------------
 def fetch_sector_performance():
     sector_etfs = [
         ("XLK", "IT/기술 (Technology)"),
@@ -971,14 +967,47 @@ def extract_clean_text(content):
         return "\n".join([p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in content])
     return str(content)
 
+# =============================================================================
+# [BLOCK 07] 증권사 투자의견 & LLM 응답 파서
+# =============================================================================
+# -------------------------------------------------------------
+# 📌 히스토리용 전략 요약 함수
+# -------------------------------------------------------------
 def summarize_user_strategy(raw_text: str) -> str:
     if not raw_text or raw_text == "분석 리포트 참조":
         return "분석 리포트 참조"
+        
     text = raw_text.replace("\n", " ").strip()
-    return text[:250] + "..." if len(text) > 250 else text
+    
+    if "보유자:" in text or "미보유자:" in text:
+        parts = []
+        if "보유자:" in text:
+            holder_part = text.split("보유자:")[1].split("미보유자:")[0].strip()
+            first_sen = re.split(r'[.!?]\s+', holder_part)[0].strip()
+            if first_sen:
+                parts.append(f"보유: {first_sen}")
+        if "미보유자:" in text:
+            non_holder_part = text.split("미보유자:")[1].strip()
+            first_sen = re.split(r'[.!?]\s+', non_holder_part)[0].strip()
+            if first_sen:
+                parts.append(f"신규: {first_sen}")
+        if parts:
+            res = " | ".join(parts)
+            return res[:130] + "..." if len(res) > 130 else res
+
+    sentences = [s.strip() for s in re.split(r'[.!?]\s+', text) if len(s.strip()) > 5]
+    if not sentences:
+        return text[:110]
+        
+    summary = ". ".join(sentences[:2])
+    if len(summary) > 120:
+        summary = summary[:120] + "..."
+    elif not summary.endswith("."):
+        summary += "."
+    return summary
 
 # -------------------------------------------------------------
-# 📌 정밀 파서 함수 (들여쓰기 구조 및 멀티라인 대응 완벽 보완)
+# 📌 신규 진입 적격성 평가 파서
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -992,16 +1021,10 @@ def parse_full_trading_scenario(text):
     pyramiding = ""
     user_strategy_raw = ""
 
-    avoidance_keywords = ["지양", "금지", "관망", "보류", "부적합", "자제", "피할"]
-    has_avoidance = any(kw in text for kw in avoidance_keywords)
-
-    # 1. 최종 투자의견 파싱
     match_action = re.search(r"\[최종\s*투자의견\s*[:\-]?\s*([^\]]+)\]", text)
     if match_action:
         op_text = match_action.group(1).strip()
-        if has_avoidance:
-            action = "홀딩"
-        elif "매수" in op_text and "관망" not in op_text and "보유" not in op_text:
+        if "매수" in op_text and "관망" not in op_text and "보유" not in op_text:
             action = "매수"
         elif "매도" in op_text or "비중축소" in op_text or "차익실현" in op_text:
             action = "매도"
@@ -1011,9 +1034,7 @@ def parse_full_trading_scenario(text):
         for line in text.split("\n"):
             line_str = line.replace("*", "").replace("#", "").replace("-", "").replace("•", "").strip()
             if "최종 투자 의견" in line_str or "최종 투자의견" in line_str:
-                if has_avoidance:
-                    action = "홀딩"
-                elif "적극매수" in line_str or "분할매수" in line_str:
+                if "적극매수" in line_str or "분할매수" in line_str:
                     action = "매수"
                 elif "비중축소" in line_str or "매도" in line_str or "차익실현" in line_str:
                     action = "매도"
@@ -1025,88 +1046,59 @@ def parse_full_trading_scenario(text):
     if match_entry_grade:
         entry_grade = match_entry_grade.group(1).strip()
     
-    # 2. [최종 투자의견] 하위의 [사용자 대응 전략] 파싱
-    if "사용자 대응 전략" in text:
-        try:
-            strat_part = text.split("사용자 대응 전략")[1]
-            if "[" in strat_part:
-                strat_part = strat_part.split("[")[0]
-            user_strategy_raw = strat_part.replace(":", "").replace("*", "").replace("-", "").replace("•", "").strip()
-        except Exception:
-            pass
+    for line in text.split("\n"):
+        line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
+        if ("신규 진입 등급" in line_clean or "진입 등급" in line_clean) and entry_grade == "분석 리포트 참조":
+            if ":" in line_clean:
+                entry_grade = ":".join(line_clean.split(":")[1:]).strip()
+        elif "예상 손익비" in line_clean or "손익비" in line_clean:
+            if ":" in line_clean:
+                entry_rr = ":".join(line_clean.split(":")[1:]).strip()
+        elif "사용자 대응 전략" in line_clean or "사용자대응전략" in line_clean:
+            if ":" in line_clean:
+                user_strategy_raw = ":".join(line_clean.split(":")[1:]).strip()
+            else:
+                user_strategy_raw = line_clean.replace("사용자 대응 전략", "").replace("사용자대응전략", "").strip(" -:\t")
 
-    # 3. 정밀 매매 시나리오 파싱 (들여쓰기 및 멀티라인 완벽 대응)
     scenario_block = text
-    if "[정밀 매매 시나리오" in text:
-        after_header = text.split("[정밀 매매 시나리오")[1]
+    if "[정밀 매매 시나리오]" in text:
+        after_header = text.split("[정밀 매매 시나리오]")[1]
         if "[최종 투자의견" in after_header:
             scenario_block = after_header.split("[최종 투자의견")[0]
         else:
             scenario_block = after_header
 
-    lines = scenario_block.split("\n")
-    current_key = None
-
-    for line in lines:
+    for line in scenario_block.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
-        if not line_clean:
-            continue
-
-        # 키워드 감지
-        if "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean:
-            current_key = "buy_band"
-            parts = line_clean.split(":")
-            if len(parts) > 1 and parts[1].strip():
-                buy_band = parts[1].strip()
-            else:
-                buy_band = ""
-            continue
-        elif "1차 목표가" in line_clean or "1차목표가" in line_clean:
-            current_key = "target_1"
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                target_1 = ":".join(parts[1:]).strip()
-            continue
+        
+        if "1차 목표가" in line_clean or "1차목표가" in line_clean:
+            if ":" in line_clean:
+                target_1 = ":".join(line_clean.split(":")[1:]).strip()
         elif "2차 목표가" in line_clean or "2차목표가" in line_clean:
-            current_key = "target_2"
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                target_2 = ":".join(parts[1:]).strip()
-            continue
-        elif "매도가 밴드" in line_clean or "매도가" in line_clean:
-            current_key = "sell_target"
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                sell_target = ":".join(parts[1:]).strip()
-            continue
+            if ":" in line_clean:
+                target_2 = ":".join(line_clean.split(":")[1:]).strip()
+        elif ("목표가" in line_clean or "익절 라인" in line_clean or "익절/" in line_clean) and target_1 == "분석 리포트 참조":
+            if ":" in line_clean:
+                target_1 = ":".join(line_clean.split(":")[1:]).strip()
+        elif "매도가 밴드" in line_clean or "비중축소(익절) 밴드" in line_clean or "비중축소 밴드" in line_clean or "매도가" in line_clean:
+            if ":" in line_clean:
+                sell_target = ":".join(line_clean.split(":")[1:]).strip()
+        elif "분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean or "분할 매수" in line_clean:
+            if ":" in line_clean:
+                buy_band = ":".join(line_clean.split(":")[1:]).strip()
         elif "손절" in line_clean or "Stop-loss" in line_clean:
-            current_key = "stop_loss"
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                raw_sl = ":".join(parts[1:]).strip()
-                dollar_match = re.search(r"(\$[0-9,]+(?:\.\d+)?(?:\s*~\s*\$[0-9,]+(?:\.\d+)?)?)", raw_sl)
-                if dollar_match:
-                    stop_loss = dollar_match.group(1)
-                else:
-                    stop_loss = raw_sl.split("(")[0].strip()
-            continue
-        elif "불타기 조건" in line_clean or "불타기" in line_clean:
-            current_key = "pyramiding"
-            parts = line_clean.split(":")
-            if len(parts) > 1:
-                pyramiding = ":".join(parts[1:]).strip()
-            continue
-
-        # 들여쓰기된 서브 라인 처리 (분할매수 1차, 2차 등)
-        if line.startswith(" ") or line.startswith("\t") or "°" in line or "o " in line:
-            if current_key == "buy_band":
-                sub_text = line_clean.replace("o", "").strip()
-                if sub_text:
-                    buy_band = f"{buy_band} | {sub_text}" if buy_band else sub_text
+            if ":" in line_clean:
+                stop_loss = ":".join(line_clean.split(":")[1:]).strip()
+        elif "불타기 조건" in line_clean or "불타기" in line_clean or "추가 매수 조건" in line_clean:
+            if ":" in line_clean:
+                pyramiding = ":".join(line_clean.split(":")[1:]).strip()
 
     user_strategy_summary = summarize_user_strategy(user_strategy_raw)
     return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
 
+# -------------------------------------------------------------
+# 📌 증권사 투자의견, 목표가 & 티어 분류기
+# -------------------------------------------------------------
 TIER_1_FIRMS = [
     "goldman", "morgan stanley", "jpmorgan", "jp morgan", "citi", "citigroup",
     "bank of america", "bofa", "merrill", "ubs", "barclays", "deutsche bank",
@@ -1130,8 +1122,6 @@ def classify_analyst_tier(firm_name: str):
         return "🔎 Tier 3 (독립/부티크)", 3
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
-    if "=F" in ticker or "-USD" in ticker:
-        return []
     try:
         stock = yf.Ticker(ticker)
         upgrades = stock.upgrades_downgrades
@@ -1178,17 +1168,10 @@ def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
         return records
     except Exception:
         return []
-
-def normalize_ticker(ticker: str) -> str:
-    ticker = ticker.upper().strip()
-    crypto_symbols = ["BTC", "ETH", "SOL", "DOGE", "XRP", "ADA", "AVAX"]
-    if ticker in crypto_symbols:
-        return f"{ticker}-USD"
-    commodity_symbols = ["GC", "CL", "SI", "HG"]
-    if ticker in commodity_symbols:
-        return f"{ticker}=F"
-    return ticker
-
+        
+# =============================================================================
+# [BLOCK 08] 사이드바 UI 컴포넌트 & 히스토리 카드 렌더링
+# =============================================================================
 # -------------------------------------------------------------
 # 2. 사이드바 UI
 # -------------------------------------------------------------
@@ -1209,10 +1192,9 @@ with st.sidebar:
     selected_model_id = MODEL_OPTIONS[selected_model_label]
     
     st.markdown("---")
-    raw_ticker_input = st.text_input("종목/자산 티커 (비트코인: BTC, 금: GC)", value=st.session_state.get("selected_ticker", "TSLA"))
-    ticker_input = normalize_ticker(raw_ticker_input)
+    ticker_input = st.text_input("종목 티커 (Ticker)", value=st.session_state.selected_ticker).upper()
     
-    is_holding = st.checkbox("💼 **현재 보유 중인 자산인가요?**", value=False)
+    is_holding = st.checkbox("💼 **현재 보유 중인 종목인가요?**", value=False)
     
     user_avg_price = 0.0
     user_shares = 0.0
@@ -1222,12 +1204,13 @@ with st.sidebar:
         with u_col1:
             user_avg_price = st.number_input("내 평단가 ($)", min_value=0.0, value=0.0, step=0.5, format="%.2f")
         with u_col2:
-            user_shares = st.number_input("보유 수량", min_value=0.0, value=0.0, step=1.0, format="%.1f")
+            user_shares = st.number_input("보유 수량 (주)", min_value=0.0, value=0.0, step=1.0, format="%.1f")
             
     st.write("")
     analyze_btn = st.button("🚀 분석 & 백테스팅 실행", type="primary", use_container_width=True)
     st.divider()
 
+    # 📌 트레이딩 히스토리
     st.markdown("#### 📌 **트레이딩 히스토리**")
     
     if st.session_state.history:
@@ -1303,6 +1286,9 @@ with st.sidebar:
     else:
         st.caption("분석 내역이 여기에 영구 저장됩니다.")
 
+# =============================================================================
+# [BLOCK 09] LLM RAG 추론 파이프라인 & 실행 트리거 (analyze_btn)
+# =============================================================================
 # -------------------------------------------------------------
 # 3. 메인 분석 화면 & 분석 완료 즉시 렌더링 로직
 # -------------------------------------------------------------
@@ -1316,7 +1302,7 @@ if analyze_btn:
         except Exception:
             api_key = None
             
-    with st.spinner(f"🔍 [{ticker_input}] 기술적 지표, POC 매물대, 11개 섹터 수급 및 백테스팅 실행 중..."):
+    with st.spinner(f"🔍 [{ticker_input}] POC 매물대/헤지펀드 지분/공매도 세력 분석/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
         tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df, vol_profile = fetch_stock_technical_data(ticker_input)
         backtest_results = run_strategy_backtest(raw_df)
         options_data = fetch_nearest_options_data(ticker_input, retries=3)
@@ -1343,14 +1329,14 @@ if analyze_btn:
             my_return_str = f"{pnl_pct:+.2f}%"
 
         user_position_text = (
-            f"사용자 보유 현황: 평단가 ${user_avg_price:.2f}, 보유수량 {user_shares:.1f}, 평가수익률 {my_return_str}"
-            if is_holding and user_avg_price > 0 else "사용자 미보유 자산 (신규 진입 검토 관점)"
+            f"사용자 보유 현황: 평단가 ${user_avg_price:.2f}, 보유수량 {user_shares:.1f}주, 평가수익률 {my_return_str}"
+            if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
         )
 
         if is_holding and user_avg_price > 0:
-            strategy_instruction_text = f"""* **사용자 대응 전략**: [현재 사용자가 평단가 ${user_avg_price:.2f}, 평가수익률 {my_return_str}로 자산을 보유 중인 상태입니다. 반드시 '보유자 관점'의 전략만 단독 작성할 것.]"""
+            strategy_instruction_text = f"""* **사용자 대응 전략**: [현재 사용자가 평단가 ${user_avg_price:.2f}, 평가수익률 {my_return_str}로 주식을 보유 중인 상태입니다. 반드시 '보유자 관점'의 전략만 단독 작성할 것. 미보유자나 신규 진입 관련 문구는 일절 작성하지 말 것. 1차/2차 목표가 도달 시 구체적인 부분 익절/비중축소 비중(예: 30% 매도) 및 손절선 이탈 시 전량 손절 계획을 명시할 것.]"""
         else:
-            strategy_instruction_text = """* **사용자 대응 전략**: [현재 사용자가 자산을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것.]"""
+            strategy_instruction_text = """* **사용자 대응 전략**: [현재 사용자가 주식을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것. 보유자 관련 문구는 일절 작성하지 말 것. 상단 [신규 진입 적격성 평가] 및 [분할 매수 밴드]와 100% 일치하는 진입 가격대와 진입 비중(예: 1차 30% 분할 진입 등)을 명확히 제시할 것.]"""
 
         full_rag_payload = {
             "meta": {
@@ -1381,11 +1367,11 @@ if analyze_btn:
 
         response_content = None
         if not api_key:
-            response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다."
+            response_content = "⚠️ GEMINI_API_KEY가 등록되지 않았습니다. 아래 [분석용 JSON 데이터 다운로드] 버튼으로 JSON을 내려받아 분석을 요청하세요."
         else:
             template = """
-[RAG 심층 주입 데이터 ({ticker})]
-1. 기술적/수급, VWAP, 볼린저 밴드 스퀴즈 및 6개월 매물대 POC:
+[RAG 심층 주입 데이터]
+1. 기술적/수급, VWAP, 볼린저 밴드 스퀴즈 및 6개월 매물대 POC ({ticker}) (기준일: {stock_date}):
 {tech_json}
 
 2. 최근 6개월 최다 매물대(POC) 및 70% 핵심 매물대(Value Area):
@@ -1397,61 +1383,107 @@ if analyze_btn:
 4. 최근 6개월 피보나치 되돌림 밴드:
 {fib_json}
 
-5. 옵션 체인 스마트머니 포지션:
+5. 가장 빠른 만기 옵션 체인 수급 (콜/풋 Max OI & Volume):
 {options_json}
 
-6. 헤지펀드 지분 및 공매도 세력 분석:
+6. 내부자/기관 지분율 및 유명 헤지펀드/공매도 세력 분석 (Short Squeeze Analysis):
 {hedge_short_json}
 
 7. 실적 발표 일정 및 52주 고저:
 {earnings_json}
 
-8. 매크로 및 6대 자산 실시간 지표:
+8. 매크로 및 6대 자산 실시간 지표 (출처 및 기준일 포함):
 {macro_json}
 
-9. S&P 500 11개 전 섹터 실시간 등락률:
+9. 글로벌 거시/시장 주요 뉴스:
+{macro_news_json}
+
+10. S&P 500 11개 전 섹터 실시간 등락률 및 모멘텀:
 {sector_json}
 
-10. 펀더멘털 및 밸류에이션:
+11. 펀더멘털 및 6대 밸류에이션:
 {fund_json}
 
-11. 사용자 보유 현황:
+12. 사용자 보유 현황:
 {user_position}
 
-12. 최신 기사 및 애널리스트 투자의견:
+13. 종목 최신 주요 기사:
 {news_json}
 
-위 데이터를 바탕으로 최고 수준의 퀀트 애널리스트 관점에서 정밀 리포트를 작성할 것:
-- 거시경제 환경 및 11개 전 섹터 자금 순환매 분석.
-- 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가.
-- 신규 진입 적격성 평가 및 구체적 매매 시나리오 (분할 매수 밴드, 목표가, 손절선) 제시.
+14. 최근 2개월 증권가 투자의견 및 목표가 변동 (기관 신뢰도 티어 포함):
+{analyst_json}
+
+---
+
+[지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 POC 매물벽 검증 규칙]
+위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
+
+1. 거시환경 및 시장 국면
+- **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 요약 명시할 것.
+- 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측] (현금, 채권, 주식, 코인, 금, 원유).
+- **[자산배분 코멘트 – 근거 없는 수치 생성 금지 (필수)]**: 주입된 데이터(10년물 국채금리, VIX, 달러인덱스, 유가, 금, 비트코인)만을 근거로 방향성(예: "국채 비중 확대 고려" 등)을 서술할 것. "주식 40% : 채권 30%"처럼 **구체적인 퍼센트 배분 수치는 절대 임의로 생성하지 말 것** — 그런 수치를 뒷받침할 데이터가 제공되지 않았으므로, 정량 배분표 대신 정성적 방향성만 제시할 것.
+
+2. 11개 전 섹터 전망 및 자금 순환매 심층 분석 (서식 엄격 준수)
+- **11개 섹터 전수 리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 상태를 11개 모두 글머리 기호(*)로 작성할 것.
+- **자금 순환매 결론 분리 (필수)**: 11개 섹터 글머리 기호 작성이 끝난 후, **반드시 빈 줄(한 줄 공백)을 삽입**하여 아래와 같이 독립된 글머리 기호로 작성할 것:
+
+  * **자금 순환매 결론**: [방어주 vs 성장주 순환매 방향성과 {ticker}가 속한 섹터의 수혜/소외 여부 및 상대 강도를 명확히 도출]
+
+3. 밸류에이션, 스마트머니(헤지펀드) 및 공매도 세력/옵션 분석 ({ticker})
+- **유명 헤지펀드 포지션**: 13F 주요 보유 기관(Top Holders)의 지분 집중도와 스마트머니 매집 특성을 분석할 것.
+- **공매도 세력 및 숏스퀴즈 리스크**: Short Float, Days to Cover(상환 소요 일수), 월간 공매도 증감율을 결합하여 공매도 세력의 하방 압력 강도 및 숏스퀴즈 촉발 가능성을 평가할 것.
+- **IB 투자의견 신뢰도 가중**: Tier 1/2 투자은행의 목표가 변동을 가중 평가하되, 기관 목표가는 중장기 상방 여력 참고용으로만 활용할 것.
+
+4. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가 ({ticker})
+- **VWAP & 최다 매물대(POC) 지지/저항 판정**: 현재가가 1Y/20D VWAP 및 6개월 최다 매물대(POC) 상단/하단 중 어디에 위치하며 실제 매물 부담이 적은 구간인지 집중 분석할 것.
+- **볼린저 밴드 스퀴즈 & 백테스팅 시사점**: 스퀴즈 상태(Squeeze On/Off)에 따른 폭발 방향성을 평가할 것.
+- **[백테스팅 성과 정직성 원칙 (필수, 절대 축소·생략 금지)]**: 두 전략의 `total_ret`을 반드시 `benchmark_buy_and_hold`(단순 보유 수익률)와 직접 비교하여 명시할 것.
+  * 전략 수익률이 벤치마크보다 낮으면 "벤치마크 대비 열위"임을 굵은 글씨로 명확히 경고할 것 (승률/손익비만 언급하고 총수익 비교를 생략하는 것 금지).
+  * `total_ret`이 마이너스(손실)인 전략은 "실전 매매 타이밍 시그널로서 신뢰도 낮음"이라고 반드시 명시할 것.
+  * 결론적으로 두 전략 중 하나라도 벤치마크를 밑돌면, "이 종목은 기술적 타이밍 매매보다 단순 보유(Buy & Hold)가 더 유리했다"는 취지의 문장을 반드시 포함할 것.
+- **[밸류에이션 이상치 검증 원칙 (필수)]**: 밸류에이션 모델 값에 "산출불가", "모델 괴리율 과다", "참고용" 등의 문구가 포함되어 있으면 이를 유효한 목표가처럼 서술하지 말고, 왜 신뢰할 수 없는지(예: 저성장/성숙 기업에 성장주 모델 적용, 고PER 성장주에 자산가치/청산가치 모델 적용, 현재가 대비 비현실적 괴리)를 밝히고 해당 모델은 판단에서 제외할 것. PBR이 음수(자사주 매입 등으로 인한 자본잠식)인 경우도 그 원인을 짚고 액면 그대로 해석하지 말 것.
+- 스코어카드 (각 10점 만점): 성장성, 수익성, 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
+
+5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
+- **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망/리스크 과다) 중 택1]
+- **진입 적합성 종합 판정**: 미보유자 입장에서 현재 시점에 무조건 하방 매수를 기다려야 하는지, 아니면 현재가 부근에서 즉시/분할 진입할 만한 모멘텀과 밸류에이션 메리트가 있는지 객관적이고 냉정하게 평가할 것.
+- **예상 손익비 (Risk/Reward Ratio)**: 1차 목표가까지의 기대 상승률 대비 손절선까지의 하방 리스크 비율을 수치로 명시할 것.
+
+6. [정밀 매매 시나리오]
+- **[매수 밴드 및 진입 가격의 상·하단 논리 일치 규칙 (필수)]**:
+  * **분할 매수 밴드 설정**: 피보나치 지지선, 20일 VWAP, POC 매물대 지지선을 결합하여 실질적 달러 범위를 도출할 것.
+  * **하단 [사용자 대응 전략]과의 가격 일치**: 사용자 대응 전략에서 언급하는 진입가는 반드시 상단 **[분할 매수 밴드]**에서 제시한 가격대와 100% 동일한 수치를 인용할 것.
+
+- **[가격 표기 및 서식 엄격 준수 규칙]**: 
+  * **가격 밴드 오름차순 표기 (필수)**: 분할 매수 밴드, 매도가 밴드 등 모든 가격 범위는 반드시 **'낮은 가격 ~ 높은 가격 (하단 ~ 상단)' 오름차순 순서로 정렬**하여 작성할 것 (예: $332.49 ~ $356.98). 절대로 높은 가격을 앞에 적지 말 것.
+  * **보수적 매도가 밴드 설정**: 증권사 기관 목표가 대신 **볼린저 밴드 상단, 52주 고점 저항선, POC 매물대 저항선, 콜옵션 Max OI 저항벽 등 실제 차트/수급상의 실시간 저항선**을 최우선 기준으로 하여 현실적인 차익실현 달러 밴드를 도출할 것.
+  * **피보나치 수치 표기 규칙**: 반드시 **'피보나치 50.0%', '피보나치 38.2%', '피보나치 23.6%', '피보나치 61.8%'**와 같이 소수점과 퍼센트(%) 기호를 붙여 표기할 것.
+  * 비중 언급 시 '30%'처럼 퍼센트(%) 기호를 붙이고 단어와 숫자 사이에 공백을 둘 것.
+
+7. [최종 투자의견 규칙 (엄격 준수)]
+- 만약 현재 과열권이거나 추격 매수를 지양해야 하는 상황, 또는 관망/보류가 유리한 국면이라면 **최종 투자의견을 절대 '매수'나 '분할매수'로 적지 말고, 반드시 '관망' 또는 '홀딩'으로 명시할 것.**
+
+- **[반드시 아래의 구조 및 순서로 완벽히 동일하게 작성할 것]**:
 
 [신규 진입 적격성 평가]
 * **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망) 중 택1]
-* **진입 적합성 분석**: [...]
-* **예상 손익비 (Risk/Reward)**: [...]
+* **진입 적합성 분석**: [미보유자 관점에서 현재 진입의 타당성, 추세 지속성 및 밸류에이션 매력도 분석]
+* **예상 손익비 (Risk/Reward)**: [기대수익 % : 손실 % (비율)]
 
 [정밀 매매 시나리오]
-* **분할 매수 밴드**: 
-  - 1차: [...]
-  - 2차: [...]
-* **1차 목표가**: [...]
-* **2차 목표가**: [...]
-* **매도가 밴드**: [...]
-* **손절(Stop-loss) 기준선**: [...]
-* **불타기 조건**: [...]
+* **분할 매수 밴드**: [피보나치 지지선, VWAP 및 POC 지지선을 결합한 구체적 달러 범위와 근거 (낮은 가격 ~ 높은 가격 순 정렬)]
+* **1차 목표가**: [피보나치 38.2% 또는 50.0% 구간 구체적 달러 가격대와 근거]
+* **2차 목표가**: [피보나치 23.6% 또는 52주 고점 인근 저항 구체적 달러 가격대와 근거]
+* **매도가 밴드**: [볼린저 밴드 상단, POC 저항 및 콜옵션 저항벽을 최우선 반영한 실전 분할 차익실현 구체적 달러 밴드 (낮은 가격 ~ 높은 가격 순 정렬)]
+* **손절(Stop-loss) 기준선**: [2.0x ATR 또는 1Y VWAP 이탈 시 추세 훼손 구체적 달러 가격대]
+* **불타기 조건**: [스퀴즈 상방 돌파 및 상방 저항선 안착 시 추가 매수 검토 기준]
 
 [최종 투자의견]
-- **최종 투자의견**: [적극매수 | 분할매수 | 홀딩(보유) | 비중축소 | 관망 중 택1]
-- **사용자 대응 전략**: [...]
-
-[최종 투자의견 규칙 (엄격 준수)]:
-- 만약 현재 과열권이거나 추격 매수를 지양해야 하는 상황, 또는 관망/보류가 유리한 국면이라면 **최종 투자의견을 절대 '매수'나 '분할매수'로 적지 말고, 반드시 '관망' 또는 '홀딩'으로 명시할 것.**
-
+* **최종 투자의견**: [적극매수 | 분할매수 | 홀딩 | 비중축소 | 관망 | 손절 중 택1]
 {strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json"],
                 template=template
             )
             llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
@@ -1464,15 +1496,17 @@ if analyze_btn:
                 "poc_json": json.dumps(vol_profile, indent=2, ensure_ascii=False),
                 "backtest_json": json.dumps(backtest_results, indent=2, ensure_ascii=False) if backtest_results else "백테스팅 데이터 부족",
                 "fib_json": json.dumps(fib_levels, indent=2, ensure_ascii=False),
-                "options_json": json.dumps(options_data, indent=2, ensure_ascii=False) if options_data else "옵션 데이터 없음 (원자재/코인)",
+                "options_json": json.dumps(options_data, indent=2, ensure_ascii=False) if options_data else "옵션 데이터 없음",
                 "hedge_short_json": json.dumps(hedge_short_intel, indent=2, ensure_ascii=False),
                 "earnings_json": json.dumps(earnings_info, indent=2, ensure_ascii=False),
                 "macro_json": json.dumps(macro_data, indent=2, ensure_ascii=False),
+                "macro_news_json": json.dumps(macro_news_data, indent=2, ensure_ascii=False),
                 "sector_json": json.dumps(sector_data, indent=2, ensure_ascii=False),
                 "fund_json": json.dumps(fund_data, indent=2, ensure_ascii=False),
                 "user_position": user_position_text,
                 "strategy_guide": strategy_instruction_text,
-                "news_json": json.dumps(news_data, indent=2, ensure_ascii=False)
+                "news_json": json.dumps(news_data, indent=2, ensure_ascii=False),
+                "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
             }
             
             for delay in [0, 5, 10]:
@@ -1486,7 +1520,7 @@ if analyze_btn:
                     continue
                     
             if not response_content:
-                response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다."
+                response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
         if response_content and not response_content.startswith("⚠️"):
             act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary = parse_full_trading_scenario(response_content)
@@ -1538,6 +1572,9 @@ if analyze_btn:
         }
         st.rerun()
 
+# =============================================================================
+# [BLOCK 10] 메인 대시보드 시각화 렌더링 (지표 카드/테이블/리포트 출력)
+# =============================================================================
 if st.session_state.last_analysis_result:
     res = st.session_state.last_analysis_result
     curr_p = res["curr_p"]
@@ -1555,9 +1592,9 @@ if st.session_state.last_analysis_result:
     info_source = res.get("info_source", "stock.info")
 
     if info_source == "stock.info":
-        st.markdown(f"📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` ({res['ticker']})")
+        st.markdown("📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` (상세 펀더멘털 & 밸류에이션 정상 수집)")
     else:
-        st.markdown(f"📡 **데이터 소스:** `🟡 Yahoo Finance fast_info` ({res['ticker']})")
+        st.markdown("📡 **데이터 소스:** `🟡 Yahoo Finance stock.fast_info` (야후 서버 지연으로 인한 간이 시세 백업 데이터 적용)")
 
     if res["is_holding"] and res["user_avg_price"] > 0 and res["user_shares"] > 0 and curr_p > 0:
         total_invested = res["user_avg_price"] * res["user_shares"]
@@ -1568,31 +1605,31 @@ if st.session_state.last_analysis_result:
         with st.container(border=True):
             st.markdown(f"#### 💼 **내 보유 포지션 분석 ({res['ticker']})**")
             p_c1, p_c2, p_c3, p_c4 = st.columns(4)
-            p_c1.metric("내 매수 평단가", f"${res['user_avg_price']:,.2f}", f"{res['user_shares']:,.1f} 보유")
-            p_c2.metric("총 투입 원금", f"${total_invested:,.2f}")
+            p_c1.metric("내 매수 평단가", f"${res['user_avg_price']:,.2f}", f"{res['user_shares']:,.1f}주 보유")
+            p_c2.metric("총 매수 원금", f"${total_invested:,.2f}")
             p_c3.metric("현재 평가 금액", f"${total_current:,.2f}")
             p_c4.metric("평가 손익 (수익률)", f"${pnl_dollar:+,.2f}", f"{pnl_pct:+.2f}%")
 
     with st.container(border=True):
-        st.markdown(f"**🏢 핵심 시장 지표 ({res['ticker']})**")
+        st.markdown("**🏢 핵심 시장 및 재무 지표**")
         r1_c1, r1_c2, r1_c3, r1_c4 = st.columns(4)
-        r1_c1.metric("현재 가격", f"${curr_p}")
-        r1_c2.metric("시가총액 / 거래대금", str(fund_data.get('market_cap_fmt', 'N/A')))
+        r1_c1.metric("현재 주가", f"${curr_p}")
+        r1_c2.metric("시가총액", str(fund_data.get('market_cap_fmt', 'N/A')))
         r1_c3.metric("PER (선행/후행)", f"{fund_data.get('forward_pe', 'N/A')} / {fund_data.get('trailing_pe', 'N/A')}")
         r1_c4.metric("PBR / PSR", f"{fund_data.get('pbr', 'N/A')} / {fund_data.get('ps_ratio', 'N/A')}")
         
         st.divider()
         
-        st.markdown("**👥 스마트머니 및 내부자 지분**")
+        st.markdown("**👥 스마트머니 기본 지분 (내부자 & 기관 지분율 및 내부자 매매)**")
         own_c1, own_c2, own_c3, own_c4 = st.columns(4)
-        own_c1.metric("Insider Own", str(ownership.get('insider_own', 'N/A')))
-        own_c2.metric("Insider Trans", str(ownership.get('insider_trans', 'N/A')))
-        own_c3.metric("Inst Own", str(ownership.get('inst_own', 'N/A')))
-        own_c4.metric("Inst Trans", str(ownership.get('inst_trans', 'N/A')))
+        own_c1.metric("Insider Own (내부자 지분)", str(ownership.get('insider_own', 'N/A')))
+        own_c2.metric("Insider Trans (내부자 매매)", str(ownership.get('insider_trans', 'N/A')))
+        own_c3.metric("Inst Own (기관 지분)", str(ownership.get('inst_own', 'N/A')))
+        own_c4.metric("Inst Trans (기관 매매/보유)", str(ownership.get('inst_trans', 'N/A')))
 
         st.divider()
 
-        st.markdown(f"**🐋 헤지펀드 & 수급 분석 ({res['ticker']})**")
+        st.markdown(f"**🐋 13F 헤지펀드 지분 & 공매도(Shorts) 수급 정밀 분석 ({res['ticker']})**")
         s_intel = hedge_short_intel.get("short_intel", {})
         
         sk1, sk2, sk3 = st.columns(3)
@@ -1600,10 +1637,13 @@ if st.session_state.last_analysis_result:
         sk2.metric("상환 소요 일수 (DTC)", s_intel.get("short_ratio_days", "N/A"), "Days to Cover")
         sk3.metric("공매도 총 주수", s_intel.get("shares_short_formatted", "N/A"))
         
-        st.markdown(f"**🎯 리스크 등급:** `{s_intel.get('squeeze_risk_level', 'N/A')}`")
+        st.markdown(f"**🎯 숏스퀴즈 리스크 등급:** `{s_intel.get('squeeze_risk_level', 'N/A')}`")
         
         high_52 = earnings_info.get('fiftyTwoWeekHigh', 'N/A')
         diff_52h = round(((curr_p - high_52) / high_52) * 100, 1) if isinstance(high_52, (int, float)) and curr_p else None
+        e_date = earnings_info.get('earnings_date', '미정')
+        e_dday = earnings_info.get('d_day', '')
+        st.caption(f"📅 차기 실적 발표: **{e_date} ({e_dday})** | 52주 고점 괴리율: **{diff_52h:+.1f}%**" if diff_52h is not None else f"📅 차기 실적 발표: **{e_date}**")
         
         holders_list = hedge_short_intel.get("top_holders", [])
         if holders_list:
@@ -1613,12 +1653,12 @@ if st.session_state.last_analysis_result:
 
         st.divider()
 
-        st.markdown("**📅 주요 일정, 52주 가격 범위 & ATR/모멘텀**")
+        st.markdown("**📅 차기 실적 발표 일정, 52주 가격 범위 & ATR/모멘텀**")
         s_c1, s_c2, s_c3, s_c4 = st.columns(4)
-        s_c1.metric("실적/주요일정", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
+        s_c1.metric("차기 실적 발표일", str(earnings_info.get('earnings_date', 'N/A')), str(earnings_info.get('d_day', '')))
         
         low_52 = earnings_info.get('fiftyTwoWeekLow', 'N/A')
-        s_c2.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"고점 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
+        s_c2.metric("52주 최고 / 최저가", f"${high_52} / ${low_52}", f"최고가 대비 {diff_52h:+.1f}%" if diff_52h is not None else None)
         
         s_c3.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
         s_c4.metric(
@@ -1628,7 +1668,7 @@ if st.session_state.last_analysis_result:
         )
 
     if sector_data:
-        with st.expander("🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 [클릭하여 펼치기]**", expanded=False):
+        with st.expander("🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 (11 Sectors Rotation) [클릭하여 펼치기]**", expanded=False):
             s_rows = []
             for etf, s_info in sector_data.items():
                 s_rows.append({
@@ -1638,76 +1678,156 @@ if st.session_state.last_analysis_result:
                     "1개월 등락률": s_info.get("return_1m", "N/A"),
                     "현재가 ($)": f"${s_info.get('latest_close', 'N/A')}"
                 })
-            st.dataframe(pd.DataFrame(s_rows), use_container_width=True, hide_index=True)
+            
+            df_sec = pd.DataFrame(s_rows)
+            st.dataframe(df_sec, use_container_width=True, hide_index=True)
 
     with st.container(border=True):
         st.markdown("##### 🧪 **퀀트 모멘텀, 스마트머니 VWAP & 6개월 최다 매물대 (POC)**")
+        
         q_c1, q_c2, q_c3, q_c4 = st.columns(4)
         
         vwap_1y = tech_data.get('vwap_1y', 'N/A')
         diff_vwap1y = round(((curr_p - vwap_1y) / vwap_1y) * 100, 1) if isinstance(vwap_1y, (int, float)) and curr_p else None
-        q_c1.metric("1Y 누적 VWAP", f"${vwap_1y}", f"현재가 {diff_vwap1y:+.1f}%" if diff_vwap1y is not None else None)
+        q_c1.metric("1Y 누적 VWAP (장기 평단)", f"${vwap_1y}", f"현재가 {diff_vwap1y:+.1f}%" if diff_vwap1y is not None else None)
 
         vwap_20d = tech_data.get('vwap_20d', 'N/A')
         diff_vwap20 = round(((curr_p - vwap_20d) / vwap_20d) * 100, 1) if isinstance(vwap_20d, (int, float)) and curr_p else None
-        q_c2.metric("20일 단기 VWAP", f"${vwap_20d}", f"현재가 {diff_vwap20:+.1f}%" if diff_vwap20 is not None else None)
+        q_c2.metric("20일 단기 VWAP (스마트머니)", f"${vwap_20d}", f"현재가 {diff_vwap20:+.1f}%" if diff_vwap20 is not None else None)
 
         poc_val = tech_data.get('poc_price_6m', 'N/A')
         diff_poc = round(((poc_val - curr_p) / curr_p) * 100, 1) if isinstance(poc_val, (int, float)) and curr_p else None
-        q_c3.metric("6M 최다 매물대 (POC)", f"${poc_val}", f"현재가 대비 {diff_poc:+.1f}%" if diff_poc is not None else "최대 거래 구간")
+        q_c3.metric("6M 최다 매물대 (POC)", f"${poc_val}", f"현재가 대비 {diff_poc:+.1f}%" if diff_poc is not None else "최대 거래량 구간")
 
         bb_w = tech_data.get('bb_width_pct', 'N/A')
-        q_c4.metric("볼린저 밴드폭", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
+        q_c4.metric("볼린저 밴드폭 (Bandwidth)", f"{bb_w}%" if bb_w != "N/A" else "N/A", "변동성 압축도")
         
-        st.markdown(f"**⚡ 변동성 국면:** `{tech_data.get('bb_squeeze_status', 'N/A')}` | **🧱 70% 핵심 매물대:** `{tech_data.get('value_area_range_6m', 'N/A')}`")
+        st.markdown(f"**⚡ 변동성 국면 판정:** `{tech_data.get('bb_squeeze_status', 'N/A')}` | **🧱 70% 핵심 매물대 밴드:** `{tech_data.get('value_area_range_6m', 'N/A')}`")
 
     if backtest_results:
         with st.container(border=True):
-            st.markdown("##### 🔬 **과거 1년 퀀트 전략 백테스팅 시뮬레이션**")
+            st.markdown("##### 🔬 **과거 1년 퀀트 전략 백테스팅 시뮬레이션 (1-Year Backtest)**")
+            
             bh_ret = backtest_results.get("benchmark_buy_and_hold", 0.0)
-            st.caption(f"📌 **벤치마크 (Buy & Hold 1년 수익률):** `{bh_ret:+.2f}%`")
+            st.caption(f"📌 **벤치마크 (단순 보유 Buy & Hold 1년 수익률):** `{bh_ret:+.2f}%`")
             
             bt_col1, bt_col2 = st.columns(2)
+            
             with bt_col1:
-                st.markdown("**🚀 전략 A: 모멘텀 스퀴즈 돌파**")
+                st.markdown("**🚀 전략 A: 모멘텀 스퀴즈 돌파 (Momentum Squeeze Breakout)**")
+                st.caption("진입: MACD 상방전환 + 20일 이평 및 20일 VWAP 상회 시 | 청산: MACD 꺾임 또는 1.5x ATR 이탈")
                 s1 = backtest_results.get("strategy_1_momentum_squeeze", {})
+                
                 m1_1, m1_2, m1_3 = st.columns(3)
-                m1_1.metric("총 누적 수익률", f"{s1.get('total_ret', 0):+.2f}%")
-                m1_2.metric("승률", f"{s1.get('win_rate', 0)}%", f"총 {s1.get('trades_count', 0)}회")
-                m1_3.metric("Profit Factor", f"{s1.get('profit_factor', 0)}")
+                m1_1.metric("총 누적 수익률", f"{s1.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s1.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
+                m1_2.metric("승률 (Win Rate)", f"{s1.get('win_rate', 0)}%", f"총 {s1.get('trades_count', 0)}회 매매")
+                m1_3.metric("Profit Factor / MDD", f"{s1.get('profit_factor', 0)}", f"MDD: -{s1.get('mdd', 0)}%")
 
             with bt_col2:
-                st.markdown("**🔄 전략 B: 1Y VWAP + RSI 되돌림**")
+                st.markdown("**🔄 전략 B: 1Y VWAP + RSI 밸류 되돌림 (Mean Reversion)**")
+                st.caption("진입: 1Y 누적 VWAP 하회 + RSI 42 이하 + 볼린저 하단 지지 | 청산: VWAP 도달 또는 RSI 65")
                 s2 = backtest_results.get("strategy_2_vwap_mean_reversion", {})
+                
                 m2_1, m2_2, m2_3 = st.columns(3)
-                m2_1.metric("총 누적 수익률", f"{s2.get('total_ret', 0):+.2f}%")
-                m2_2.metric("승률", f"{s2.get('win_rate', 0)}%", f"총 {s2.get('trades_count', 0)}회")
-                m2_3.metric("Profit Factor", f"{s2.get('profit_factor', 0)}")
+                m2_1.metric("총 누적 수익률", f"{s2.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s2.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
+                m2_2.metric("승률 (Win Rate)", f"{s2.get('win_rate', 0)}%", f"총 {s2.get('trades_count', 0)}회 매매")
+                m2_3.metric("Profit Factor / MDD", f"{s2.get('profit_factor', 0)}", f"MDD: -{s2.get('mdd', 0)}%")
 
     with st.container(border=True):
-        st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
+        st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
         fb1, fb2, fb3, fb4 = st.columns(4)
-        f236, f382, f500, f618 = fib_levels.get('fib_23.6%', 'N/A'), fib_levels.get('fib_38.2%', 'N/A'), fib_levels.get('fib_50.0%', 'N/A'), fib_levels.get('fib_61.8%', 'N/A')
         
-        fb1.metric("23.6% 되돌림", f"${f236}")
-        fb2.metric("38.2% 되돌림", f"${f382}")
-        fb3.metric("50.0% 하프라인", f"${f500}")
-        fb4.metric("61.8% 되돌림", f"${f618}")
+        f236 = fib_levels.get('fib_23.6%', 'N/A')
+        f382 = fib_levels.get('fib_38.2%', 'N/A')
+        f500 = fib_levels.get('fib_50.0%', 'N/A')
+        f618 = fib_levels.get('fib_61.8%', 'N/A')
+        
+        fb1.metric("23.6% 되돌림 (단기 지지)", f"${f236}", f"{round(((f236-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f236, (int, float)) and curr_p else None)
+        fb2.metric("38.2% 되돌림 (1차 매수 지지)", f"${f382}", f"{round(((f382-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f382, (int, float)) and curr_p else None)
+        fb3.metric("50.0% 하프라인 (추세 기준선)", f"${f500}", f"{round(((f500-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f500, (int, float)) and curr_p else None)
+        fb4.metric("61.8% 되돌림 (강력한 2차 지지)", f"${f618}", f"{round(((f618-curr_p)/curr_p)*100, 1):+.1f}%" if isinstance(f618, (int, float)) and curr_p else None)
 
     with st.container(border=True):
         if options_data:
             exp_date = options_data['expiration_date']
             pc_rat = options_data['pc_volume_ratio']
-            st.markdown(f"##### 🎯 **옵션 체인 스마트머니 포지션** `만기: {exp_date}` `P/C Ratio: {pc_rat}`")
+            st.markdown(f"##### 🎯 **가장 빠른 만기 옵션 체인 스마트머니 포지션** `만기일: {exp_date}` `P/C Ratio: {pc_rat}`")
+            
             op_c1, op_c2, op_c3, op_c4 = st.columns(4)
-            c_oi, c_vol, p_oi, p_vol = options_data['call_max_oi'], options_data['call_max_vol'], options_data['put_max_oi'], options_data['put_max_vol']
-            op_c1.metric("콜옵션 Max OI", f"${c_oi['strike']}", f"OI: {c_oi['oi']:,}")
-            op_c2.metric("콜옵션 Max Vol", f"${c_vol['strike']}", f"Vol: {c_vol['volume']:,}")
-            op_c3.metric("풋옵션 Max OI", f"${p_oi['strike']}", f"OI: {p_oi['oi']:,}")
-            op_c4.metric("풋옵션 Max Vol", f"${p_vol['strike']}", f"Vol: {p_vol['volume']:,}")
+            c_oi = options_data['call_max_oi']
+            diff_c_oi = round(((c_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_oi['strike'], (int, float)) else None
+            op_c1.metric(
+                "콜옵션 Max OI (상방 저항벽)",
+                f"${c_oi['strike']}",
+                f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,} / ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}"
+            )
+            
+            c_vol = options_data['call_max_vol']
+            diff_c_vol = round(((c_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_vol['strike'], (int, float)) else None
+            op_c2.metric(
+                "콜옵션 Max Vol (당일 상방 수급)",
+                f"${c_vol['strike']}",
+                f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,} / ${c_vol['price']})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}"
+            )
+            
+            p_oi = options_data['put_max_oi']
+            diff_p_oi = round(((p_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_oi['strike'], (int, float)) else None
+            op_c3.metric(
+                "풋옵션 Max OI (하방 지지벽)",
+                f"${p_oi['strike']}",
+                f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,} / ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}"
+            )
+            
+            p_vol = options_data['put_max_vol']
+            diff_p_vol = round(((p_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_vol['strike'], (int, float)) else None
+            op_c4.metric(
+                "풋옵션 Max Vol (당일 하방 헤지)",
+                f"${p_vol['strike']}",
+                f"{diff_p_vol:+.1f}% (Vol: {p_vol['volume']:,} / ${p_vol['price']})" if diff_p_vol is not None else f"Vol: {p_vol['volume']:,}"
+            )
         else:
-            st.markdown(f"##### 🎯 **옵션 체인 포지션**")
-            st.info("해당 자산은 옵션 체인 거래가 지원되지 않습니다.")
+            st.markdown("##### 🎯 **옵션 체인 스마트머니 포지션**")
+            st.info("해당 종목은 옵션 체인 거래 데이터가 없거나 수집되지 않았습니다.")
+
+    with st.container(border=True):
+        st.markdown("##### 🚀 **성장주/빅테크 맞춤형 밸류에이션 모델 (Growth Models)**")
+        g_models = fund_data.get('growth_models', {})
+        g1, g2, g3, g4 = st.columns(4)
+        
+        target_p = fund_data.get('target_mean_price', 'N/A')
+        diff_t = round(((target_p - curr_p) / curr_p) * 100, 1) if isinstance(target_p, (int, float)) and curr_p else None
+        g1.metric("IB 컨센서스 목표가", f"${target_p}" if isinstance(target_p, (int, float)) else str(target_p), f"{diff_t:+.1f}%" if diff_t is not None else None)
+        
+        peg_p = g_models.get('forward_peg', 'N/A')
+        diff_peg = round(((peg_p - curr_p) / curr_p) * 100, 1) if isinstance(peg_p, (int, float)) and curr_p else None
+        g2.metric("Forward PEG 1.5 모델", f"${peg_p}" if isinstance(peg_p, (int, float)) else str(peg_p), f"{diff_peg:+.1f}%" if diff_peg is not None else None)
+        
+        psr_p = g_models.get('psr_target', 'N/A')
+        diff_psr = round(((psr_p - curr_p) / curr_p) * 100, 1) if isinstance(psr_p, (int, float)) and curr_p else None
+        g3.metric("PSR 타깃 매출가치 (5배)", f"${psr_p}" if isinstance(psr_p, (int, float)) else str(psr_p), f"{diff_psr:+.1f}%" if diff_psr is not None else None)
+        
+        dcf_p = g_models.get('dcf_growth', 'N/A')
+        diff_dcf = round(((dcf_p - curr_p) / curr_p) * 100, 1) if isinstance(dcf_p, (int, float)) and curr_p else None
+        g4.metric("2단계 DCF 현금흐름 모델", f"${dcf_p}" if isinstance(dcf_p, (int, float)) else str(dcf_p), f"{diff_dcf:+.1f}%" if diff_dcf is not None else None)
+
+    with st.container(border=True):
+        st.markdown("##### 🏛️ **전통 제조업/자산가치 기반 3대 모델 (Value Models - 청산/장부가치 기준)**")
+        v_models = fund_data.get('value_models', {})
+        v1, v2, v3 = st.columns(3)
+        
+        g_val = v_models.get('graham', 'N/A')
+        diff_g = round(((g_val - curr_p) / curr_p) * 100, 1) if isinstance(g_val, (int, float)) and curr_p else None
+        v1.metric("그레이엄 청산가치", f"${g_val}" if isinstance(g_val, (int, float)) else str(g_val), f"{diff_g:+.1f}%" if diff_g is not None else None)
+        
+        l_val = v_models.get('peter_lynch', 'N/A')
+        diff_l = round(((l_val - curr_p) / curr_p) * 100, 1) if isinstance(l_val, (int, float)) and curr_p else None
+        v2.metric("피터 린치 가치모델", f"${l_val}" if isinstance(l_val, (int, float)) else str(l_val), f"{diff_l:+.1f}%" if diff_l is not None else None)
+        
+        r_val = v_models.get('roe_pbr', 'N/A')
+        diff_r = round(((r_val - curr_p) / curr_p) * 100, 1) if isinstance(r_val, (int, float)) and curr_p else None
+        v3.metric("ROE-PBR 자본가치", f"${r_val}" if isinstance(r_val, (int, float)) else str(r_val), f"{diff_r:+.1f}%" if diff_r is not None else None)
+
+    st.caption(f"🕒 데이터 수집 기준일자: 주가/재무제표 ({res['stock_date']}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
 
     with st.container(border=True):
         head_col1, head_col2 = st.columns([0.65, 0.35])
@@ -1724,10 +1844,24 @@ if st.session_state.last_analysis_result:
         clean_rendered_content = re.sub(r'(?<!\\)\$', r'\$', res["response_content"])
         st.markdown(clean_rendered_content)
 
+    with st.expander("🌐 **6대 유동성 자산 분석 참고 거시 기사 & 원문 링크 (클릭하여 접기/펼치기)**", expanded=False):
+        if res.get("macro_news_data"):
+            for m_item in res.get("macro_news_data", []):
+                st.markdown(f"- **[{m_item['title']}]({m_item['link']})**")
+                if m_item.get("summary"):
+                    st.caption(f"> {m_item['summary']}")
+                st.caption(f"출처: {m_item['publisher']} | 게시일: {m_item['date']}")
+                st.write("")
+        else:
+            st.info("수집된 거시경제 기사가 없습니다.")
+    
+    st.write("")
+
     col_left, col_right = st.columns([0.9, 1.1])
+    
     with col_left:
         with st.container(border=True):
-            st.markdown(f"##### 📰 **{res['ticker']} 최신 뉴스 및 기사 원문**")
+            st.markdown(f"##### 📰 **{res['ticker']} 최신 주요 뉴스 및 기사 원문**")
             if res.get("news_data"):
                 for item in res.get("news_data", []):
                     st.markdown(f"**[{item['title']}]({item['link']})**")
@@ -1740,12 +1874,12 @@ if st.session_state.last_analysis_result:
                 
     with col_right:
         with st.container(border=True):
-            st.markdown(f"##### 🏛️ **{res['ticker']} 증권가 투자의견 변동**")
+            st.markdown(f"##### 🏛️ **{res['ticker']} 최근 2개월 증권가 투자의견 및 목표가 변동**")
             if res.get("analyst_data"):
                 df_analyst = pd.DataFrame(res.get("analyst_data", []))
                 display_cols = ["date", "firm", "tier", "action", "grade_change", "target_price"]
                 df_analyst = df_analyst[[c for c in display_cols if c in df_analyst.columns]]
-                df_analyst.columns = ["일자", "증권사", "신뢰도", "구분", "의견변동", "목표가"]
+                df_analyst.columns = ["일자", "증권사", "기관 신뢰도 등급", "구분", "투자의견 변동", "제시 목표가"]
                 st.dataframe(df_analyst, use_container_width=True, hide_index=True)
             else:
-                st.info("원자재 및 암호화폐 자산은 증권사 투자의견 리포트가 제공되지 않습니다.")
+                st.info("최근 2개월간 등록된 투자의견 변동 내역이 없습니다.")
