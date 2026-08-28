@@ -430,11 +430,8 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
     for attempt in range(retries):
         try:
             stock = yf.Ticker(ticker)
-            expirations = stock.options
+            expirations = getattr(stock, 'options', None)
             if not expirations:
-                if attempt < retries - 1:
-                    time.sleep(1.0 * (attempt + 1))
-                    continue
                 return None
             
             nearest_exp = expirations[0]
@@ -442,7 +439,7 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
             calls = opt_chain.calls
             puts = opt_chain.puts
             
-            if calls.empty or puts.empty:
+            if calls is None or puts is None or calls.empty or puts.empty:
                 if attempt < retries - 1:
                     time.sleep(1.0 * (attempt + 1))
                     continue
@@ -551,8 +548,8 @@ def fetch_hedge_funds_and_short_intel(stock, info):
     }
     
     try:
-        inst_df = stock.institutional_holders
-        if inst_df is not None and not inst_df.empty:
+        inst_df = getattr(stock, 'institutional_holders', None)
+        if inst_df is not None and isinstance(inst_df, pd.DataFrame) and not inst_df.empty:
             for _, row in inst_df.head(6).iterrows():
                 holder_name = str(row.get("Holder", "N/A")).strip()
                 shares_val = row.get("Shares", 0)
@@ -572,10 +569,10 @@ def fetch_hedge_funds_and_short_intel(stock, info):
         pass
 
     try:
-        short_float = info.get("shortPercentOfFloat", None)
-        short_ratio = info.get("shortRatio", None)
-        shares_short = info.get("sharesShort", None)
-        shares_short_prior = info.get("sharesShortPriorMonth", None)
+        short_float = info.get("shortPercentOfFloat", None) if isinstance(info, dict) else None
+        short_ratio = info.get("shortRatio", None) if isinstance(info, dict) else None
+        shares_short = info.get("sharesShort", None) if isinstance(info, dict) else None
+        shares_short_prior = info.get("sharesShortPriorMonth", None) if isinstance(info, dict) else None
 
         short_float_pct = round(short_float * 100, 2) if short_float is not None else None
         short_ratio_days = round(short_ratio, 2) if short_ratio is not None else None
@@ -584,7 +581,7 @@ def fetch_hedge_funds_and_short_intel(stock, info):
         if shares_short and shares_short_prior and shares_short_prior > 0:
             short_mom_pct = round(((shares_short - shares_short_prior) / shares_short_prior) * 100, 2)
 
-        squeeze_risk = "🟢 안정 (Low Risk)"
+        squeeze_risk = "해당없음 (원자재/코인/지수)" if not short_float_pct and not short_ratio_days else "🟢 안정 (Low Risk)"
         if short_float_pct is not None and short_ratio_days is not None:
             if short_float_pct >= 20.0 and short_ratio_days >= 5.0:
                 squeeze_risk = "🚨 숏스퀴즈 고위험 (High Squeeze Potential)"
@@ -626,22 +623,23 @@ def fetch_ownership_and_shorts(stock, info):
         "inst_trans": "N/A"
     }
     try:
-        ins_own_val = info.get("heldPercentInsiders", None)
-        if ins_own_val is not None:
-            data["insider_own"] = f"{ins_own_val * 100:.2f}%"
-            
-        inst_own_val = info.get("heldPercentInstitutions", None)
-        if inst_own_val is not None:
-            data["inst_own"] = f"{inst_own_val * 100:.2f}%"
+        if isinstance(info, dict):
+            ins_own_val = info.get("heldPercentInsiders", None)
+            if ins_own_val is not None:
+                data["insider_own"] = f"{ins_own_val * 100:.2f}%"
+                
+            inst_own_val = info.get("heldPercentInstitutions", None)
+            if inst_own_val is not None:
+                data["inst_own"] = f"{inst_own_val * 100:.2f}%"
     except Exception:
         pass
 
     try:
-        ins_df = stock.insider_transactions
-        if ins_df is not None and not ins_df.empty and 'Shares' in ins_df.columns:
+        ins_df = getattr(stock, 'insider_transactions', None)
+        if ins_df is not None and isinstance(ins_df, pd.DataFrame) and not ins_df.empty and 'Shares' in ins_df.columns:
             recent_ins = ins_df.head(15)
             net_shares = recent_ins['Shares'].dropna().sum()
-            shares_out = info.get("sharesOutstanding", None)
+            shares_out = info.get("sharesOutstanding", None) if isinstance(info, dict) else None
             if shares_out and shares_out > 0:
                 trans_pct = (net_shares / shares_out) * 100
                 data["insider_trans"] = f"{trans_pct:+.2f}%"
@@ -651,11 +649,11 @@ def fetch_ownership_and_shorts(stock, info):
         pass
 
     try:
-        inst_df = stock.institutional_holders
-        if inst_df is not None and not inst_df.empty and '% Out' in inst_df.columns:
+        inst_df = getattr(stock, 'institutional_holders', None)
+        if inst_df is not None and isinstance(inst_df, pd.DataFrame) and not inst_df.empty and '% Out' in inst_df.columns:
             tot_pct = inst_df['% Out'].sum() * 100
             data["inst_trans"] = f"{tot_pct:.2f}% (Top10)"
-        elif inst_df is not None and not inst_df.empty and 'Shares' in inst_df.columns:
+        elif inst_df is not None and isinstance(inst_df, pd.DataFrame) and not inst_df.empty and 'Shares' in inst_df.columns:
             tot_shares = inst_df['Shares'].sum()
             data["inst_trans"] = f"{tot_shares:,.0f}주 (Top10)"
     except Exception:
@@ -664,10 +662,10 @@ def fetch_ownership_and_shorts(stock, info):
     return data
 
 def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
-    earnings_date_str = "미정"
+    earnings_date_str = "해당없음 (원자재/코인/지수)"
     d_day_str = ""
     try:
-        cal = stock.calendar
+        cal = getattr(stock, 'calendar', None)
         if cal is not None and isinstance(cal, dict) and 'Earnings Date' in cal:
             e_dates = cal['Earnings Date']
             if isinstance(e_dates, list) and e_dates:
@@ -686,8 +684,8 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
     except Exception:
         pass
 
-    high_52w = info.get("fiftyTwoWeekHigh", None) or high_52_calc
-    low_52w = info.get("fiftyTwoWeekLow", None) or low_52_calc
+    high_52w = (info.get("fiftyTwoWeekHigh", None) if isinstance(info, dict) else None) or high_52_calc
+    low_52w = (info.get("fiftyTwoWeekLow", None) if isinstance(info, dict) else None) or low_52_calc
 
     return {
         "earnings_date": earnings_date_str,
@@ -707,28 +705,48 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     except Exception:
         pass
 
-    market_cap = info.get("marketCap", None)
+    market_cap = info.get("marketCap", None) if isinstance(info, dict) else None
     if not market_cap and fast_info:
-        market_cap = getattr(fast_info, 'market_cap', None) or fast_info.get('market_cap', "N/A")
+        market_cap = getattr(fast_info, 'market_cap', None) or (fast_info.get('market_cap', "N/A") if isinstance(fast_info, dict) else "N/A")
 
-    trailing_pe = info.get("trailingPE", "N/A")
-    forward_pe = info.get("forwardPE", "N/A")
-    pbr = info.get("priceToBook", "N/A")
-    ps_ratio = info.get("priceToSalesTrailing12Months", "N/A")
+    trailing_pe = info.get("trailingPE", "N/A") if isinstance(info, dict) else "N/A"
+    forward_pe = info.get("forwardPE", "N/A") if isinstance(info, dict) else "N/A"
+    pbr = info.get("priceToBook", "N/A") if isinstance(info, dict) else "N/A"
+    ps_ratio = info.get("priceToSalesTrailing12Months", "N/A") if isinstance(info, dict) else "N/A"
     
-    roe_raw = info.get("returnOnEquity", None)
+    roe_raw = info.get("returnOnEquity", None) if isinstance(info, dict) else None
     roe_pct = round(roe_raw * 100, 2) if roe_raw is not None else "N/A"
-    eps = info.get("trailingEps", None)
-    forward_eps = info.get("forwardEps", None)
-    bps = info.get("bookValue", None)
-    revenue_per_share = info.get("revenuePerShare", None)
-    target_mean_price = info.get("targetMeanPrice", "N/A")
+    eps = info.get("trailingEps", None) if isinstance(info, dict) else None
+    forward_eps = info.get("forwardEps", None) if isinstance(info, dict) else None
+    bps = info.get("bookValue", None) if isinstance(info, dict) else None
+    revenue_per_share = info.get("revenuePerShare", None) if isinstance(info, dict) else None
+    target_mean_price = info.get("targetMeanPrice", "N/A") if isinstance(info, dict) else "N/A"
+
+    # 📌 우량성 & 펀더멘털 정밀 검증 팩터 (FCF, D/E, Gross Margin, Operating Margin)
+    fcf_raw = info.get("freeCashflow", None) if isinstance(info, dict) else None
+    fcf_fmt = format_market_cap(fcf_raw) if fcf_raw else "N/A"
+    
+    de_ratio = info.get("debtToEquity", None) if isinstance(info, dict) else None
+    de_fmt = f"{de_ratio:.2f}%" if isinstance(de_ratio, (int, float)) else "N/A"
+    
+    gross_margin = info.get("grossMargins", None) if isinstance(info, dict) else None
+    gross_margin_fmt = f"{gross_margin * 100:.2f}%" if isinstance(gross_margin, (int, float)) else "N/A"
+    
+    op_margin = info.get("operatingMargins", None) if isinstance(info, dict) else None
+    op_margin_fmt = f"{op_margin * 100:.2f}%" if isinstance(op_margin, (int, float)) else "N/A"
+
+    quality_factors = {
+        "free_cash_flow": fcf_fmt,
+        "debt_to_equity": de_fmt,
+        "gross_margin": gross_margin_fmt,
+        "operating_margin": op_margin_fmt
+    }
 
     ownership_and_shorts = fetch_ownership_and_shorts(stock, info)
     hedge_and_short_intel = fetch_hedge_funds_and_short_intel(stock, info)
     earnings_cal = fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc)
 
-    earnings_growth = info.get("earningsGrowth", None)
+    earnings_growth = info.get("earningsGrowth", None) if isinstance(info, dict) else None
     if earnings_growth and earnings_growth > 0:
         est_growth = min(earnings_growth * 100, 35.0)
     else:
@@ -737,9 +755,9 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     def _value_model_sanity(value, label):
         try:
             if not isinstance(value, (int, float)):
+                return "산출불가 (재무제표 미존재/해당없음)"
+            if not isinstance(curr_price, (int, float)) or curr_price <= 0:
                 return "산출불가"
-            if not curr_price or curr_price <= 0:
-                return value
             deviation = abs(value - curr_price) / curr_price
             high_per = isinstance(trailing_pe, (int, float)) and trailing_pe >= 60.0
             if deviation > 0.6 and high_per:
@@ -748,7 +766,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
                 return f"산출불가 (모델 괴리율 과다: {deviation*100:.0f}%)"
             return value
         except Exception:
-            return "산출불가"
+            return "산출불가 (해당없음)"
 
     value_models = {}
     try:
@@ -756,33 +774,35 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
             raw_graham = round(math.sqrt(22.5 * float(eps) * float(bps)), 2)
             value_models["graham"] = _value_model_sanity(raw_graham, "graham")
         else:
-            value_models["graham"] = "산출불가"
+            value_models["graham"] = "산출불가 (해당없음)"
     except Exception:
-        value_models["graham"] = "산출불가"
+        value_models["graham"] = "산출불가 (해당없음)"
 
     try:
         if eps and eps > 0 and roe_raw and roe_raw > 0:
             raw_lynch = round(float(eps) * min(float(roe_raw) * 100, 25.0), 2)
             value_models["peter_lynch"] = _value_model_sanity(raw_lynch, "peter_lynch")
         else:
-            value_models["peter_lynch"] = "산출불가"
+            value_models["peter_lynch"] = "산출불가 (해당없음)"
     except Exception:
-        value_models["peter_lynch"] = "산출불가"
+        value_models["peter_lynch"] = "산출불가 (해당없음)"
 
     try:
         if bps and bps > 0 and roe_raw and roe_raw > 0:
             raw_roe_pbr = round(float(bps) * (float(roe_raw) / 0.10), 2)
             value_models["roe_pbr"] = _value_model_sanity(raw_roe_pbr, "roe_pbr")
         else:
-            value_models["roe_pbr"] = "산출불가"
+            value_models["roe_pbr"] = "산출불가 (해당없음)"
     except Exception:
-        value_models["roe_pbr"] = "산출불가"
+        value_models["roe_pbr"] = "산출불가 (해당없음)"
 
     used_growth_fallback = not (earnings_growth and earnings_growth > 0)
 
     def _sanity_capped(value, label):
         try:
-            if not isinstance(value, (int, float)) or not curr_price or curr_price <= 0:
+            if not isinstance(value, (int, float)):
+                return "산출불가 (해당없음)"
+            if not isinstance(curr_price, (int, float)) or curr_price <= 0:
                 return "산출불가"
             deviation = abs(value - curr_price) / curr_price
             if deviation > 0.6:
@@ -791,7 +811,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
                 return f"{value} (참고용·추정성장률 가정치)"
             return value
         except Exception:
-            return "산출불가"
+            return "산출불가 (해당없음)"
 
     growth_models = {}
     f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
@@ -800,18 +820,18 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
             raw_peg = round(float(f_eps) * (est_growth * 1.5), 2)
             growth_models["forward_peg"] = _sanity_capped(raw_peg, "forward_peg")
         else:
-            growth_models["forward_peg"] = "산출불가"
+            growth_models["forward_peg"] = "산출불가 (해당없음)"
     except Exception:
-        growth_models["forward_peg"] = "산출불가"
+        growth_models["forward_peg"] = "산출불가 (해당없음)"
 
     try:
         if revenue_per_share and revenue_per_share > 0:
             raw_psr = round(float(revenue_per_share) * 5.0, 2)
             growth_models["psr_target"] = _sanity_capped(raw_psr, "psr_target")
         else:
-            growth_models["psr_target"] = "산출불가"
+            growth_models["psr_target"] = "산출불가 (해당없음)"
     except Exception:
-        growth_models["psr_target"] = "산출불가"
+        growth_models["psr_target"] = "산출불가 (해당없음)"
 
     try:
         if f_eps and f_eps > 0:
@@ -827,9 +847,9 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
             raw_dcf = round(pv_sum + pv_terminal, 2)
             growth_models["dcf_growth"] = _sanity_capped(raw_dcf, "dcf_growth")
         else:
-            growth_models["dcf_growth"] = "산출불가"
+            growth_models["dcf_growth"] = "산출불가 (해당없음)"
     except Exception:
-        growth_models["dcf_growth"] = "산출불가"
+        growth_models["dcf_growth"] = "산출불가 (해당없음)"
 
     return {
         "info_source": info_source,
@@ -840,6 +860,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         "ps_ratio": round(ps_ratio, 2) if isinstance(ps_ratio, (int, float)) else ps_ratio,
         "roe": f"{roe_pct}%" if roe_pct != "N/A" else "N/A",
         "target_mean_price": target_mean_price,
+        "quality_factors": quality_factors,
         "ownership_and_shorts": ownership_and_shorts,
         "hedge_and_short_intel": hedge_and_short_intel,
         "earnings_calendar": earnings_cal,
@@ -886,7 +907,7 @@ def fetch_sector_performance():
 def fetch_news(ticker: str, limit: int = 5):
     try:
         stock = yf.Ticker(ticker)
-        raw_news = stock.news
+        raw_news = getattr(stock, 'news', None)
         if not raw_news:
             return []
             
@@ -927,7 +948,7 @@ def fetch_macro_news(limit: int = 4):
     for sym in ["SPY", "TLT"]:
         try:
             stock = yf.Ticker(sym)
-            raw = stock.news
+            raw = getattr(stock, 'news', None)
             if raw:
                 for n in raw[:2]:
                     content = n.get("content", {})
