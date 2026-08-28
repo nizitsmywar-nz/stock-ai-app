@@ -999,10 +999,8 @@ def summarize_user_strategy(raw_text: str) -> str:
         return "분석 리포트 참조"
         
     text = raw_text.replace("\n", " ").strip()
-    # 연속 공백 제거
     text = re.sub(r'\s+', ' ', text)
     
-    # 문장이 너무 길 경우 300자 내외로 자연스럽게 정돈
     if len(text) > 300:
         sentences = [s.strip() for s in re.split(r'(?<=[.!?])\s+', text) if len(s.strip()) > 3]
         collected = []
@@ -1017,7 +1015,7 @@ def summarize_user_strategy(raw_text: str) -> str:
     return text
 
 # -------------------------------------------------------------
-# 📌 신규 진입 적격성 평가 파서
+# 📌 신규 진입 적격성 평가 및 매매 시나리오 파서
 # -------------------------------------------------------------
 def parse_full_trading_scenario(text):
     action = "홀딩"
@@ -1030,6 +1028,17 @@ def parse_full_trading_scenario(text):
     stop_loss = "분석 리포트 참조"
     pyramiding = ""
     user_strategy_raw = ""
+    quality_badge = ""
+
+    # 0. 스코어카드 종합 평점 및 우량성 이모지 추출
+    if "최상위 핵심 우량주" in text or "👑" in text:
+        quality_badge = "👑 "
+    elif "적격 우량주" in text or "🥇" in text:
+        quality_badge = "🥇 "
+    elif "조건부 종목" in text or "⚠️" in text:
+        quality_badge = "⚠️ "
+    elif "비우량주" in text or "🚨" in text:
+        quality_badge = "🚨 "
 
     # 1. 최종 투자의견 액션 판정
     match_action = re.search(r"(?:최종\s*투자의견|최종투자\s*의견)[^:\n]*[:\-]?\s*([^\n\r]+)", text)
@@ -1043,7 +1052,6 @@ def parse_full_trading_scenario(text):
             action = "홀딩"
 
     # 2. [신규 진입 적격성 평가] 전용 섹션 파싱
-    entry_block = ""
     match_entry_sec = re.search(r"\[신규\s*진입\s*적격성\s*평가\](.*?)(?=\[(?:정밀\s*매매\s*시나리오|최종\s*투자의견)|\Z)", text, re.DOTALL)
     if match_entry_sec:
         entry_block = match_entry_sec.group(1)
@@ -1056,38 +1064,28 @@ def parse_full_trading_scenario(text):
                 if ":" in line_clean:
                     entry_rr = ":".join(line_clean.split(":")[1:]).strip()
 
-    # 3. [정밀 매매 시나리오] 전용 섹션 엄격 분리 파싱 (하단 7번 섹션 혼입 원천 차단)
-    scenario_block = ""
+    # 3. [정밀 매매 시나리오] 전용 섹션 엄격 분리 파싱
     match_scen_sec = re.search(r"\[정밀\s*매매\s*시나리오\](.*?)(?=\[(?:최종\s*투자의견)|\Z)", text, re.DOTALL)
-    if match_scen_sec:
-        scenario_block = match_scen_sec.group(1)
-    else:
-        scenario_block = text
+    scenario_block = match_scen_sec.group(1) if match_scen_sec else text
 
     for line in scenario_block.split("\n"):
         line_clean = line.replace("*", "").replace("-", "").replace("•", "").strip()
         
-        # 1차 목표가
         if ("1차 목표가" in line_clean or "1차목표가" in line_clean) and target_1 == "분석 리포트 참조":
             if ":" in line_clean:
                 target_1 = ":".join(line_clean.split(":")[1:]).strip()
-        # 2차 목표가
         elif ("2차 목표가" in line_clean or "2차목표가" in line_clean) and not target_2:
             if ":" in line_clean:
                 target_2 = ":".join(line_clean.split(":")[1:]).strip()
-        # 매도가 밴드
         elif ("매도가 밴드" in line_clean or "비중축소" in line_clean or "매도가" in line_clean) and sell_target == "분석 리포트 참조":
             if ":" in line_clean:
                 sell_target = ":".join(line_clean.split(":")[1:]).strip()
-        # 분할 매수 밴드
         elif ("분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean) and buy_band == "분석 리포트 참조":
             if ":" in line_clean:
                 buy_band = ":".join(line_clean.split(":")[1:]).strip()
-        # 손절선
         elif ("손절" in line_clean or "Stop-loss" in line_clean) and stop_loss == "분석 리포트 참조":
             if ":" in line_clean:
                 stop_loss = ":".join(line_clean.split(":")[1:]).strip()
-        # 불타기 조건
         elif ("불타기 조건" in line_clean or "불타기" in line_clean) and not pyramiding:
             if ":" in line_clean:
                 pyramiding = ":".join(line_clean.split(":")[1:]).strip()
@@ -1119,7 +1117,7 @@ def parse_full_trading_scenario(text):
         user_strategy_raw = " ".join(strategy_lines)
 
     user_strategy_summary = summarize_user_strategy(user_strategy_raw)
-    return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary
+    return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_summary, quality_badge
 
 # -------------------------------------------------------------
 # 📌 증권사 투자의견, 목표가 & 티어 분류기
@@ -1243,7 +1241,9 @@ with st.sidebar:
         
         def render_history_card(t_code, data):
             action_badge = "🟢 매수" if data['action'] == "매수" else ("🔴 매도" if data['action'] == "매도" else "🟡 홀딩")
-            with st.expander(f"**{t_code}** (${data['price']}) | {action_badge}", expanded=False):
+            q_badge = data.get('quality_badge', '')
+            
+            with st.expander(f"{q_badge}**{t_code}** (${data['price']}) | {action_badge}", expanded=False):
                 st.markdown(f"- **현재가:** `${data['price']}`")
                 
                 entry_grade_val = data.get('entry_grade', '')
@@ -1468,6 +1468,11 @@ if analyze_btn:
   * 결론적으로 두 전략 중 하나라도 벤치마크를 밑돌면, "이 종목은 기술적 타이밍 매매보다 단순 보유(Buy & Hold)가 더 유리했다"는 취지의 문장을 반드시 포함할 것.
 - **[밸류에이션 이상치 검증 원칙 (필수)]**: 밸류에이션 모델 값에 "산출불가", "모델 괴리율 과다", "참고용", "해당없음" 등의 문구가 포함되어 있으면 이를 유효한 목표가처럼 서술하지 말고, 왜 신뢰할 수 없는지(예: 원자재/코인 자산으로 재무제표 부재, 고PER 성장주에 자산가치 모델 적용, 현재가 대비 비현실적 괴리)를 밝히고 해당 모델은 판단에서 제외할 것. PBR이 음수인 경우도 그 원인을 짚고 액면 그대로 해석하지 말 것.
 - 스코어카드 (각 10점 만점): 성장성, 수익성(FCF 및 마진율 반영), 밸류에이션, 해자, 퀀트/모멘텀 | 종합 평점 제시
+  * **[우량성 등급 필수 명시]**: 종합 평점 뒤에 반드시 점수 구간별 판정 등급과 이모지를 함께 표기할 것:
+    - 8.5점 ~ 10.0점: `종합 평점: X.X/10 (👑 최상위 핵심 우량주)`
+    - 7.5점 ~ 8.4점: `종합 평점: X.X/10 (🥇 적격 우량주)`
+    - 6.0점 ~ 7.4점: `종합 평점: X.X/10 (⚠️ 조건부 종목)`
+    - 6.0점 미만: `종합 평점: X.X/10 (🚨 비우량주)`
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
 - **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망/리스크 과다) 중 택1]
@@ -1548,11 +1553,12 @@ if analyze_btn:
                 response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
         if response_content and not response_content.startswith("⚠️"):
-            act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary = parse_full_trading_scenario(response_content)
+            act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary, q_badge = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
                 "action": act,
                 "entry_grade": ent_grade,
                 "entry_rr": ent_rr,
+                "quality_badge": q_badge,
                 "price": curr_p,
                 "my_avg": user_avg_price if is_holding else 0,
                 "my_return": my_return_str if is_holding else "미보유",
