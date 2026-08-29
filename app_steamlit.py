@@ -166,6 +166,7 @@ def fetch_stock_technical_data(ticker: str):
         df['BB_Upper'] = bb.bollinger_hband()
         df['BB_Lower'] = bb.bollinger_lband()
         df['BB_Mid'] = bb.bollinger_mavg()
+        df['BB_Width'] = ((df['BB_Upper'] - df['BB_Lower']) / df['BB_Mid']) * 100
         
         # 5. 볼린저 밴드 스퀴즈 (BB Width vs Keltner Channels)
         kc = ta.volatility.KeltnerChannel(df['High'], df['Low'], df['Close'], window=20)
@@ -181,6 +182,7 @@ def fetch_stock_technical_data(ticker: str):
         cum_vol = df['Volume'].cumsum()
         cum_tp_vol = (typical_price * df['Volume']).cumsum()
         df['VWAP_1Y'] = np.where(cum_vol > 0, cum_tp_vol / cum_vol, df['Close'])
+        df['Cumulative_VWAP'] = df['VWAP_1Y']  # 백테스팅 호환용 컬럼 매핑
         
         df['Typical_Price'] = typical_price
         df['TP_Vol_20'] = (typical_price * df['Volume']).rolling(window=20).sum()
@@ -220,14 +222,19 @@ def fetch_stock_technical_data(ticker: str):
             "macd": round(float(latest['MACD']), 2) if pd.notnull(latest['MACD']) else "N/A",
             "macd_signal": round(float(latest['MACD_Signal']), 2) if pd.notnull(latest['MACD_Signal']) else "N/A",
             "macd_diff": round(float(latest['MACD_Diff']), 2) if pd.notnull(latest['MACD_Diff']) else "N/A",
+            "macd_hist": round(float(latest['MACD_Diff']), 2) if pd.notnull(latest['MACD_Diff']) else "N/A",
             "bb_upper": round(float(latest['BB_Upper']), 2) if pd.notnull(latest['BB_Upper']) else "N/A",
             "bb_lower": round(float(latest['BB_Lower']), 2) if pd.notnull(latest['BB_Lower']) else "N/A",
             "bb_mid": round(float(latest['BB_Mid']), 2) if pd.notnull(latest['BB_Mid']) else "N/A",
+            "bb_width_pct": round(float(latest['BB_Width']), 2) if pd.notnull(latest['BB_Width']) else "N/A",
             "bb_squeeze_on": bool(latest['BB_Squeeze']) if pd.notnull(latest['BB_Squeeze']) else False,
+            "bb_squeeze_status": "🔥 Squeeze On (변동성 압축)" if (pd.notnull(latest['BB_Squeeze']) and latest['BB_Squeeze']) else "일반 상태",
             "atr_14": round(float(latest['ATR']), 2) if pd.notnull(latest['ATR']) else "N/A",
             "atr_stop_2_0x": round(float(latest['Close']) - (2.0 * float(latest['ATR'])), 2) if pd.notnull(latest['ATR']) else "N/A",
             "vwap_1y": round(float(latest['VWAP_1Y']), 2) if pd.notnull(latest['VWAP_1Y']) else "N/A",
-            "vwap_20d": round(float(latest['VWAP_20D']), 2) if pd.notnull(latest['VWAP_20D']) else "N/A"
+            "vwap_20d": round(float(latest['VWAP_20D']), 2) if pd.notnull(latest['VWAP_20D']) else "N/A",
+            "poc_price_6m": vol_profile.get("poc_price", "N/A"),
+            "value_area_range_6m": f"${vol_profile.get('val_price', 'N/A')} ~ ${vol_profile.get('vah_price', 'N/A')}" if "val_price" in vol_profile else "N/A"
         }
         
         return tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, df, vol_profile
@@ -294,35 +301,44 @@ def run_strategy_backtest(raw_df: pd.DataFrame):
         
     df = raw_df.copy()
     
-    # 전략 1: 골든크로스 / 데드크로스 (SMA 20 & SMA 50)
-    df['sig_cross'] = 0
-    df.loc[df['SMA_20'] > df['SMA_50'], 'sig_cross'] = 1
-    df['pos_cross'] = df['sig_cross'].shift(1).fillna(0)
-    df['ret_cross'] = df['pos_cross'] * df['Close'].pct_change().fillna(0)
+    # 누락 방지: 필요한 컬럼 확인 및 결측치 제거
+    required_cols = ['Close', 'SMA_20', 'SMA_50', 'BB_Lower', 'BB_Mid']
+    avail_cols = [c for c in required_cols if c in df.columns]
+    if len(avail_cols) < len(required_cols):
+        return {}
+    b_df = df.dropna(subset=avail_cols).copy()
+    if len(b_df) < 20:
+        return {}
+    
+    # 전략 1: 골든크로스 / 모멘텀 (SMA 20 & SMA 50)
+    b_df['sig_cross'] = 0
+    b_df.loc[b_df['SMA_20'] > b_df['SMA_50'], 'sig_cross'] = 1
+    b_df['pos_cross'] = b_df['sig_cross'].shift(1).fillna(0)
+    b_df['ret_cross'] = b_df['pos_cross'] * b_df['Close'].pct_change().fillna(0)
     
     # 전략 2: 볼린저 밴드 하단 반등 매매 (Mean Reversion)
-    df['sig_bb'] = 0
-    df.loc[df['Close'] < df['BB_Lower'], 'sig_bb'] = 1
-    df.loc[df['Close'] > df['BB_Mid'], 'sig_bb'] = 0
-    df['sig_bb'] = df['sig_bb'].ffill().fillna(0)
-    df['pos_bb'] = df['sig_bb'].shift(1).fillna(0)
-    df['ret_bb'] = df['pos_bb'] * df['Close'].pct_change().fillna(0)
+    b_df['sig_bb'] = 0
+    b_df.loc[b_df['Close'] < b_df['BB_Lower'], 'sig_bb'] = 1
+    b_df.loc[b_df['Close'] > b_df['BB_Mid'], 'sig_bb'] = 0
+    b_df['sig_bb'] = b_df['sig_bb'].ffill().fillna(0)
+    b_df['pos_bb'] = b_df['sig_bb'].shift(1).fillna(0)
+    b_df['ret_bb'] = b_df['pos_bb'] * b_df['Close'].pct_change().fillna(0)
     
     # 벤치마크: 단순 보유 수익률 (Buy & Hold)
-    b_start = df['Close'].iloc[0]
-    b_end = df['Close'].iloc[-1]
+    b_start = b_df['Close'].iloc[0]
+    b_end = b_df['Close'].iloc[-1]
     b_ret = ((b_end - b_start) / b_start) * 100
     
     def calc_stats(ret_series, pos_series):
         cum_ret = (np.prod(1 + ret_series) - 1) * 100
-        trades = (pos_series.diff() != 0).sum()
-        win_days = (ret_series > 0).sum()
-        loss_days = (ret_series < 0).sum()
-        win_rate = (win_days / (win_days + loss_days) * 100) if (win_days + loss_days) > 0 else 0
-        return round(float(cum_ret), 2), int(trades), round(float(win_rate), 1)
+        trades = int((pos_series.diff() != 0).sum())
+        win_days = int((ret_series > 0).sum())
+        loss_days = int((ret_series < 0).sum())
+        win_rate = (win_days / (win_days + loss_days) * 100) if (win_days + loss_days) > 0 else 0.0
+        return round(float(cum_ret), 2), trades, round(float(win_rate), 1)
         
-    c_ret, c_trades, c_win = calc_stats(df['ret_cross'], df['pos_cross'])
-    bb_ret, bb_trades, bb_win = calc_stats(df['ret_bb'], df['pos_bb'])
+    c_ret, c_trades, c_win = calc_stats(b_df['ret_cross'], b_df['pos_cross'])
+    bb_ret, bb_trades, bb_win = calc_stats(b_df['ret_bb'], b_df['pos_bb'])
     
     return {
         "benchmark_buy_and_hold": f"{b_ret:+.2f}%",
@@ -332,6 +348,17 @@ def run_strategy_backtest(raw_df: pd.DataFrame):
             "win_rate": f"{c_win}%"
         },
         "strategy_bb_reversion": {
+            "total_ret": f"{bb_ret:+.2f}%",
+            "trades_count": bb_trades,
+            "win_rate": f"{bb_win}%"
+        },
+        # UI 및 이전 호환용 별칭 키
+        "strategy_1_momentum_squeeze": {
+            "total_ret": f"{c_ret:+.2f}%",
+            "trades_count": c_trades,
+            "win_rate": f"{c_win}%"
+        },
+        "strategy_2_vwap_mean_reversion": {
             "total_ret": f"{bb_ret:+.2f}%",
             "trades_count": bb_trades,
             "win_rate": f"{bb_win}%"
@@ -401,70 +428,6 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
             return {}
     return {}
     
-    
-# -------------------------------------------------------------
-# 📌 가장 빠른 만기 옵션 체인 수급 & 개별 종목 PCR / 감마스퀴즈 지표
-# -------------------------------------------------------------
-def fetch_nearest_options_data(ticker: str, retries: int = 3):
-    for attempt in range(retries):
-        try:
-            stock = yf.Ticker(ticker)
-            expirations = stock.options
-            if not expirations:
-                return {}
-                
-            nearest_exp = expirations[0]
-            chain = stock.option_chain(nearest_exp)
-            
-            calls = chain.calls
-            puts = chain.puts
-            
-            if calls.empty and puts.empty:
-                return {}
-                
-            call_max_oi_strike = float(calls.loc[calls['openInterest'].idxmax()]['strike']) if not calls.empty and calls['openInterest'].max() > 0 else 0.0
-            put_max_oi_strike = float(puts.loc[puts['openInterest'].idxmax()]['strike']) if not puts.empty and puts['openInterest'].max() > 0 else 0.0
-            
-            tot_call_vol = int(calls['volume'].sum()) if not calls.empty and pd.notnull(calls['volume'].sum()) else 0
-            tot_put_vol = int(puts['volume'].sum()) if not puts.empty and pd.notnull(puts['volume'].sum()) else 0
-            
-            tot_call_oi = int(calls['openInterest'].sum()) if not calls.empty and pd.notnull(calls['openInterest'].sum()) else 0
-            tot_put_oi = int(puts['openInterest'].sum()) if not puts.empty and pd.notnull(puts['openInterest'].sum()) else 0
-            
-            # 개별 종목 옵션 PCR (Volume & OI 기준) 및 감마 수급 쏠림 분석
-            pcr_vol = round(tot_put_vol / tot_call_vol, 2) if tot_call_vol > 0 else "N/A"
-            pcr_oi = round(tot_put_oi / tot_call_oi, 2) if tot_call_oi > 0 else "N/A"
-            
-            pcr_status_oi = "중립"
-            if isinstance(pcr_oi, (int, float)):
-                if pcr_oi <= 0.45:
-                    pcr_status_oi = "🚨 극단적 콜 집중 (감마 스퀴즈 발화 가능성 또는 단기 과열)"
-                elif pcr_oi <= 0.65:
-                    pcr_status_oi = "🟢 상방(콜) 우위 (스마트머니 상방 베팅)"
-                elif pcr_oi >= 1.20:
-                    pcr_status_oi = "⚠️ 하방(풋) 헷지 급증 (하락 대비 및 실적 방어 포지셔닝)"
-                else:
-                    pcr_status_oi = "⚖️ 균형 (중립)"
-
-            return {
-                "nearest_expiration": nearest_exp,
-                "call_total_volume": tot_call_vol,
-                "put_total_volume": tot_put_vol,
-                "call_total_oi": tot_call_oi,
-                "put_total_oi": tot_put_oi,
-                "pcr_volume": pcr_vol,
-                "pcr_open_interest": pcr_oi,
-                "pcr_oi_status": pcr_status_oi,
-                "call_max_oi_strike": call_max_oi_strike,
-                "put_max_oi_strike": put_max_oi_strike
-            }
-        except Exception:
-            if attempt < retries - 1:
-                time.sleep(1)
-                continue
-            return {}
-    return {}
-
 # =============================================================================
 # [BLOCK 05] 퀀트 전략 백테스팅 엔진
 # =============================================================================
