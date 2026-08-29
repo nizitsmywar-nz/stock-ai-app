@@ -499,112 +499,152 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
     return {}
     
 # =============================================================================
-# [BLOCK 05] 퀀트 전략 백테스팅 엔진
+# [BLOCK 05] 거시 지표 6종 및 S&P 500 11개 섹터 실시간 수급
 # =============================================================================
 # -------------------------------------------------------------
-# 📌 정밀 전략 백테스팅 모듈 (1Y 일봉 기반)
+# 📌 6대 유동성/매크로 핵심 지표 수집기 (FRED API & Yahoo 백업)
 # -------------------------------------------------------------
-def run_strategy_backtest(df: pd.DataFrame):
-    if df is None or len(df) < 60:
-        return None
-
-    b_df = df.copy().dropna(subset=['Close', 'SMA_20', 'MACD', 'MACD_Signal', 'ATR', 'Cumulative_VWAP'])
-    if len(b_df) < 30:
-        return None
-
-    bh_return = (b_df['Close'].iloc[-1] - b_df['Close'].iloc[0]) / b_df['Close'].iloc[0] * 100
-
-    pos1 = 0
-    entry_p1 = 0
-    trades1 = []
-
-    for i in range(1, len(b_df)):
-        cur = b_df.iloc[i]
-        prev = b_df.iloc[i-1]
-        
-        if pos1 == 1:
-            stop_price = entry_p1 - (1.5 * cur['ATR']) if pd.notnull(cur['ATR']) else entry_p1 * 0.93
-            if cur['Close'] < stop_price or cur['MACD_Hist'] < 0:
-                ret = (cur['Close'] - entry_p1) / entry_p1
-                trades1.append(ret)
-                pos1 = 0
-                entry_p1 = 0
-        
-        if pos1 == 0:
-            cond_macd = (prev['MACD_Hist'] <= 0 and cur['MACD_Hist'] > 0)
-            cond_trend = cur['Close'] > cur['SMA_20']
-            cond_vwap = cur['Close'] > cur['Rolling_VWAP_20'] if pd.notnull(cur['Rolling_VWAP_20']) else True
-            if cond_macd and cond_trend and cond_vwap:
-                pos1 = 1
-                entry_p1 = cur['Close']
-
-    if pos1 == 1:
-        ret = (b_df['Close'].iloc[-1] - entry_p1) / entry_p1
-        trades1.append(ret)
-
-    pos2 = 0
-    entry_p2 = 0
-    trades2 = []
-
-    for i in range(1, len(b_df)):
-        cur = b_df.iloc[i]
-        
-        if pos2 == 1:
-            if cur['Close'] >= cur['Cumulative_VWAP'] or cur['RSI'] >= 65 or cur['Close'] < (cur['BB_Low'] * 0.97):
-                ret = (cur['Close'] - entry_p2) / entry_p2
-                trades2.append(ret)
-                pos2 = 0
-                entry_p2 = 0
-        
-        if pos2 == 0:
-            cond_val = cur['Close'] < cur['Cumulative_VWAP']
-            cond_rsi = cur['RSI'] < 42
-            cond_bb = cur['Close'] > cur['BB_Low']
-            if cond_val and cond_rsi and cond_bb:
-                pos2 = 1
-                entry_p2 = cur['Close']
-
-    if pos2 == 1:
-        ret = (b_df['Close'].iloc[-1] - entry_p2) / entry_p2
-        trades2.append(ret)
-
-    def calc_stats(trades):
-        if not trades:
-            return {"total_ret": 0.0, "win_rate": 0.0, "trades_count": 0, "profit_factor": 0.0, "mdd": 0.0}
-        
-        cum = 1.0
-        peak = 1.0
-        mdd = 0.0
-        wins = [t for t in trades if t > 0]
-        losses = [t for t in trades if t < 0]
-        
-        for t in trades:
-            cum *= (1.0 + t)
-            if cum > peak:
-                peak = cum
-            dd = (peak - cum) / peak
-            if dd > mdd:
-                mdd = dd
-                
-        tot_ret = (cum - 1.0) * 100
-        win_rate = (len(wins) / len(trades)) * 100 if trades else 0
-        sum_win = sum(wins) if wins else 0
-        sum_loss = abs(sum(losses)) if losses else 0
-        pf = round(sum_win / sum_loss, 2) if sum_loss > 0 else (99.9 if sum_win > 0 else 0.0)
-
-        return {
-            "total_ret": round(tot_ret, 2),
-            "win_rate": round(win_rate, 1),
-            "trades_count": len(trades),
-            "profit_factor": pf,
-            "mdd": round(mdd * 100, 2)
-        }
-
-    return {
-        "benchmark_buy_and_hold": round(bh_return, 2),
-        "strategy_1_momentum_squeeze": calc_stats(trades1),
-        "strategy_2_vwap_mean_reversion": calc_stats(trades2)
+def fetch_macro_indicators():
+    macro_data = {}
+    
+    # 1. 미국 10년물 국채금리 (FRED API 우선, 실패 시 yfinance ^TNX 백업)
+    fred_api_key = os.getenv("FRED_API_KEY")
+    if not fred_api_key:
+        try:
+            fred_api_key = st.secrets["FRED_API_KEY"]
+        except Exception:
+            fred_api_key = None
+            
+    tnx_val = "N/A"
+    tnx_date = "N/A"
+    tnx_src = "Yahoo Finance (^TNX)"
+    
+    if fred_api_key:
+        try:
+            url = f"https://api.stlouisfed.org/fred/series/observations?series_id=DGS10&api_key={fred_api_key}&file_type=json&sort_order=desc&limit=5"
+            r = requests.get(url, timeout=5)
+            if r.status_code == 200:
+                obs = r.json().get("observations", [])
+                for o in obs:
+                    if o.get("value") and o.get("value") != ".":
+                        tnx_val = f"{float(o['value']):.2f}%"
+                        tnx_date = o.get("date", "N/A")
+                        tnx_src = "FRED (DGS10)"
+                        break
+        except Exception:
+            pass
+            
+    if tnx_val == "N/A":
+        try:
+            tnx_tk = yf.Ticker("^TNX")
+            tnx_hist = tnx_tk.history(period="5d")
+            if not tnx_hist.empty:
+                tnx_val = f"{float(tnx_hist['Close'].iloc[-1]):.2f}%"
+                tnx_date = tnx_hist.index[-1].strftime("%Y-%m-%d")
+        except Exception:
+            pass
+            
+    macro_data["us_10y_yield"] = {
+        "value": tnx_val,
+        "date": tnx_date,
+        "source": tnx_src
     }
+
+    # 2. 기타 5대 자산 (달러, VIX, WTI 유가, 금, 비트코인)
+    assets = {
+        "dollar_index": {"ticker": "DX-Y.NYB", "name": "달러 인덱스 (DXY)"},
+        "vix": {"ticker": "^VIX", "name": "변동성 지수 (VIX)"},
+        "wti_crude": {"ticker": "CL=F", "name": "WTI 원유 선물"},
+        "gold": {"ticker": "GC=F", "name": "금 선물 (Gold)"},
+        "bitcoin": {"ticker": "BTC-USD", "name": "비트코인 (BTC)"}
+    }
+    
+    for k, info in assets.items():
+        try:
+            tk = yf.Ticker(info["ticker"])
+            h = tk.history(period="5d")
+            if not h.empty and len(h) >= 2:
+                latest_p = float(h['Close'].iloc[-1])
+                prev_p = float(h['Close'].iloc[-2])
+                chg_pct = ((latest_p - prev_p) / prev_p) * 100
+                m_date = h.index[-1].strftime("%Y-%m-%d")
+                
+                macro_data[k] = {
+                    "name": info["name"],
+                    "value": f"${latest_p:,.2f}" if "USD" in info["ticker"] or "=F" in info["ticker"] else f"{latest_p:.2f}",
+                    "daily_change": f"{chg_pct:+.2f}%",
+                    "date": m_date
+                }
+            elif not h.empty:
+                latest_p = float(h['Close'].iloc[-1])
+                m_date = h.index[-1].strftime("%Y-%m-%d")
+                macro_data[k] = {
+                    "name": info["name"],
+                    "value": f"{latest_p:.2f}",
+                    "daily_change": "0.00%",
+                    "date": m_date
+                }
+            else:
+                macro_data[k] = {"name": info["name"], "value": "N/A", "daily_change": "N/A", "date": "N/A"}
+        except Exception:
+            macro_data[k] = {"name": info["name"], "value": "N/A", "daily_change": "N/A", "date": "N/A"}
+            
+    return macro_data
+
+# -------------------------------------------------------------
+# 📌 S&P 500 11개 전 섹터 실시간 등락률 및 모멘텀 계산기
+# -------------------------------------------------------------
+def fetch_sector_performance():
+    sector_etfs = {
+        "XLK": "정보기술 (Tech)",
+        "XLC": "커뮤니케이션 (Comm)",
+        "XLY": "임의소비재 (Discretionary)",
+        "XLP": "필수소비재 (Staples)",
+        "XLF": "금융 (Financials)",
+        "XLV": "헬스케어 (Healthcare)",
+        "XLI": "산업재 (Industrials)",
+        "XLE": "에너지 (Energy)",
+        "XLB": "소재 (Materials)",
+        "XLU": "유틸리티 (Utilities)",
+        "XLRE": "부동산 (Real Estate)"
+    }
+    
+    sector_data = {}
+    
+    for etf, s_name in sector_etfs.items():
+        try:
+            tk = yf.Ticker(etf)
+            df = tk.history(period="1mo")
+            if not df.empty and len(df) >= 5:
+                curr_c = float(df['Close'].iloc[-1])
+                c_5d = float(df['Close'].iloc[-5])
+                c_1m = float(df['Close'].iloc[0])
+                
+                ret_5d = ((curr_c - c_5d) / c_5d) * 100
+                ret_1m = ((curr_c - c_1m) / c_1m) * 100
+                
+                sector_data[etf] = {
+                    "sector_name": s_name,
+                    "latest_close": round(curr_c, 2),
+                    "return_5d": f"{ret_5d:+.2f}%",
+                    "return_1m": f"{ret_1m:+.2f}%"
+                }
+            else:
+                sector_data[etf] = {
+                    "sector_name": s_name,
+                    "latest_close": "N/A",
+                    "return_5d": "N/A",
+                    "return_1m": "N/A"
+                }
+        except Exception:
+            sector_data[etf] = {
+                "sector_name": s_name,
+                "latest_close": "N/A",
+                "return_5d": "N/A",
+                "return_1m": "N/A"
+            }
+            
+    return sector_data
 
 # =============================================================================
 # [BLOCK 06] 펀더멘털, 6대 밸류에이션 & 3개년 장기 퀄리티 지표
