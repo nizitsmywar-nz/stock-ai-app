@@ -1451,6 +1451,112 @@ if analyze_btn:
         else:
             strategy_instruction_text = """* **사용자 대응 전략**: [현재 사용자가 주식을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것. 보유자 관련 문구는 일절 작성하지 말 것. 상단 [신규 진입 적격성 평가] 및 [분할 매수 밴드]와 100% 일치하는 진입 가격대와 진입 비중(예: 1차 30% 분할 진입 등)을 명확히 제시할 것.]"""
 
+        # =====================================================================
+        # 💡 [신규 추가] Python 기반 정량 지표 & 손익비 사전 연산 엔진 (할루시네이션 원천 차단)
+        # =====================================================================
+        def calculate_pre_scores(fund, tech, bt, curr_price):
+            def parse_num(v):
+                if isinstance(v, str):
+                    try: return float(re.sub(r'[^0-9.-]', '', v))
+                    except: return 0.0
+                return float(v) if v else 0.0
+
+            # 1) 성장성 (20%): EPS 데이터 부재 시 기본 중간값 부여
+            s_growth = 5.5 
+
+            # 2) 수익성 (25%)
+            opm = parse_num(fund.get('quality_factors', {}).get('operating_margin', 0))
+            fcf_str = str(fund.get('quality_factors', {}).get('free_cash_flow', ''))
+            roic = parse_num(fund.get('long_term_quality', {}).get('roic', 0))
+            
+            s_prof = 1.5
+            if opm >= 20 and '-' not in fcf_str and fcf_str != 'N/A': s_prof = 9.5
+            elif opm >= 15: s_prof = 7.5
+            elif opm >= 8: s_prof = 5.5
+            elif opm >= 0: s_prof = 3.5
+            if roic >= 15.0: s_prof = min(10.0, s_prof + 1.0)
+
+            # 3) 해자 (25%)
+            s_moat = 0.0
+            if parse_num(fund.get('roe', 0)) >= 20.0: s_moat += 2.5
+            if parse_num(fund.get('quality_factors', {}).get('gross_margin', 0)) >= 50.0: s_moat += 2.5
+            if parse_num(fund.get('quality_factors', {}).get('rnd_to_revenue', 0)) >= 5.0: s_moat += 2.5
+            if parse_num(fund.get('ownership_and_shorts', {}).get('inst_own', 0)) >= 70.0: s_moat += 1.5
+            if parse_num(fund.get('quality_factors', {}).get('debt_to_equity', 999)) <= 100.0: s_moat += 1.0
+            if parse_num(fund.get('long_term_quality', {}).get('shares_change_pct', 0)) < 0: s_moat += 1.0
+            s_moat = min(10.0, max(1.5, s_moat))
+
+            # 4) 밸류에이션 (20%) - 4개 지표 개별 채점 후 정확한 산술 평균
+            pe = fund.get('trailing_pe'); fpe = fund.get('forward_pe')
+            ps = fund.get('ps_ratio'); pbr = fund.get('pbr')
+            def score_v(val, b1, b2, b3, b4):
+                if not isinstance(val, (int, float)) or val < 0: return 1.5
+                if val <= b1: return 9.5
+                elif val <= b2: return 7.5
+                elif val <= b3: return 5.5
+                elif val <= b4: return 3.5
+                return 1.5
+            
+            s_val = (score_v(pe, 15, 25, 40, 60) + score_v(fpe, 12, 20, 28, 35) + 
+                     score_v(ps, 3, 6, 10, 15) + score_v(pbr, 3, 6, 10, 15)) / 4.0
+
+            # 5) 모멘텀 (10%) - 빈틈없는 구간 설정
+            vwap1y = parse_num(tech.get('vwap_1y'))
+            vwap_dev = ((curr_price - vwap1y) / vwap1y * 100) if vwap1y > 0 else 0
+            if vwap_dev >= 5: s_mom1 = 9.5
+            elif vwap_dev >= 0: s_mom1 = 7.5
+            elif vwap_dev >= -2: s_mom1 = 5.5
+            elif vwap_dev >= -5: s_mom1 = 3.5
+            else: s_mom1 = 1.5
+
+            rsi = parse_num(tech.get('rsi_14', 50))
+            if 55 <= rsi <= 70: s_mom2 = 9.0
+            elif 45 <= rsi < 55: s_mom2 = 7.0
+            elif 30 <= rsi < 45: s_mom2 = 5.0
+            elif rsi > 70: s_mom2 = 4.0
+            else: s_mom2 = 2.0
+
+            sharpe = bt.get('strategy_2_vwap_mean_reversion', {}).get('sharpe_ratio', 0) if bt else 0
+            if sharpe >= 1.5: s_mom3 = 9.5
+            elif sharpe >= 1.0: s_mom3 = 7.5
+            elif sharpe >= 0.5: s_mom3 = 5.5
+            elif sharpe >= 0.0: s_mom3 = 3.5
+            else: s_mom3 = 1.5
+            
+            s_mom = (s_mom1 + s_mom2 + s_mom3) / 3.0
+
+            # ✅ 총점 및 등급 산출
+            total_score = (s_growth * 0.2) + (s_prof * 0.25) + (s_moat * 0.25) + (s_val * 0.2) + (s_mom * 0.1)
+            
+            if total_score >= 8.5: badge = "👑 최상위 핵심 우량주"
+            elif total_score >= 7.5: badge = "🥇 적격 우량주"
+            elif total_score >= 6.0: badge = "⚠️ 조건부 종목"
+            else: badge = "🚨 비우량주"
+            
+            return f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
+
+        def calculate_pre_risk_reward(curr_price, fib, tech):
+            # 1차 목표가를 피보나치 38.2% 또는 현재가 +10%로 설정
+            target_p = fib.get('fib_38.2%')
+            if not isinstance(target_p, (int, float)) or target_p <= curr_price:
+                target_p = curr_price * 1.10
+            
+            # 손절가를 2.0x ATR Stop으로 설정
+            stop_p = tech.get('atr_stop_2_0x')
+            if not isinstance(stop_p, (int, float)) or stop_p >= curr_price:
+                stop_p = curr_price * 0.90
+                
+            up_pct = (target_p - curr_price) / curr_price * 100
+            down_pct = (curr_price - stop_p) / curr_price * 100
+            ratio = abs(up_pct / down_pct) if down_pct != 0 else 0
+            
+            return f"기대수익 {up_pct:+.2f}% : 예상손실 {down_pct:+.2f}% (손익비 {ratio:.2f} : 1)"
+
+        # 실행 및 변수 할당
+        precalc_scorecard = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p)
+        precalc_rr = calculate_pre_risk_reward(curr_p, fib_levels, tech_data)
+        # =====================================================================
+
         full_rag_payload = {
             "meta": {
                 "ticker": ticker_input,
@@ -1473,7 +1579,9 @@ if analyze_btn:
             "fundamentals_and_6_valuations": fund_data,
             "user_portfolio_status": user_position_text,
             "stock_recent_news": news_data,
-            "analyst_upgrades_downgrades_2m": analyst_data
+            "analyst_upgrades_downgrades_2m": analyst_data,
+            "precalculated_scorecard": precalc_scorecard, 
+            "precalculated_risk_reward": precalc_rr
         }
 
         full_json_str = json.dumps(full_rag_payload, indent=2, ensure_ascii=False)
@@ -1530,20 +1638,25 @@ if analyze_btn:
 14. 최근 2개월 증권가 투자의견 및 목표가 변동 (기관 신뢰도 티어 포함):
 {analyst_json}
 
+15. 파이썬 알고리즘 사전 연산 스코어카드 (절대 임의 수정 금지):
+{score_json}
+
+16. 파이썬 알고리즘 사전 연산 예상 손익비 (절대 임의 수정 금지):
+{rr_json}
+
 ---
 
 [지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 POC 매물벽 검증 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
-- **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 요약 명시할 것.
+- **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 명시할 것. (⚠️경고: 각 자산별 수집 기준일자(date)가 다를 수 있으므로, 임의로 하나의 날짜로 통일하거나 왜곡하지 말고 JSON에 명시된 날짜를 개별적으로 정확히 기재할 것)
 - 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측] (현금, 채권, 주식, 코인, 금, 원유).
 - **[자산배분 코멘트 – 근거 없는 수치 생성 금지 (필수)]**: 주입된 데이터(10년물 국채금리, VIX, 달러인덱스, 유가, 금, 비트코인)만을 근거로 방향성(예: "국채 비중 확대 고려" 등)을 서술할 것. "주식 40% : 채권 30%"처럼 **구체적인 퍼센트 배분 수치는 절대 임의로 생성하지 말 것** — 그런 수치를 뒷받침할 데이터가 제공되지 않았으므로, 정량 배분표 대신 정성적 방향성만 제시할 것.
 
 2. 11개 전 섹터 전망 및 자금 순환매 심층 분석 (서식 엄격 준수)
 - **11개 섹터 전수 리스트 작성**: 주입된 11개 섹터 데이터(XLK, XLC, XLY, XLP, XLF, XLV, XLI, XLE, XLB, XLU, XLRE) 각각에 대해 5일/1개월 등락률을 바탕으로 현재 상태를 11개 모두 글머리 기호(*)로 작성할 것.
 - **자금 순환매 결론 분리 (필수)**: 11개 섹터 글머리 기호 작성이 끝난 후, **반드시 빈 줄(한 줄 공백)을 삽입**하여 아래와 같이 독립된 글머리 기호로 작성할 것:
-
   * **자금 순환매 결론**: [방어주 vs 성장주 순환매 방향성과 {ticker}가 속한 섹터의 수혜/소외 여부 및 상대 강도를 명확히 도출. 만약 {ticker}가 원자재(GC=F 등), 가상자산(BTC-USD 등), 지수인 경우 주식 시장 전반 대비 해당 대체 자산으로의 자금 이동/선호도 관점에서 서술할 것]
 
 3. 밸류에이션, 스마트머니(헤지펀드) 및 공매도 세력/옵션 분석 ({ticker})
@@ -1553,45 +1666,13 @@ if analyze_btn:
 - **IB 투자의견 신뢰도 가중**: Tier 1/2 투자은행의 목표가 변동을 가중 평가하되, 기관 목표가는 중장기 상방 여력 참고용으로만 활용할 것.
 
 4. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가 ({ticker})
-- 스코어카드 산출 (정량 앵커 및 대리지표 가중 채점 규칙 엄격 준수 - 임의 점수 부여 절대 금지):
-  * [항목별 10점 만점 정량 앵커]:
-    1) 성장성 (20%): EPS 및 실적 성장률 (30%+ 9~10점 | 15~29% 7~8점 | 5~14% 5~6점 | 역성장 1~4점)
-    2) 수익성 (25%): FCF 흑자 규모 및 OPM 5단계 구간
-       - OPM 20%+ & FCF 대규모 흑자: 9~10점
-       - OPM 15~19%: 7~8점
-       - OPM 8~14%: 5~6점
-       - OPM 0~7%: 3~4점
-       - FCF 적자: 1~2점
-       (※ 가산점 절대 규칙: ROIC가 15.0% 이상일 때만 +1.0~+1.5점 가산 가능. ROIC가 15% 미만이면 가산점 0점. 'FCF 흑자 지속'을 이유로 점수를 임의 상향하는 행위 절대 금지. 항목 총점은 min(10, base+가산점))
-    3) 해자 (25% - 5대 대리지표 가산점 합산):
-       - ROE 20%+ (+2.5) | 매출총이익률 50%+ (+2.5) | R&D비중 5%+ (+2.5) | 기관지분율 70%+ (+1.5) | 부채비율 100%이하 (+1.0)
-       (※ '영업이익률'은 수익성 항목과 중복되므로 해자 지표에서 제외하고 R&D비중으로 대체함 - 마진과 상관관계가 낮은 별도 해자 신호 확보 목적)
-       - *한계 명시: "해자 점수는 재무 대리지표 기반 정량 근사치임"
-       (※ 주주환원 가산점 규칙: 주식 수 증감률(shares_change_pct)이 명백한 마이너스(-)일 때만 +1.0~+1.5점 가산. 주식 수가 증가했거나 양수(+)이면 가산점 0점. 임의의 base 점수 창조 금지. 항목 총점은 min(10, 충족된 항목 합산))
-    4) 밸류에이션 (20% - Trailing/Forward PE, PSR, PBR 구간 평균):
-       - 9~10점: Trailing PE ≤15, Forward PE ≤12, PS ≤3, PBR ≤3
-       - 7~8점: Trailing PE 15~25, Forward PE 12~20, PS 3~6, PBR 3~6
-       - 5~6점: Trailing PE 25~40, Forward PE 20~28, PS 6~10, PBR 6~10
-       - 3~4점: Trailing PE 40~60, Forward PE 28~35, PS 10~15, PBR 10~15
-       - 1~2점: Trailing PE >60, Forward PE >35, PS >15, PBR >15
-       (※ 성장주 핑계로 임의 상향 금지, PBR 음수 시 나머지 3개 지표 평균)
-    5) 퀀트/모멘텀 (10% - 아래 지정된 3개 서브지표 단순 평균):
-       - VWAP 이격도((현재가-VWAP)/VWAP×100): +5%↑ 9~10점 | 0~5% 7~8점 | -2~0% 5~6점 | -5~-2% 3~4점 | -5%↓ 1~2점
-       - RSI: 55~70 9점 | 45~55 7점 | 30~45 5점 | 70초과(과매수) 4점 | 30미만(과매도) 2점
-       - 백테스팅 샤프비율: 1.5+ 9~10점 | 1.0~1.4 7~8점 | 0.5~0.9 5~6점 | 0~0.4 3~4점 | 음수 1~2점
-       (※ MACD 등 다른 지표로 바꿔치기 금지. 반드시 위 3개 지표 점수의 산술평균으로 채점할 것)
-  * 종합 평점 계산식: (수익성×0.25) + (해자×0.25) + (밸류에이션×0.20) + (성장성×0.20) + (모멘텀×0.10)
-  * 표기 형식: 성장성(X), 수익성(X), 밸류에이션(X), 해자(X), 퀀트/모멘텀(X) | 종합 평점: X.X/10 (등급 이모지 및 판정명)
-  * [우량성 등급 기준]:
-    - 8.5점 ~ 10.0점: `종합 평점: X.X/10 (👑 최상위 핵심 우량주)`
-    - 7.5점 ~ 8.4점: `종합 평점: X.X/10 (🥇 적격 우량주)`
-    - 6.0점 ~ 7.4점: `종합 평점: X.X/10 (⚠️ 조건부 종목)`
-    - 6.0점 미만: `종합 평점: X.X/10 (🚨 비우량주)`
+- **스코어카드 산출**: 
+  * ⚠️ [매우 중요]: LLM 본인이 직접 점수나 수식을 계산하지 마십시오. 반드시 주입된 데이터 [15. 파이썬 알고리즘 사전 연산 스코어카드]의 텍스트 결과를 **토씨 하나 틀리지 않고 그대로 복사하여 출력**할 것.
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
 - **신규 진입 등급**: [적극 진입 추천 | 조정 시 분할 진입 | 돌파 확인 후 진입 | 진입 부적합(관망/리스크 과다) 중 택1]
 - **진입 적합성 종합 판정**: 미보유자 입장에서 현재 시점에 무조건 하방 매수를 기다려야 하는지, 아니면 현재가 부근에서 즉시/분할 진입할 만한 모멘텀과 밸류에이션 메리트가 있는지 객관적이고 냉정하게 평가할 것. 단, 장기 퀄리티(3년 연속 흑자+고ROIC 등)가 입증된 우량 기업은 단기 눌림목 발생 시 '적극 진입' 또는 '분할 진입' 명분을 강력하게 부여할 것.
-- **예상 손익비 (Risk/Reward Ratio)**: 1차 목표가까지의 기대 상승률 대비 손절선까지의 하방 리스크 비율을 수치로 명시할 것.
+- **예상 손익비 (Risk/Reward Ratio)**: ⚠️ 직접 퍼센트를 계산하지 말고 주입된 [16. 파이썬 알고리즘 사전 연산 예상 손익비]의 텍스트를 그대로 출력할 것.
 
 6. [정밀 매매 시나리오]
 - **[매수 밴드 및 진입 가격의 상·하단 논리 일치 규칙 (필수)]**:
@@ -1603,6 +1684,8 @@ if analyze_btn:
   * **보수적 매도가 밴드 설정**: 증권사 기관 목표가 대신 **볼린저 밴드 상단, 52주 고점 저항선, POC 매물대 저항선, 콜옵션 Max OI 저항벽 등 실제 차트/수급상의 실시간 저항선**을 최우선 기준으로 하여 현실적인 차익실현 달러 밴드를 도출할 것.
   * **피보나치 수치 표기 규칙**: 반드시 **'피보나치 50.0%', '피보나치 38.2%', '피보나치 23.6%', '피보나치 61.8%'**와 같이 소수점과 퍼센트(%) 기호를 붙여 표기할 것.
   * 비중 언급 시 '30%'처럼 퍼센트(%) 기호를 붙이고 단어와 숫자 사이에 공백을 둘 것.
+- **손절(Stop-loss) 기준선**: [2.0x ATR 또는 1Y VWAP 이탈 시 추세 훼손 구체적 달러 가격대]
+- **불타기 조건**: [스퀴즈 상방 돌파 및 상방 저항선 안착 시 추가 매수 검토 기준 (⚠️주의: '분할매수 밴드 상단'이라는 잘못된 명칭을 쓰지 말고, '볼린저 밴드 상단($가격)' 또는 'POC 저항선($가격)'이라고 명확한 지표명을 명시할 것)]
 
 7. [최종 투자의견 규칙 (엄격 준수)]
 - 만약 현재 과열권이거나 추격 매수를 지양해야 하는 상황, 또는 관망/보류가 유리한 국면이라면 **최종 투자의견을 절대 '매수'나 '분할매수'로 적지 말고, 반드시 '관망' 또는 '홀딩'으로 명시할 것.**
@@ -1630,7 +1713,13 @@ if analyze_btn:
 {strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json"],
+                input_variables=[
+                    "ticker", "stock_date", "tech_json", "poc_json", "backtest_json", 
+                    "fib_json", "options_json", "hedge_short_json", "earnings_json", 
+                    "macro_json", "macro_news_json", "sector_json", "fund_json", 
+                    "user_position", "strategy_guide", "news_json", "analyst_json",
+                    "score_json", "rr_json"
+                ],
                 template=template
             )
             llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
@@ -1653,7 +1742,9 @@ if analyze_btn:
                 "user_position": user_position_text,
                 "strategy_guide": strategy_instruction_text,
                 "news_json": json.dumps(compact_news, indent=2, ensure_ascii=False),
-                "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False)
+                "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False),
+                "score_json": precalc_scorecard,
+                "rr_json": precalc_rr
             }
             
             for delay in [0, 5, 10]:
