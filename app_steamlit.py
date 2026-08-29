@@ -1457,18 +1457,34 @@ if analyze_btn:
         except Exception:
             api_key = None
             
-    with st.spinner(f"🔍 [{ticker_input}] POC 매물대/헤지펀드 지분/공매도 세력 분석/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
-        tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df, vol_profile = fetch_stock_technical_data(ticker_input)
+        # =====================================================================
+        # 💡 [병렬 처리 적용] ThreadPoolExecutor를 통한 데이터 동시 수집
+        # =====================================================================
+        from concurrent.futures import ThreadPoolExecutor
+
+        with ThreadPoolExecutor(max_workers=5) as executor:
+            future_tech = executor.submit(fetch_stock_technical_data, ticker_input)
+            future_options = executor.submit(fetch_nearest_options_data, ticker_input, 2)
+            future_macro = executor.submit(fetch_macro_indicators)
+            future_sector = executor.submit(fetch_sector_performance)
+            future_news = executor.submit(fetch_news, ticker_input, 5)
+            future_macro_news = executor.submit(fetch_macro_news, 4)
+            future_analyst = executor.submit(fetch_recent_upgrades_downgrades, ticker_input, 2)
+
+            # 결과 취득
+            tech_data, stock_date, fib_levels, high_52_calc, low_52_calc, raw_df, vol_profile = future_tech.result()
+            options_data = future_options.result()
+            macro_data = future_macro.result()
+            sector_data = future_sector.result()
+            news_data = future_news.result()
+            macro_news_data = future_macro_news.result()
+            analyst_data = future_analyst.result()
+
+        # 백테스팅은 기술적 데이터프레임(raw_df)이 필요하므로 직후에 실행
         backtest_results = run_strategy_backtest(raw_df)
-        options_data = fetch_nearest_options_data(ticker_input, retries=3)
-        macro_data = fetch_macro_indicators()
         
         curr_p = tech_data.get('current_price', 0)
         fund_data = fetch_fundamentals_and_valuation(ticker_input, curr_p, high_52_calc, low_52_calc)
-        sector_data = fetch_sector_performance()
-        news_data = fetch_news(ticker_input, limit=5)
-        macro_news_data = fetch_macro_news(limit=4)
-        analyst_data = fetch_recent_upgrades_downgrades(ticker_input, months=2)
         
         info_source_flag = fund_data.get('info_source', 'stock.info')
         ownership = fund_data.get('ownership_and_shorts', {})
