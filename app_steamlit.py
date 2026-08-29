@@ -160,6 +160,7 @@ def fetch_stock_technical_data(ticker: str):
         df['MACD'] = macd.macd()
         df['MACD_Signal'] = macd.macd_signal()
         df['MACD_Diff'] = macd.macd_diff()
+        df['MACD_Hist'] = df['MACD_Diff']  # 백테스팅 호환용 컬럼 매핑
         
         # 4. 볼린저 밴드 (20, 2)
         bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
@@ -293,7 +294,7 @@ def calculate_volume_profile(df_window: pd.DataFrame, num_bins: int = 25):
         return {}
 
 # -------------------------------------------------------------
-# 📌 듀얼 백테스팅 엔진 (1년)
+# 📌 듀얼 백테스팅 엔진 (1년 정밀 성과/MDD/Profit Factor 연산)
 # -------------------------------------------------------------
 def run_strategy_backtest(raw_df: pd.DataFrame):
     if raw_df.empty or len(raw_df) < 50:
@@ -301,8 +302,8 @@ def run_strategy_backtest(raw_df: pd.DataFrame):
         
     df = raw_df.copy()
     
-    # 누락 방지: 필요한 컬럼 확인 및 결측치 제거
-    required_cols = ['Close', 'SMA_20', 'SMA_50', 'BB_Lower', 'BB_Mid']
+    # 필수 지표 존재 여부 확인 및 결측치 제거
+    required_cols = ['Close', 'SMA_20', 'SMA_50', 'MACD', 'MACD_Signal', 'MACD_Diff', 'BB_Lower', 'BB_Mid', 'ATR', 'VWAP_1Y', 'VWAP_20D', 'RSI']
     avail_cols = [c for c in required_cols if c in df.columns]
     if len(avail_cols) < len(required_cols):
         return {}
@@ -310,58 +311,120 @@ def run_strategy_backtest(raw_df: pd.DataFrame):
     if len(b_df) < 20:
         return {}
     
-    # 전략 1: 골든크로스 / 모멘텀 (SMA 20 & SMA 50)
-    b_df['sig_cross'] = 0
-    b_df.loc[b_df['SMA_20'] > b_df['SMA_50'], 'sig_cross'] = 1
-    b_df['pos_cross'] = b_df['sig_cross'].shift(1).fillna(0)
-    b_df['ret_cross'] = b_df['pos_cross'] * b_df['Close'].pct_change().fillna(0)
-    
-    # 전략 2: 볼린저 밴드 하단 반등 매매 (Mean Reversion)
-    b_df['sig_bb'] = 0
-    b_df.loc[b_df['Close'] < b_df['BB_Lower'], 'sig_bb'] = 1
-    b_df.loc[b_df['Close'] > b_df['BB_Mid'], 'sig_bb'] = 0
-    b_df['sig_bb'] = b_df['sig_bb'].ffill().fillna(0)
-    b_df['pos_bb'] = b_df['sig_bb'].shift(1).fillna(0)
-    b_df['ret_bb'] = b_df['pos_bb'] * b_df['Close'].pct_change().fillna(0)
-    
     # 벤치마크: 단순 보유 수익률 (Buy & Hold)
     b_start = b_df['Close'].iloc[0]
     b_end = b_df['Close'].iloc[-1]
     b_ret = ((b_end - b_start) / b_start) * 100
     
-    def calc_stats(ret_series, pos_series):
-        cum_ret = (np.prod(1 + ret_series) - 1) * 100
-        trades = int((pos_series.diff() != 0).sum())
-        win_days = int((ret_series > 0).sum())
-        loss_days = int((ret_series < 0).sum())
-        win_rate = (win_days / (win_days + loss_days) * 100) if (win_days + loss_days) > 0 else 0.0
-        return round(float(cum_ret), 2), trades, round(float(win_rate), 1)
+    # 전략 1: 모멘텀 스퀴즈 돌파 전략 (Momentum Squeeze Breakout)
+    # 진입: MACD 상방전환(골든크로스) + 주가가 20일 이평 및 20일 VWAP 상회
+    # 청산: MACD 데드크로스 발생 시
+    sig_1 = np.zeros(len(b_df))
+    in_pos_1 = False
+    for i in range(1, len(b_df)):
+        cur = b_df.iloc[i]
+        prev = b_df.iloc[i-1]
         
-    c_ret, c_trades, c_win = calc_stats(b_df['ret_cross'], b_df['pos_cross'])
-    bb_ret, bb_trades, bb_win = calc_stats(b_df['ret_bb'], b_df['pos_bb'])
+        cond_macd = (prev['MACD_Diff'] <= 0 and cur['MACD_Diff'] > 0)
+        cond_price = (cur['Close'] > cur['SMA_20']) and (cur['Close'] > cur['VWAP_20D'])
+        
+        if not in_pos_1 and cond_macd and cond_price:
+            in_pos_1 = True
+        elif in_pos_1 and (cur['MACD_Diff'] < 0 or cur['Close'] < cur['SMA_20']):
+            in_pos_1 = False
+            
+        sig_1[i] = 1 if in_pos_1 else 0
+        
+    b_df['pos_1'] = pd.Series(sig_1, index=b_df.index).shift(1).fillna(0)
+    b_df['ret_1'] = b_df['pos_1'] * b_df['Close'].pct_change().fillna(0)
+    
+    # 전략 2: 1Y VWAP + RSI 밸류 되돌림 전략 (Mean Reversion)
+    # 진입: 1Y 누적 VWAP 하회 + RSI 42 이하 + 볼린저 밴드 하단 터치 지지
+    # 청산: 20일 이평(볼린저 중심선) 도달 또는 RSI 65 도달 시
+    sig_2 = np.zeros(len(b_df))
+    in_pos_2 = False
+    for i in range(1, len(b_df)):
+        cur = b_df.iloc[i]
+        
+        cond_buy = (cur['Close'] < cur['VWAP_1Y']) and (cur['RSI'] <= 42) and (cur['Close'] <= cur['BB_Lower'] * 1.02)
+        cond_sell = (cur['Close'] >= cur['BB_Mid']) or (cur['RSI'] >= 65)
+        
+        if not in_pos_2 and cond_buy:
+            in_pos_2 = True
+        elif in_pos_2 and cond_sell:
+            in_pos_2 = False
+            
+        sig_2[i] = 1 if in_pos_2 else 0
+        
+    b_df['pos_2'] = pd.Series(sig_2, index=b_df.index).shift(1).fillna(0)
+    b_df['ret_2'] = b_df['pos_2'] * b_df['Close'].pct_change().fillna(0)
+    
+    # 성과 분석기 (수익률, 승률, Profit Factor, MDD)
+    def calc_comprehensive_stats(ret_series, pos_series):
+        cum_ret_val = (np.prod(1 + ret_series) - 1) * 100
+        trades_cnt = int((pos_series.diff() != 0).sum())
+        
+        pos_changes = pos_series.diff()
+        trade_returns = []
+        entry_idx = None
+        for idx, (p, change) in enumerate(zip(pos_series, pos_changes)):
+            if change == 1:
+                entry_idx = idx
+            elif change == -1 and entry_idx is not None:
+                sub_rets = ret_series.iloc[entry_idx:idx+1]
+                t_ret = (np.prod(1 + sub_rets) - 1) * 100
+                trade_returns.append(t_ret)
+                entry_idx = None
+                
+        if entry_idx is not None:
+            sub_rets = ret_series.iloc[entry_idx:]
+            trade_returns.append((np.prod(1 + sub_rets) - 1) * 100)
+            
+        win_trades = [r for r in trade_returns if r > 0]
+        loss_trades = [r for r in trade_returns if r <= 0]
+        
+        win_rate_val = (len(win_trades) / len(trade_returns) * 100) if trade_returns else 0.0
+        
+        gross_profit = sum(win_trades) if win_trades else 0.0
+        gross_loss = abs(sum(loss_trades)) if loss_trades else 0.0
+        profit_factor_val = round(gross_profit / gross_loss, 2) if gross_loss > 0 else (round(gross_profit, 2) if gross_profit > 0 else 1.0)
+        
+        equity_curve = np.cumprod(1 + ret_series)
+        peak = np.maximum.accumulate(equity_curve)
+        drawdown = (equity_curve - peak) / peak
+        mdd_val = round(float(abs(drawdown.min())) * 100, 1) if not drawdown.empty else 0.0
+        
+        return round(float(cum_ret_val), 2), trades_cnt, round(float(win_rate_val), 1), profit_factor_val, mdd_val
+        
+    c_ret1, c_trades1, c_win1, pf1, mdd1 = calc_comprehensive_stats(b_df['ret_1'], b_df['pos_1'])
+    c_ret2, c_trades2, c_win2, pf2, mdd2 = calc_comprehensive_stats(b_df['ret_2'], b_df['pos_2'])
     
     return {
         "benchmark_buy_and_hold": f"{b_ret:+.2f}%",
-        "strategy_golden_cross": {
-            "total_ret": f"{c_ret:+.2f}%",
-            "trades_count": c_trades,
-            "win_rate": f"{c_win}%"
-        },
-        "strategy_bb_reversion": {
-            "total_ret": f"{bb_ret:+.2f}%",
-            "trades_count": bb_trades,
-            "win_rate": f"{bb_win}%"
-        },
-        # UI 및 이전 호환용 별칭 키
         "strategy_1_momentum_squeeze": {
-            "total_ret": f"{c_ret:+.2f}%",
-            "trades_count": c_trades,
-            "win_rate": f"{c_win}%"
+            "total_ret": f"{c_ret1:+.2f}%",
+            "trades_count": c_trades1,
+            "win_rate": f"{c_win1}%",
+            "profit_factor": pf1,
+            "mdd": mdd1
         },
         "strategy_2_vwap_mean_reversion": {
-            "total_ret": f"{bb_ret:+.2f}%",
-            "trades_count": bb_trades,
-            "win_rate": f"{bb_win}%"
+            "total_ret": f"{c_ret2:+.2f}%",
+            "trades_count": c_trades2,
+            "win_rate": f"{c_win2}%",
+            "profit_factor": pf2,
+            "mdd": mdd2
+        },
+        # 프롬프트 호환용 별칭 키
+        "strategy_golden_cross": {
+            "total_ret": f"{c_ret1:+.2f}%",
+            "trades_count": c_trades1,
+            "win_rate": f"{c_win1}%"
+        },
+        "strategy_bb_reversion": {
+            "total_ret": f"{c_ret2:+.2f}%",
+            "trades_count": c_trades2,
+            "win_rate": f"{c_win2}%"
         }
     }
 
@@ -986,8 +1049,8 @@ with st.sidebar:
     st.markdown("### ⚡ **AI Stock Analyst Pro**")
     
     MODEL_OPTIONS = {
-        "Gemini 3.1 Flash Lite": "gemini-3.1-flash-lite",
         "Gemini 3.5 Flash Lite": "gemini-3.5-flash-lite",
+        "Gemini 3.1 Flash Lite": "gemini-3.1-flash-lite",
         "Gemini 3.6 Flash": "gemini-3.6-flash"
     }
     
