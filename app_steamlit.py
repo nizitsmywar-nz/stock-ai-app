@@ -1457,6 +1457,7 @@ if analyze_btn:
         except Exception:
             api_key = None
             
+    with st.spinner(f"🔍 [{ticker_input}] POC 매물대/헤지펀드 지분/공매도 세력 분석/11개 섹터 수급/VWAP 분석 및 백테스팅 실행 중..."):
         # =====================================================================
         # 💡 [병렬 처리 적용] ThreadPoolExecutor를 통한 데이터 동시 수집
         # =====================================================================
@@ -1510,7 +1511,7 @@ if analyze_btn:
             strategy_instruction_text = """* **사용자 대응 전략**: [현재 사용자가 주식을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것. 보유자 관련 문구는 일절 작성하지 말 것. 상단 [신규 진입 적격성 평가] 및 [분할 매수 밴드]와 100% 일치하는 진입 가격대와 진입 비중(예: 1차 30% 분할 진입 등)을 명확히 제시할 것.]"""
 
         # =====================================================================
-        # 💡 [신규 추가] Python 기반 정량 지표 & 손익비 사전 연산 엔진 (할루시네이션 원천 차단)
+        # 💡 Python 기반 정량 지표 & 손익비 사전 연산 엔진
         # =====================================================================
         def calculate_pre_scores(fund, tech, bt, curr_price):
             def parse_num(v):
@@ -1519,29 +1520,27 @@ if analyze_btn:
                     except: return 0.0
                 return float(v) if v else 0.0
 
-            # 1) 성장성 (20%): 실제 매출 및 EPS 성장률 기반 보수적 평균 채점 (체리피킹 방지)
+            # 1) 성장성 (20%)
             earn_g_str = fund.get('growth_factors', {}).get('earnings_growth_yoy', 'N/A')
             rev_g_str = fund.get('growth_factors', {}).get('revenue_growth_yoy', 'N/A')
             
             if earn_g_str == 'N/A' and rev_g_str == 'N/A':
-                s_growth = 5.5  # 두 데이터가 모두 없을 때만 예외 처리
+                s_growth = 5.5
             else:
                 earn_g = parse_num(earn_g_str) if earn_g_str != 'N/A' else None
                 rev_g = parse_num(rev_g_str) if rev_g_str != 'N/A' else None
                 
-                # 각 지표별 점수 산출 함수
                 def get_g_score(val):
                     if val is None: return None
                     if val >= 30.0: return 9.5
                     elif val >= 15.0: return 7.5
                     elif val >= 5.0: return 5.5
                     elif val > 0.0: return 3.5
-                    else: return 1.5 # 역성장 (0 이하)
+                    else: return 1.5
 
                 s_earn = get_g_score(earn_g)
                 s_rev = get_g_score(rev_g)
                 
-                # 두 지표가 모두 존재하면 평균을 내어 외형성장과 이익감소의 괴리를 정확히 반영
                 if s_earn is not None and s_rev is not None:
                     s_growth = (s_earn + s_rev) / 2.0
                 elif s_earn is not None:
@@ -1573,7 +1572,7 @@ if analyze_btn:
             if parse_num(fund.get('long_term_quality', {}).get('shares_change_pct', 0)) < 0: s_moat += 1.0
             s_moat = min(10.0, max(1.5, s_moat))
 
-            # 4) 밸류에이션 (20%) - 4개 지표 개별 채점 후 정확한 산술 평균
+            # 4) 밸류에이션 (20%)
             pe = fund.get('trailing_pe'); fpe = fund.get('forward_pe')
             ps = fund.get('ps_ratio'); pbr = fund.get('pbr')
             def score_v(val, b1, b2, b3, b4):
@@ -1587,8 +1586,8 @@ if analyze_btn:
             s_val = (score_v(pe, 15, 25, 40, 60) + score_v(fpe, 12, 20, 28, 35) + 
                      score_v(ps, 3, 6, 10, 15) + score_v(pbr, 3, 6, 10, 15)) / 4.0
 
-            # 5) 모멘텀 (10%) - 💡 1년 VWAP이 아닌 정확히 '20일 단기 VWAP' 기준으로 원복
-            vwap_20d = parse_num(tech.get('vwap_20d')) # vwap_1y -> vwap_20d 로 변경
+            # 5) 모멘텀 (10%) - 20일 단기 VWAP 기준
+            vwap_20d = parse_num(tech.get('vwap_20d'))
             vwap_dev = ((curr_price - vwap_20d) / vwap_20d * 100) if vwap_20d > 0 else 0
             
             if vwap_dev >= 5: s_mom1 = 9.5
@@ -1613,7 +1612,6 @@ if analyze_btn:
             
             s_mom = (s_mom1 + s_mom2 + s_mom3) / 3.0
 
-            # ✅ 총점 및 등급 산출
             total_score = (s_growth * 0.2) + (s_prof * 0.25) + (s_moat * 0.25) + (s_val * 0.2) + (s_mom * 0.1)
             
             if total_score >= 8.5: badge = "👑 최상위 핵심 우량주"
@@ -1624,26 +1622,19 @@ if analyze_btn:
             return f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
 
         def calculate_pre_risk_reward(curr_price, fib, tech):
-            # 1차 목표가를 피보나치 38.2% 또는 현재가 +10%로 설정
             target_p = fib.get('fib_38.2%')
             if not isinstance(target_p, (int, float)) or target_p <= curr_price:
                 target_p = curr_price * 1.10
-            
-            # 손절가를 2.0x ATR Stop으로 설정
             stop_p = tech.get('atr_stop_2_0x')
             if not isinstance(stop_p, (int, float)) or stop_p >= curr_price:
                 stop_p = curr_price * 0.90
-                
             up_pct = (target_p - curr_price) / curr_price * 100
             down_pct = (curr_price - stop_p) / curr_price * 100
             ratio = abs(up_pct / down_pct) if down_pct != 0 else 0
-            
             return f"기대수익 {up_pct:+.2f}% : 예상손실 {down_pct:+.2f}% (손익비 {ratio:.2f} : 1)"
 
-        # 실행 및 변수 할당
         precalc_scorecard = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p)
         precalc_rr = calculate_pre_risk_reward(curr_p, fib_levels, tech_data)
-        # =====================================================================
 
         full_rag_payload = {
             "meta": {
@@ -1674,7 +1665,6 @@ if analyze_btn:
 
         full_json_str = json.dumps(full_rag_payload, indent=2, ensure_ascii=False)
 
-        # 📌 Flash-Lite 모델의 주의력 집중을 위한 뉴스 타이틀 압축 정제
         compact_news = [{"title": item.get("title", ""), "publisher": item.get("publisher", ""), "date": item.get("date", "")} for item in news_data] if news_data else []
         compact_macro_news = [{"title": item.get("title", ""), "publisher": item.get("publisher", ""), "date": item.get("date", "")} for item in macro_news_data] if macro_news_data else []
 
