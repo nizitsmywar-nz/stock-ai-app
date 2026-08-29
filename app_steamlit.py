@@ -178,17 +178,18 @@ def fetch_stock_technical_data(ticker: str):
         # 6. ATR (14)
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         
-        # 7. VWAP (1Y & 20D)
+        # 7. VWAP (1Y & 20D) 및 컬럼 별칭 전수 등록
         typical_price = (df['High'] + df['Low'] + df['Close']) / 3.0
         cum_vol = df['Volume'].cumsum()
         cum_tp_vol = (typical_price * df['Volume']).cumsum()
         df['VWAP_1Y'] = np.where(cum_vol > 0, cum_tp_vol / cum_vol, df['Close'])
-        df['Cumulative_VWAP'] = df['VWAP_1Y']  # 백테스팅 호환용 컬럼 매핑
+        df['Cumulative_VWAP'] = df['VWAP_1Y']  # 백테스팅 호환용
         
         df['Typical_Price'] = typical_price
         df['TP_Vol_20'] = (typical_price * df['Volume']).rolling(window=20).sum()
         df['Vol_20'] = df['Volume'].rolling(window=20).sum()
         df['VWAP_20D'] = np.where(df['Vol_20'] > 0, df['TP_Vol_20'] / df['Vol_20'], df['Close'])
+        df['Rolling_VWAP_20'] = df['VWAP_20D']  # 백테스팅 호환용
         
         # 8. 최근 6개월 피보나치 되돌림
         df_6m = df.tail(126) if len(df) >= 126 else df
@@ -302,8 +303,8 @@ def run_strategy_backtest(raw_df: pd.DataFrame):
         
     df = raw_df.copy()
     
-    # 필수 지표 존재 여부 확인 및 결측치 제거
-    required_cols = ['Close', 'SMA_20', 'SMA_50', 'MACD', 'MACD_Signal', 'MACD_Diff', 'BB_Lower', 'BB_Mid', 'ATR', 'VWAP_1Y', 'VWAP_20D', 'RSI']
+    # 필수 컬럼 결측치 제거
+    required_cols = ['Close', 'SMA_20', 'SMA_50', 'BB_Lower', 'BB_Mid', 'ATR', 'VWAP_1Y', 'VWAP_20D', 'RSI']
     avail_cols = [c for c in required_cols if c in df.columns]
     if len(avail_cols) < len(required_cols):
         return {}
@@ -317,20 +318,22 @@ def run_strategy_backtest(raw_df: pd.DataFrame):
     b_ret = ((b_end - b_start) / b_start) * 100
     
     # 전략 1: 모멘텀 스퀴즈 돌파 전략 (Momentum Squeeze Breakout)
-    # 진입: MACD 상방전환(골든크로스) + 주가가 20일 이평 및 20일 VWAP 상회
-    # 청산: MACD 데드크로스 발생 시
     sig_1 = np.zeros(len(b_df))
     in_pos_1 = False
     for i in range(1, len(b_df)):
         cur = b_df.iloc[i]
         prev = b_df.iloc[i-1]
         
-        cond_macd = (prev['MACD_Diff'] <= 0 and cur['MACD_Diff'] > 0)
-        cond_price = (cur['Close'] > cur['SMA_20']) and (cur['Close'] > cur['VWAP_20D'])
+        prev_macd = prev.get('MACD_Hist', prev.get('MACD_Diff', 0))
+        cur_macd = cur.get('MACD_Hist', cur.get('MACD_Diff', 0))
+        cur_vwap20 = cur.get('Rolling_VWAP_20', cur.get('VWAP_20D', cur['SMA_20']))
+        
+        cond_macd = (prev_macd <= 0 and cur_macd > 0)
+        cond_price = (cur['Close'] > cur['SMA_20']) and (cur['Close'] > cur_vwap20)
         
         if not in_pos_1 and cond_macd and cond_price:
             in_pos_1 = True
-        elif in_pos_1 and (cur['MACD_Diff'] < 0 or cur['Close'] < cur['SMA_20']):
+        elif in_pos_1 and (cur_macd < 0 or cur['Close'] < cur['SMA_20']):
             in_pos_1 = False
             
         sig_1[i] = 1 if in_pos_1 else 0
@@ -339,14 +342,13 @@ def run_strategy_backtest(raw_df: pd.DataFrame):
     b_df['ret_1'] = b_df['pos_1'] * b_df['Close'].pct_change().fillna(0)
     
     # 전략 2: 1Y VWAP + RSI 밸류 되돌림 전략 (Mean Reversion)
-    # 진입: 1Y 누적 VWAP 하회 + RSI 42 이하 + 볼린저 밴드 하단 터치 지지
-    # 청산: 20일 이평(볼린저 중심선) 도달 또는 RSI 65 도달 시
     sig_2 = np.zeros(len(b_df))
     in_pos_2 = False
     for i in range(1, len(b_df)):
         cur = b_df.iloc[i]
+        cur_vwap1y = cur.get('Cumulative_VWAP', cur.get('VWAP_1Y', cur['SMA_50']))
         
-        cond_buy = (cur['Close'] < cur['VWAP_1Y']) and (cur['RSI'] <= 42) and (cur['Close'] <= cur['BB_Lower'] * 1.02)
+        cond_buy = (cur['Close'] < cur_vwap1y) and (cur['RSI'] <= 42) and (cur['Close'] <= cur['BB_Lower'] * 1.02)
         cond_sell = (cur['Close'] >= cur['BB_Mid']) or (cur['RSI'] >= 65)
         
         if not in_pos_2 and cond_buy:
@@ -415,7 +417,6 @@ def run_strategy_backtest(raw_df: pd.DataFrame):
             "profit_factor": pf2,
             "mdd": mdd2
         },
-        # 프롬프트 호환용 별칭 키
         "strategy_golden_cross": {
             "total_ret": f"{c_ret1:+.2f}%",
             "trades_count": c_trades1,
@@ -457,7 +458,6 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
             tot_call_oi = int(calls['openInterest'].sum()) if not calls.empty and pd.notnull(calls['openInterest'].sum()) else 0
             tot_put_oi = int(puts['openInterest'].sum()) if not puts.empty and pd.notnull(puts['openInterest'].sum()) else 0
             
-            # 개별 종목 옵션 PCR (Volume & OI 기준) 및 감마 수급 쏠림 분석
             pcr_vol = round(tot_put_vol / tot_call_vol, 2) if tot_call_vol > 0 else "N/A"
             pcr_oi = round(tot_put_oi / tot_call_oi, 2) if tot_call_oi > 0 else "N/A"
             
