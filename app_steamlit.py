@@ -502,7 +502,6 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
 @st.cache_data(ttl=300)
 def fetch_macro_indicators():
     macro_data = {}
-    # 1. FRED 국채 금리 수집
     try:
         end = datetime.now()
         start = end - timedelta(days=30)
@@ -516,7 +515,6 @@ def fetch_macro_indicators():
     except Exception:
         macro_data["us_10y_yield"] = {"source": "FRED", "value": "N/A", "date": "N/A"}
         
-    # 2. 5대 거시 자산 동시 일괄 다운로드
     asset_map = {
         "^VIX": ("vix", "CBOE Volatility Index"),
         "DX-Y.NYB": ("dollar_index", "ICE US Dollar Index"),
@@ -848,11 +846,19 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     hedge_and_short_intel = fetch_hedge_funds_and_short_intel(stock, info)
     earnings_cal = fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc)
 
+    # 💡 [신규 추가] 매출 및 EPS 성장률 데이터 수집
     earnings_growth = info.get("earningsGrowth", None) if isinstance(info, dict) else None
+    revenue_growth = info.get("revenueGrowth", None) if isinstance(info, dict) else None
+    
     if earnings_growth and earnings_growth > 0:
         est_growth = min(earnings_growth * 100, 35.0)
     else:
         est_growth = 15.0
+
+    growth_factors = {
+        "revenue_growth_yoy": f"{revenue_growth * 100:.2f}%" if revenue_growth is not None else "N/A",
+        "earnings_growth_yoy": f"{earnings_growth * 100:.2f}%" if earnings_growth is not None else "N/A"
+    }
 
     def _value_model_sanity(value, label):
         try:
@@ -964,6 +970,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         "target_mean_price": target_mean_price,
         "quality_factors": quality_factors,
         "long_term_quality": long_term_quality,
+        "growth_factors": growth_factors, # 💡 JSON에 성장성 데이터 추가
         "ownership_and_shorts": ownership_and_shorts,
         "hedge_and_short_intel": hedge_and_short_intel,
         "earnings_calendar": earnings_cal,
@@ -1097,6 +1104,7 @@ def extract_clean_text(content):
     elif isinstance(content, list):
         return "\n".join([p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in content])
     return str(content)
+    
 # =============================================================================
 # [BLOCK 07] 증권사 투자의견 & LLM 응답 파서
 # =============================================================================
@@ -1482,8 +1490,24 @@ if analyze_btn:
                     except: return 0.0
                 return float(v) if v else 0.0
 
-            # 1) 성장성 (20%): EPS 데이터 부재 시 기본 중간값 부여
-            s_growth = 5.5 
+            # 1) 성장성 (20%): 💡 실제 매출/EPS 성장률 기반 정량 채점 (하드코딩 제거)
+            earn_g_str = fund.get('growth_factors', {}).get('earnings_growth_yoy', 'N/A')
+            rev_g_str = fund.get('growth_factors', {}).get('revenue_growth_yoy', 'N/A')
+            
+            if earn_g_str == 'N/A' and rev_g_str == 'N/A':
+                s_growth = 5.5  # API에서 데이터를 아예 주지 않을 때만 예외 처리
+            else:
+                earn_g = parse_num(earn_g_str)
+                rev_g = parse_num(rev_g_str)
+                
+                # EPS 성장률과 매출 성장률 중 더 높은 수치를 기준으로 판단
+                best_g = max(earn_g, rev_g)
+                
+                if best_g >= 30.0: s_growth = 9.5
+                elif best_g >= 15.0: s_growth = 7.5
+                elif best_g >= 5.0: s_growth = 5.5
+                elif best_g > 0.0: s_growth = 3.5
+                else: s_growth = 1.5 # 역성장
 
             # 2) 수익성 (25%)
             opm = parse_num(fund.get('quality_factors', {}).get('operating_margin', 0))
@@ -1671,7 +1695,7 @@ if analyze_btn:
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
 
 1. 거시환경 및 시장 국면
-- **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 명시할 것. (⚠️경고: 각 자산별 수집 기준일자(date)가 다를 수 있으므로, 임의로 하나의 날짜로 통일하거나 왜곡하지 말고 JSON에 명시된 날짜를 개별적으로 정확히 기재할 것)
+- **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 명시할 것. (⚠️경고: 각 자산별 수집 기준일자(date)가 다를 수 있으므로, 임의로 하나의 날짜로 통일하거나 왜곡하지 말고 JSON에 명시된 날짜를 개별적으로 정확히 기재할 것. **또한 JSON 값에 `NaN`, `N/A` 등으로 데이터가 누락되어 있다면 절대 임의의 숫자를 창작하지 말고 '수집 불가'로 있는 그대로 표기할 것.**)
 - 경기 국면 판정 및 최신 매크로 지표/뉴스를 직접 인용하여 [6대 유동성 자산 변동 예측] (현금, 채권, 주식, 코인, 금, 원유).
 - **[자산배분 코멘트 – 근거 없는 수치 생성 금지 (필수)]**: 주입된 데이터(10년물 국채금리, VIX, 달러인덱스, 유가, 금, 비트코인)만을 근거로 방향성(예: "국채 비중 확대 고려" 등)을 서술할 것. "주식 40% : 채권 30%"처럼 **구체적인 퍼센트 배분 수치는 절대 임의로 생성하지 말 것** — 그런 수치를 뒷받침할 데이터가 제공되지 않았으므로, 정량 배분표 대신 정성적 방향성만 제시할 것.
 
