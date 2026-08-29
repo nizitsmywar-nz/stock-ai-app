@@ -384,7 +384,7 @@ def run_strategy_backtest(df: pd.DataFrame):
 
     def calc_stats(trades):
         if not trades:
-            return {"total_ret": 0.0, "win_rate": 0.0, "trades_count": 0, "profit_factor": 0.0, "mdd": 0.0}
+            return {"total_ret": 0.0, "win_rate": 0.0, "trades_count": 0, "profit_factor": 0.0, "mdd": 0.0, "sharpe_ratio": 0.0}
         
         cum = 1.0
         peak = 1.0
@@ -406,12 +406,22 @@ def run_strategy_backtest(df: pd.DataFrame):
         sum_loss = abs(sum(losses)) if losses else 0
         pf = round(sum_win / sum_loss, 2) if sum_loss > 0 else (99.9 if sum_win > 0 else 0.0)
 
+        # 📌 샤프비율 연산 (무위험 수익률 0 가정, 단위 매매당 표준편차 기반)
+        if len(trades) > 1:
+            std_dev = np.std(trades, ddof=1)
+            sharpe = round((np.mean(trades) / std_dev), 2) if std_dev > 0 else 0.0
+        elif len(trades) == 1 and trades[0] > 0:
+            sharpe = 1.0 
+        else:
+            sharpe = 0.0
+
         return {
             "total_ret": round(tot_ret, 2),
             "win_rate": round(win_rate, 1),
             "trades_count": len(trades),
             "profit_factor": pf,
-            "mdd": round(mdd * 100, 2)
+            "mdd": round(mdd * 100, 2),
+            "sharpe_ratio": sharpe
         }
 
     return {
@@ -722,7 +732,27 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     revenue_per_share = info.get("revenuePerShare", None) if isinstance(info, dict) else None
     target_mean_price = info.get("targetMeanPrice", "N/A") if isinstance(info, dict) else "N/A"
 
-    # 📌 우량성 & 펀더멘털 정밀 검증 팩터 (FCF, D/E, Gross Margin, Operating Margin)
+    # 📌 R&D 비중 계산 (해자 점수용)
+    rnd_ratio_fmt = "N/A"
+    try:
+        inc = stock.financials
+        if not inc.empty:
+            rnd_val = 0
+            for col in ["Research And Development", "Research & Development", "Research Expense"]:
+                if col in inc.index:
+                    rnd_val = inc.loc[col].iloc[0]
+                    break
+            
+            tot_rev = 0
+            if "Total Revenue" in inc.index:
+                tot_rev = inc.loc["Total Revenue"].iloc[0]
+                
+            if tot_rev > 0 and pd.notnull(rnd_val):
+                rnd_ratio_fmt = f"{(rnd_val / tot_rev) * 100:.2f}%"
+    except Exception:
+        pass
+
+    # 📌 우량성 & 펀더멘털 정밀 검증 팩터
     fcf_raw = info.get("freeCashflow", None) if isinstance(info, dict) else None
     fcf_fmt = format_market_cap(fcf_raw) if fcf_raw else "N/A"
     
@@ -739,10 +769,11 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         "free_cash_flow": fcf_fmt,
         "debt_to_equity": de_fmt,
         "gross_margin": gross_margin_fmt,
-        "operating_margin": op_margin_fmt
+        "operating_margin": op_margin_fmt,
+        "rnd_to_revenue": rnd_ratio_fmt
     }
 
-    # 📌 장기 퀄리티 & 주주환원 지표 (3개년 FCF, ROIC, 주식 수 증감 등) 추가 수집 로직
+    # 📌 장기 퀄리티 & 주주환원 지표 (3개년 FCF, ROIC, 주식 수 증감 등)
     long_term_quality = {
         "3y_fcf_status": "N/A",
         "roic": "N/A",
@@ -1483,7 +1514,7 @@ if analyze_btn:
 10. S&P 500 11개 전 섹터 실시간 등락률 및 모멘텀:
 {sector_json}
 
-11. 펀더멘털 및 6대 밸류에이션 (장기 퀄리티 지표 포함):
+11. 펀더멘털 및 6대 밸류에이션 (장기 퀄리티 지표 및 R&D 비중 포함):
 {fund_json}
 
 12. 사용자 보유 현황:
@@ -1521,11 +1552,18 @@ if analyze_btn:
 - 스코어카드 산출 (정량 앵커 및 대리지표 가중 채점 규칙 엄격 준수):
   * [항목별 10점 만점 정량 앵커]:
     1) 성장성 (20%): EPS 및 실적 성장률 (30%+ 9~10점 | 15~29% 7~8점 | 5~14% 5~6점 | 역성장 1~4점)
-    2) 수익성 (25%): FCF 흑자 규모 및 OPM (OPM 20%+ & FCF 대규모 흑자 9~10점 | FCF 적자 1~4점) **(단, 3년 연속 FCF 흑자 및 고 ROIC 입증 시 가산점 +1.0~+2.0점 추가 반영)**
+    2) 수익성 (25%): FCF 흑자 규모 및 OPM 5단계 구간
+       - OPM 20%+ & FCF 대규모 흑자: 9~10점
+       - OPM 15~19%: 7~8점
+       - OPM 8~14%: 5~6점
+       - OPM 0~7%: 3~4점
+       - FCF 적자: 1~2점
+       (가산점: 고ROIC(15%+) 입증 시 +1.0~+1.5점만 추가. 'FCF 흑자 지속'은 위 구간표에 이미 반영되어 있으므로 가산점 중복 사유로 사용 금지. 항목 총점은 base+가산점을 min(10, ...)으로 상한 적용)
     3) 해자 (25% - 5대 대리지표 가산점 합산):
-       - 영업이익률 35%+ (+2.5) | ROE 20%+ (+2.5) | 매출총이익률 50%+ (+2.5) | 기관지분율 70%+ (+1.5) | 부채비율 100%이하 (+1.0)
+       - ROE 20%+ (+2.5) | 매출총이익률 50%+ (+2.5) | R&D비중 5%+ (+2.5) | 기관지분율 70%+ (+1.5) | 부채비율 100%이하 (+1.0)
+       (※ '영업이익률'은 수익성 항목과 중복되므로 해자 지표에서 제외하고 R&D비중으로 대체함 - 마진과 상관관계가 낮은 별도 해자 신호 확보 목적)
        - *한계 명시: "해자 점수는 재무 대리지표 기반 정량 근사치임"
-       - **(단, 주식 수 감소 등 주주환원 우수 시 가산점 +1.0~+1.5점 추가 반영)**
+       (가산점: 주식 수 감소 등 주주환원 우수 시 +1.0~+1.5점. 항목 총점은 base+가산점을 min(10, ...)으로 상한 적용)
     4) 밸류에이션 (20% - Trailing/Forward PE, PSR, PBR 구간 평균):
        - 9~10점: Trailing PE ≤15, Forward PE ≤12, PS ≤3, PBR ≤3
        - 7~8점: Trailing PE 15~25, Forward PE 12~20, PS 3~6, PBR 3~6
@@ -1533,8 +1571,11 @@ if analyze_btn:
        - 3~4점: Trailing PE 40~60, Forward PE 28~35, PS 10~15, PBR 10~15
        - 1~2점: Trailing PE >60, Forward PE >35, PS >15, PBR >15
        (※ 성장주 핑계로 임의 상향 금지, PBR 음수 시 나머지 3개 지표 평균)
-    5) 퀀트/모멘텀 (10%): VWAP 상회 여부, RSI 모멘텀, 과거 백테스팅 성과 유효성
-
+    5) 퀀트/모멘텀 (10% - 아래 3개 서브지표 평균):
+       - VWAP 이격도((현재가-VWAP)/VWAP×100): +5%↑ 9~10점 | 0~5% 7~8점 | -2~0% 5~6점 | -5~-2% 3~4점 | -5%↓ 1~2점
+       - RSI: 55~70 9점 | 45~55 7점 | 30~45 5점 | 70초과(과매수) 4점 | 30미만(과매도) 2점
+       - 백테스팅 샤프비율: 1.5+ 9~10점 | 1.0~1.4 7~8점 | 0.5~0.9 5~6점 | 0~0.4 3~4점 | 음수 1~2점
+       (세 서브지표를 단순 평균해 항목 점수로 사용. '유효성'처럼 정성적 표현 대신 반드시 위 구간표로만 채점)
   * 종합 평점 계산식: (수익성×0.25) + (해자×0.25) + (밸류에이션×0.20) + (성장성×0.20) + (모멘텀×0.10)
   * 표기 형식: 성장성(X), 수익성(X), 밸류에이션(X), 해자(X), 퀀트/모멘텀(X) | 종합 평점: X.X/10 (등급 이모지 및 판정명)
   * [우량성 등급 기준]:
