@@ -496,8 +496,13 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
             return None
     return None
 
+# -------------------------------------------------------------
+# 📌 매크로 지표 수집기 (5분 캐싱 + 일괄 다운로드 최적화)
+# -------------------------------------------------------------
+@st.cache_data(ttl=300)
 def fetch_macro_indicators():
     macro_data = {}
+    # 1. FRED 국채 금리 수집
     try:
         end = datetime.now()
         start = end - timedelta(days=30)
@@ -511,26 +516,36 @@ def fetch_macro_indicators():
     except Exception:
         macro_data["us_10y_yield"] = {"source": "FRED", "value": "N/A", "date": "N/A"}
         
-    asset_tickers = [
-        ("vix", "^VIX", "CBOE Volatility Index"),
-        ("dollar_index", "DX-Y.NYB", "ICE US Dollar Index"),
-        ("wti_oil", "CL=F", "NYMEX WTI Crude Oil"),
-        ("gold", "GC=F", "COMEX Gold Futures"),
-        ("bitcoin", "BTC-USD", "Binance/Coinbase Crypto Market")
-    ]
-    for name, ticker, src_name in asset_tickers:
-        try:
-            hist = yf.Ticker(ticker).history(period="5d")
-            if not hist.empty:
-                macro_data[name] = {
-                    "source": src_name,
-                    "value": round(float(hist['Close'].iloc[-1]), 2),
-                    "date": hist.index[-1].strftime("%Y-%m-%d")
-                }
-            else:
+    # 2. 5대 거시 자산 동시 일괄 다운로드
+    asset_map = {
+        "^VIX": ("vix", "CBOE Volatility Index"),
+        "DX-Y.NYB": ("dollar_index", "ICE US Dollar Index"),
+        "CL=F": ("wti_oil", "NYMEX WTI Crude Oil"),
+        "GC=F": ("gold", "COMEX Gold Futures"),
+        "BTC-USD": ("bitcoin", "Binance/Coinbase Crypto Market")
+    }
+    
+    try:
+        tickers = list(asset_map.keys())
+        df = yf.download(tickers, period="5d", progress=False)['Close']
+        
+        for ticker, (name, src_name) in asset_map.items():
+            try:
+                hist = df[ticker].dropna()
+                if not hist.empty:
+                    macro_data[name] = {
+                        "source": src_name,
+                        "value": round(float(hist.iloc[-1]), 2),
+                        "date": hist.index[-1].strftime("%Y-%m-%d")
+                    }
+                else:
+                    macro_data[name] = {"source": src_name, "value": "N/A", "date": "N/A"}
+            except Exception:
                 macro_data[name] = {"source": src_name, "value": "N/A", "date": "N/A"}
-        except Exception:
+    except Exception:
+        for ticker, (name, src_name) in asset_map.items():
             macro_data[name] = {"source": src_name, "value": "N/A", "date": "N/A"}
+            
     return macro_data
 
 def format_market_cap(market_cap):
@@ -957,41 +972,47 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     }
 
 # -------------------------------------------------------------
-# 📌 S&P 500 11개 전 섹터 5일/1개월 수익률 수집
+# 📌 S&P 500 11개 전 섹터 수익률 수집 (5분 캐싱 + 일괄 다운로드 적용)
 # -------------------------------------------------------------
+@st.cache_data(ttl=300)
 def fetch_sector_performance():
-    sector_etfs = [
-        ("XLK", "IT/기술 (Technology)"),
-        ("XLC", "커뮤니케이션 (Communication Services)"),
-        ("XLY", "임의소비재 (Consumer Discretionary)"),
-        ("XLP", "필수소비재 (Consumer Staples)"),
-        ("XLF", "금융 (Financials)"),
-        ("XLV", "헬스케어 (Health Care)"),
-        ("XLI", "산업재 (Industrials)"),
-        ("XLE", "에너지 (Energy)"),
-        ("XLB", "소재 (Materials)"),
-        ("XLU", "유틸리티 (Utilities)"),
-        ("XLRE", "부동산 (Real Estate)")
-    ]
+    sector_etfs = {
+        "XLK": "IT/기술 (Technology)", "XLC": "커뮤니케이션 (Communication Services)",
+        "XLY": "임의소비재 (Consumer Discretionary)", "XLP": "필수소비재 (Consumer Staples)",
+        "XLF": "금융 (Financials)", "XLV": "헬스케어 (Health Care)",
+        "XLI": "산업재 (Industrials)", "XLE": "에너지 (Energy)",
+        "XLB": "소재 (Materials)", "XLU": "유틸리티 (Utilities)",
+        "XLRE": "부동산 (Real Estate)"
+    }
     summary = {}
-    for etf, name in sector_etfs:
-        try:
-            hist = yf.Ticker(etf).history(period="1mo")
-            if len(hist) >= 2:
-                pct_5d = ((hist['Close'].iloc[-1] - hist['Close'].iloc[-5]) / hist['Close'].iloc[-5] * 100) if len(hist) >= 5 else ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100)
-                pct_1m = ((hist['Close'].iloc[-1] - hist['Close'].iloc[0]) / hist['Close'].iloc[0] * 100)
-                summary[etf] = {
-                    "sector_name": name,
-                    "return_5d": f"{pct_5d:+.2f}%",
-                    "return_1m": f"{pct_1m:+.2f}%",
-                    "latest_close": round(float(hist['Close'].iloc[-1]), 2)
-                }
-            else:
+    
+    try:
+        tickers = list(sector_etfs.keys())
+        df = yf.download(tickers, period="1mo", progress=False)['Close']
+        
+        for etf, name in sector_etfs.items():
+            try:
+                hist = df[etf].dropna()
+                if len(hist) >= 2:
+                    pct_5d = ((hist.iloc[-1] - hist.iloc[-5]) / hist.iloc[-5] * 100) if len(hist) >= 5 else ((hist.iloc[-1] - hist.iloc[0]) / hist.iloc[0] * 100)
+                    pct_1m = ((hist.iloc[-1] - hist.iloc[0]) / hist.iloc[0] * 100)
+                    summary[etf] = {
+                        "sector_name": name,
+                        "return_5d": f"{pct_5d:+.2f}%",
+                        "return_1m": f"{pct_1m:+.2f}%",
+                        "latest_close": round(float(hist.iloc[-1]), 2)
+                    }
+                else:
+                    summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
+            except Exception:
                 summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
-        except Exception:
+    except Exception:
+        for etf, name in sector_etfs.items():
             summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
+            
     return summary
 
+@st.cache_data(ttl=300)
 def fetch_news(ticker: str, limit: int = 5):
     try:
         stock = yf.Ticker(ticker)
@@ -1031,6 +1052,7 @@ def fetch_news(ticker: str, limit: int = 5):
     except Exception:
         return []
 
+@st.cache_data(ttl=300)
 def fetch_macro_news(limit: int = 4):
     macro_articles = []
     for sym in ["SPY", "TLT"]:
@@ -1075,7 +1097,6 @@ def extract_clean_text(content):
     elif isinstance(content, list):
         return "\n".join([p["text"] if isinstance(p, dict) and "text" in p else str(p) for p in content])
     return str(content)
-
 # =============================================================================
 # [BLOCK 07] 증권사 투자의견 & LLM 응답 파서
 # =============================================================================
