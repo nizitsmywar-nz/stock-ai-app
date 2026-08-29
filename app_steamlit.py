@@ -1490,24 +1490,37 @@ if analyze_btn:
                     except: return 0.0
                 return float(v) if v else 0.0
 
-            # 1) 성장성 (20%): 💡 실제 매출/EPS 성장률 기반 정량 채점 (하드코딩 제거)
+            # 1) 성장성 (20%): 실제 매출 및 EPS 성장률 기반 보수적 평균 채점 (체리피킹 방지)
             earn_g_str = fund.get('growth_factors', {}).get('earnings_growth_yoy', 'N/A')
             rev_g_str = fund.get('growth_factors', {}).get('revenue_growth_yoy', 'N/A')
             
             if earn_g_str == 'N/A' and rev_g_str == 'N/A':
-                s_growth = 5.5  # API에서 데이터를 아예 주지 않을 때만 예외 처리
+                s_growth = 5.5  # 두 데이터가 모두 없을 때만 예외 처리
             else:
-                earn_g = parse_num(earn_g_str)
-                rev_g = parse_num(rev_g_str)
+                earn_g = parse_num(earn_g_str) if earn_g_str != 'N/A' else None
+                rev_g = parse_num(rev_g_str) if rev_g_str != 'N/A' else None
                 
-                # EPS 성장률과 매출 성장률 중 더 높은 수치를 기준으로 판단
-                best_g = max(earn_g, rev_g)
+                # 각 지표별 점수 산출 함수
+                def get_g_score(val):
+                    if val is None: return None
+                    if val >= 30.0: return 9.5
+                    elif val >= 15.0: return 7.5
+                    elif val >= 5.0: return 5.5
+                    elif val > 0.0: return 3.5
+                    else: return 1.5 # 역성장 (0 이하)
+
+                s_earn = get_g_score(earn_g)
+                s_rev = get_g_score(rev_g)
                 
-                if best_g >= 30.0: s_growth = 9.5
-                elif best_g >= 15.0: s_growth = 7.5
-                elif best_g >= 5.0: s_growth = 5.5
-                elif best_g > 0.0: s_growth = 3.5
-                else: s_growth = 1.5 # 역성장
+                # 두 지표가 모두 존재하면 평균을 내어 외형성장과 이익감소의 괴리를 정확히 반영
+                if s_earn is not None and s_rev is not None:
+                    s_growth = (s_earn + s_rev) / 2.0
+                elif s_earn is not None:
+                    s_growth = s_earn
+                elif s_rev is not None:
+                    s_growth = s_rev
+                else:
+                    s_growth = 5.5
 
             # 2) 수익성 (25%)
             opm = parse_num(fund.get('quality_factors', {}).get('operating_margin', 0))
