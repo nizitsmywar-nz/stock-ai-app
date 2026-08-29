@@ -9,6 +9,10 @@ import re
 import warnings
 from datetime import datetime, timedelta, timezone
 
+import requests
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
 import streamlit as st
 import pandas as pd
 import numpy as np
@@ -28,6 +32,29 @@ KST = timezone(timedelta(hours=9))
 
 def get_current_kst_time_str():
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
+
+# -------------------------------------------------------------
+# 💡 [신규 추가] 커넥션 풀링 & User-Agent 세션 생성 (야후 봇 차단 방어)
+# -------------------------------------------------------------
+def init_global_session():
+    session = requests.Session()
+    session.headers.update({
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/122.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5"
+    })
+    retries = Retry(
+        total=2,
+        backoff_factor=0.3,
+        status_forcelist=[429, 500, 502, 503, 504],
+        raise_on_status=False
+    )
+    adapter = HTTPAdapter(pool_connections=20, pool_maxsize=20, max_retries=retries)
+    session.mount("https://", adapter)
+    session.mount("http://", adapter)
+    return session
+
+GLOBAL_SESSION = init_global_session()
 
 st.set_page_config(
     page_title="AI Stock Valuation Dashboard Pro",
@@ -134,10 +161,7 @@ if "last_analysis_result" not in st.session_state:
 # =============================================================================
 # [BLOCK 04] 기술적 지표 & 퀀트 매물대 연산 엔진
 # =============================================================================
-# -------------------------------------------------------------
-# 1. RAG 데이터 수집 모듈 (기술적 지표, BB Squeeze, VWAP, Volume Profile POC 등)
-# -------------------------------------------------------------
-def get_stock_info_with_retry(stock, retries=3):
+def get_stock_info_with_retry(stock, retries=2):
     for attempt in range(retries):
         try:
             info = stock.info
@@ -146,7 +170,7 @@ def get_stock_info_with_retry(stock, retries=3):
         except Exception:
             pass
         if attempt < retries - 1:
-            time.sleep(1.0 * (attempt + 1))
+            time.sleep(0.5 * (attempt + 1))
             
     try:
         fallback_info = stock.info or {}
@@ -157,7 +181,7 @@ def get_stock_info_with_retry(stock, retries=3):
     return {}, "stock.fast_info"
 
 def fetch_stock_technical_data(ticker: str):
-    stock = yf.Ticker(ticker)
+    stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
     df = stock.history(period="1y")
     if df.empty:
         df = stock.history(period="6mo")
@@ -218,7 +242,6 @@ def fetch_stock_technical_data(ticker: str):
     low_6m = float(df_6m['Low'].min())
     diff_hl = high_6m - low_6m
     
-    # 📌 피보나치 되돌림 밴드
     fibonacci_levels = {
         "high_6m": round(high_6m, 2),
         "low_6m": round(low_6m, 2),
@@ -228,7 +251,6 @@ def fetch_stock_technical_data(ticker: str):
         "fib_61.8%": round(high_6m - (0.618 * diff_hl), 2)
     }
     
-    # 📌 최근 6개월 매물대 프로파일 및 POC (Point of Control) 연산
     volume_profile = {}
     try:
         num_bins = 30
@@ -243,7 +265,6 @@ def fetch_stock_technical_data(ticker: str):
         poc_idx = int(np.argmax(vol_by_bin))
         poc_price = round(float((price_bins[poc_idx] + price_bins[poc_idx + 1]) / 2), 2)
         
-        # 70% Value Area (VAH / VAL)
         tot_vol = np.sum(vol_by_bin)
         target_va_vol = tot_vol * 0.70
         sorted_indices = np.argsort(vol_by_bin)[::-1]
@@ -436,10 +457,10 @@ def run_strategy_backtest(df: pd.DataFrame):
 # -------------------------------------------------------------
 # 📌 옵션 체인 스마트머니 수급 수집기
 # -------------------------------------------------------------
-def fetch_nearest_options_data(ticker: str, retries: int = 3):
+def fetch_nearest_options_data(ticker: str, retries: int = 2):
     for attempt in range(retries):
         try:
-            stock = yf.Ticker(ticker)
+            stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
             expirations = getattr(stock, 'options', None)
             if not expirations:
                 return None
@@ -451,7 +472,7 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
             
             if calls is None or puts is None or calls.empty or puts.empty:
                 if attempt < retries - 1:
-                    time.sleep(1.0 * (attempt + 1))
+                    time.sleep(0.5 * (attempt + 1))
                     continue
                 return None
                 
@@ -491,13 +512,13 @@ def fetch_nearest_options_data(ticker: str, retries: int = 3):
             }
         except Exception:
             if attempt < retries - 1:
-                time.sleep(1.0 * (attempt + 1))
+                time.sleep(0.5 * (attempt + 1))
                 continue
             return None
     return None
 
 # -------------------------------------------------------------
-# 📌 매크로 지표 수집기 (5분 캐싱 + 일괄 다운로드 최적화)
+# 📌 매크로 지표 수집기 (5분 캐싱 복구 + 일괄 다운로드 최적화)
 # -------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_macro_indicators():
@@ -505,7 +526,7 @@ def fetch_macro_indicators():
     try:
         end = datetime.now()
         start = end - timedelta(days=30)
-        fred_res = web.DataReader('DGS10', 'fred', start, end).dropna()
+        fred_res = web.DataReader('DGS10', 'fred', start, end, session=GLOBAL_SESSION).dropna()
         dgs10 = fred_res.iloc[-1, 0]
         macro_data["us_10y_yield"] = {
             "source": "FRED (Federal Reserve Economic Data)",
@@ -525,7 +546,7 @@ def fetch_macro_indicators():
     
     try:
         tickers = list(asset_map.keys())
-        df = yf.download(tickers, period="5d", progress=False)['Close']
+        df = yf.download(tickers, period="5d", progress=False, session=GLOBAL_SESSION)['Close']
         
         for ticker, (name, src_name) in asset_map.items():
             try:
@@ -718,8 +739,8 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
     }
 
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
-    stock = yf.Ticker(ticker)
-    info, info_source = get_stock_info_with_retry(stock, retries=3)
+    stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
+    info, info_source = get_stock_info_with_retry(stock, retries=2)
 
     fast_info = {}
     try:
@@ -745,7 +766,6 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     revenue_per_share = info.get("revenuePerShare", None) if isinstance(info, dict) else None
     target_mean_price = info.get("targetMeanPrice", "N/A") if isinstance(info, dict) else "N/A"
 
-    # 📌 R&D 비중 계산 (해자 점수용)
     rnd_ratio_fmt = "N/A"
     try:
         inc = stock.financials
@@ -755,17 +775,12 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
                 if col in inc.index:
                     rnd_val = inc.loc[col].iloc[0]
                     break
-            
-            tot_rev = 0
-            if "Total Revenue" in inc.index:
-                tot_rev = inc.loc["Total Revenue"].iloc[0]
-                
+            tot_rev = inc.loc["Total Revenue"].iloc[0] if "Total Revenue" in inc.index else 0
             if tot_rev > 0 and pd.notnull(rnd_val):
                 rnd_ratio_fmt = f"{(rnd_val / tot_rev) * 100:.2f}%"
     except Exception:
         pass
 
-    # 📌 우량성 & 펀더멘털 정밀 검증 팩터
     fcf_raw = info.get("freeCashflow", None) if isinstance(info, dict) else None
     fcf_fmt = format_market_cap(fcf_raw) if fcf_raw else "N/A"
     
@@ -786,7 +801,6 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         "rnd_to_revenue": rnd_ratio_fmt
     }
 
-    # 📌 장기 퀄리티 & 주주환원 지표 (3개년 FCF, ROIC, 주식 수 증감 등)
     long_term_quality = {
         "3y_fcf_status": "N/A",
         "roic": "N/A",
@@ -846,7 +860,6 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     hedge_and_short_intel = fetch_hedge_funds_and_short_intel(stock, info)
     earnings_cal = fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc)
 
-    # 💡 [신규 추가] 매출 및 EPS 성장률 데이터 수집
     earnings_growth = info.get("earningsGrowth", None) if isinstance(info, dict) else None
     revenue_growth = info.get("revenueGrowth", None) if isinstance(info, dict) else None
     
@@ -970,7 +983,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         "target_mean_price": target_mean_price,
         "quality_factors": quality_factors,
         "long_term_quality": long_term_quality,
-        "growth_factors": growth_factors, # 💡 JSON에 성장성 데이터 추가
+        "growth_factors": growth_factors,
         "ownership_and_shorts": ownership_and_shorts,
         "hedge_and_short_intel": hedge_and_short_intel,
         "earnings_calendar": earnings_cal,
@@ -979,7 +992,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     }
 
 # -------------------------------------------------------------
-# 📌 S&P 500 11개 전 섹터 수익률 수집 (5분 캐싱 + 일괄 다운로드 적용)
+# 📌 S&P 500 11개 전 섹터 수익률 수집 (5분 캐싱 적용)
 # -------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_sector_performance():
@@ -995,7 +1008,7 @@ def fetch_sector_performance():
     
     try:
         tickers = list(sector_etfs.keys())
-        df = yf.download(tickers, period="1mo", progress=False)['Close']
+        df = yf.download(tickers, period="1mo", progress=False, session=GLOBAL_SESSION)['Close']
         
         for etf, name in sector_etfs.items():
             try:
@@ -1022,7 +1035,7 @@ def fetch_sector_performance():
 @st.cache_data(ttl=300)
 def fetch_news(ticker: str, limit: int = 5):
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
         raw_news = getattr(stock, 'news', None)
         if not raw_news:
             return []
@@ -1064,7 +1077,7 @@ def fetch_macro_news(limit: int = 4):
     macro_articles = []
     for sym in ["SPY", "TLT"]:
         try:
-            stock = yf.Ticker(sym)
+            stock = yf.Ticker(sym, session=GLOBAL_SESSION)
             raw = getattr(stock, 'news', None)
             if raw:
                 for n in raw[:2]:
@@ -1558,9 +1571,10 @@ if analyze_btn:
             s_val = (score_v(pe, 15, 25, 40, 60) + score_v(fpe, 12, 20, 28, 35) + 
                      score_v(ps, 3, 6, 10, 15) + score_v(pbr, 3, 6, 10, 15)) / 4.0
 
-            # 5) 모멘텀 (10%) - 빈틈없는 구간 설정
-            vwap1y = parse_num(tech.get('vwap_1y'))
-            vwap_dev = ((curr_price - vwap1y) / vwap1y * 100) if vwap1y > 0 else 0
+            # 5) 모멘텀 (10%) - 💡 1년 VWAP이 아닌 정확히 '20일 단기 VWAP' 기준으로 원복
+            vwap_20d = parse_num(tech.get('vwap_20d')) # vwap_1y -> vwap_20d 로 변경
+            vwap_dev = ((curr_price - vwap_20d) / vwap_20d * 100) if vwap_20d > 0 else 0
+            
             if vwap_dev >= 5: s_mom1 = 9.5
             elif vwap_dev >= 0: s_mom1 = 7.5
             elif vwap_dev >= -2: s_mom1 = 5.5
