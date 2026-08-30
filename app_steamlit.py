@@ -1662,7 +1662,7 @@ if analyze_btn:
         # =====================================================================
         # 💡 Python 기반 정량 지표 & 손익비 사전 연산 엔진
         # =====================================================================
-        def calculate_pre_scores(fund, tech, bt, curr_price):
+        def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
             def parse_num(v):
                 if isinstance(v, str):
                     try: return float(re.sub(r'[^0-9.-]', '', v))
@@ -1752,13 +1752,66 @@ if analyze_btn:
             elif rsi > 70: s_mom2 = 4.0
             else: s_mom2 = 2.0
 
-            sharpe = bt.get('strategy_2_vwap_mean_reversion', {}).get('sharpe_ratio', 0) if bt else 0
-            if sharpe >= 1.5: s_mom3 = 9.5
-            elif sharpe >= 1.0: s_mom3 = 7.5
-            elif sharpe >= 0.5: s_mom3 = 5.5
-            elif sharpe >= 0.0: s_mom3 = 3.5
-            else: s_mom3 = 1.5
-            
+            # 💡 [개선 4-B] 이 스코어카드는 "우량주 장기 평가"가 목적이므로,
+            # 단기 백테스트(모멘텀 스퀴즈/평균회귀 어느 쪽이든)의 Sharpe를
+            # 그대로 쓰는 대신, 우량주 철학에 맞는 "장기 추세 정합성" 지표로
+            # 대체한다: (a) 이동평균 정배열 여부(단기 추세가 중장기 추세와
+            # 같은 방향인가), (b) 최근 6개월 실제 수익률(장기 추세가 실제로
+            # 우상향해왔는가). 단기 매매 백테스트 결과는 항목명 그대로
+            # "1Y 백테스팅" 섹션에만 남기고, 종합 스코어카드에는 반영하지 않는다.
+            def _trend_alignment_score(price, sma60, sma120):
+                if not (isinstance(price, (int, float)) and isinstance(sma60, (int, float))
+                        and isinstance(sma120, (int, float)) and price > 0):
+                    return None
+                if price > sma60 > sma120:
+                    return 9.5   # 완전 정배열: 단기>중기>장기 (건강한 상승 추세)
+                elif price > sma60 and price > sma120:
+                    return 7.5   # 정배열은 아니지만 가격이 두 이평선 모두 상회
+                elif price > sma120:
+                    return 5.5   # 장기 추세선 위, 단기 조정 국면
+                elif price > sma60:
+                    return 4.5   # 단기만 반등, 장기 추세는 아직 약세
+                else:
+                    return 2.5   # 단기·장기 이평선 모두 하회: 장기 추세 훼손
+
+            def _six_month_return_score(df):
+                try:
+                    if df is None or df.empty:
+                        return None
+                    df6 = df.tail(126) if len(df) >= 126 else df
+                    if len(df6) < 2:
+                        return None
+                    start_p = float(df6['Close'].iloc[0])
+                    end_p = float(df6['Close'].iloc[-1])
+                    if start_p <= 0:
+                        return None
+                    ret6 = (end_p - start_p) / start_p * 100
+                    if ret6 >= 30: return 9.5, ret6
+                    elif ret6 >= 15: return 7.5, ret6
+                    elif ret6 >= 0: return 5.5, ret6
+                    elif ret6 >= -15: return 3.5, ret6
+                    else: return 1.5, ret6
+                except Exception:
+                    return None
+
+            trend_score = _trend_alignment_score(curr_price, tech.get('sma_60'), tech.get('sma_120'))
+            ret6_result = _six_month_return_score(price_df)
+            ret6_score = ret6_result[0] if ret6_result else None
+            ret6_pct = ret6_result[1] if ret6_result else None
+
+            parts = [p for p in (trend_score, ret6_score) if p is not None]
+            if parts:
+                s_mom3 = sum(parts) / len(parts)
+                note_bits = []
+                if trend_score is not None:
+                    note_bits.append(f"이평선 정합성 {trend_score:.1f}")
+                if ret6_score is not None:
+                    note_bits.append(f"6개월 수익률 {ret6_pct:+.1f}%({ret6_score:.1f}점)")
+                s_mom3_note = "장기추세 " + ", ".join(note_bits) + " 기반"
+            else:
+                s_mom3 = 5.5
+                s_mom3_note = "장기추세 데이터 부족 - 중립 처리"
+
             s_mom = (s_mom1 + s_mom2 + s_mom3) / 3.0
 
             total_score = (s_growth * 0.2) + (s_prof * 0.25) + (s_moat * 0.25) + (s_val * 0.2) + (s_mom * 0.1)
@@ -1768,7 +1821,7 @@ if analyze_btn:
             elif total_score >= 6.0: badge = "⚠️ 조건부 종목"
             else: badge = "🚨 비우량주"
             
-            return f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
+            return f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f} · {s_mom3_note}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
 
         def calculate_pre_risk_reward(curr_price, fib, tech):
             target_p = fib.get('fib_38.2%')
@@ -1782,7 +1835,7 @@ if analyze_btn:
             ratio = abs(up_pct / down_pct) if down_pct != 0 else 0
             return f"기대수익 {up_pct:+.2f}% : 예상손실 {down_pct:+.2f}% (손익비 {ratio:.2f} : 1)"
 
-        precalc_scorecard = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p)
+        precalc_scorecard = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p, price_df=raw_df)
         precalc_rr = calculate_pre_risk_reward(curr_p, fib_levels, tech_data)
 
         full_rag_payload = {
@@ -2234,20 +2287,22 @@ if st.session_state.last_analysis_result:
                 st.caption("진입: MACD 상방전환 + 20일 이평 및 20일 VWAP 상회 시 | 청산: MACD 꺾임 또는 1.5x ATR 이탈")
                 s1 = backtest_results.get("strategy_1_momentum_squeeze", {})
                 
-                m1_1, m1_2, m1_3 = st.columns(3)
+                m1_1, m1_2, m1_3, m1_4 = st.columns(4)
                 m1_1.metric("총 누적 수익률", f"{s1.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s1.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
                 m1_2.metric("승률 (Win Rate)", f"{s1.get('win_rate', 0)}%", f"총 {s1.get('trades_count', 0)}회 매매")
                 m1_3.metric("Profit Factor / MDD", f"{s1.get('profit_factor', 0)}", f"MDD: -{s1.get('mdd', 0)}%")
+                m1_4.metric("Sharpe Ratio", f"{s1.get('sharpe_ratio', 0)}", "위험조정수익 (매매당)")
 
             with bt_col2:
                 st.markdown("**🔄 전략 B: 1Y VWAP + RSI 밸류 되돌림 (Mean Reversion)**")
                 st.caption("진입: 1Y 누적 VWAP 하회 + RSI 42 이하 + 볼린저 하단 지지 | 청산: VWAP 도달 또는 RSI 65")
                 s2 = backtest_results.get("strategy_2_vwap_mean_reversion", {})
                 
-                m2_1, m2_2, m2_3 = st.columns(3)
+                m2_1, m2_2, m2_3, m2_4 = st.columns(4)
                 m2_1.metric("총 누적 수익률", f"{s2.get('total_ret', 0):+.2f}%", f"B&H 대비 {round(s2.get('total_ret', 0) - bh_ret, 2):+.2f}%p")
                 m2_2.metric("승률 (Win Rate)", f"{s2.get('win_rate', 0)}%", f"총 {s2.get('trades_count', 0)}회 매매")
                 m2_3.metric("Profit Factor / MDD", f"{s2.get('profit_factor', 0)}", f"MDD: -{s2.get('mdd', 0)}%")
+                m2_4.metric("Sharpe Ratio", f"{s2.get('sharpe_ratio', 0)}", "위험조정수익 (매매당)")
 
     with st.container(border=True):
         st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
