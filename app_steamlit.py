@@ -555,34 +555,53 @@ def fetch_macro_indicators():
     start_t = time.time()
     macro_data = {}
     
-    # 💡 [수정됨] pandas-datareader 대신 requests를 사용한 브라우저 위장 방식으로 FRED 데이터 수집
+    # 💡 [수정됨] 공식 FRED API를 활용한 미국 10년물 국채 금리 수집
     try:
-        import io
-        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
-        headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
-        }
-        
-        response = requests.get(url, headers=headers, timeout=10)
-        
-        if response.status_code == 200:
-            # FRED CSV 데이터는 결측치가 '.'으로 올 수 있으므로 na_values="." 처리 후 드랍
-            fred_res = pd.read_csv(io.StringIO(response.text), index_col=0, parse_dates=True, na_values=".").dropna()
-            dgs10 = fred_res.iloc[-1, 0]
-            
-            macro_data["us_10y_yield"] = {
-                "source": "FRED (Federal Reserve Economic Data)",
-                "value": f"{round(float(dgs10), 2)}%",
-                "date": fred_res.index[-1].strftime("%Y-%m-%d")
+        fred_api_key = os.getenv("FRED_API_KEY") 
+        if not fred_api_key:
+            try:
+                fred_api_key = st.secrets["FRED_API_KEY"]
+            except Exception:
+                pass
+                
+        if fred_api_key:
+            url = "https://api.stlouisfed.org/fred/series/observations"
+            params = {
+                "series_id": "DGS10",
+                "api_key": fred_api_key,
+                "file_type": "json",
+                "sort_order": "desc",
+                "limit": 5  # 최근 결측 대비 여유값
             }
+            
+            # 기존 앱의 커넥션 풀링 세션(GLOBAL_SESSION) 활용
+            response = GLOBAL_SESSION.get(url, params=params, timeout=15)
+            response.raise_for_status()
+            
+            data = response.json().get("observations", [])
+            valid_data_found = False
+            
+            for obs in data:
+                if obs["value"] != ".":
+                    macro_data["us_10y_yield"] = {
+                        "source": "FRED API",
+                        "value": f"{round(float(obs['value']), 2)}%",
+                        "date": obs["date"]
+                    }
+                    valid_data_found = True
+                    break
+                    
+            if not valid_data_found:
+                macro_data["us_10y_yield"] = {"source": "FRED API", "value": "N/A", "date": "N/A"}
         else:
-            raise Exception(f"HTTP Status {response.status_code}")
+            logger.warning("⚠️ FRED_API_KEY가 설정되지 않았습니다.")
+            macro_data["us_10y_yield"] = {"source": "FRED API", "value": "N/A", "date": "N/A"}
             
     except Exception as e:
-        logger.warning(f"⚠️ FRED 금리 수집 실패: {e}")
-        macro_data["us_10y_yield"] = {"source": "FRED", "value": "N/A", "date": "N/A"}
+        logger.warning(f"⚠️ FRED API 수집 실패: {e}")
+        macro_data["us_10y_yield"] = {"source": "FRED API", "value": "N/A", "date": "N/A"}
     
-    # 📌 여기에 asset_map이 반드시 정의되어 있어야 아래 yf.download가 정상 작동합니다.
+    # 📌 6대 자산 수급 데이터 다운로드 로직 (그대로 유지)
     asset_map = {
         "^VIX": ("vix", "CBOE Volatility Index"),
         "DX-Y.NYB": ("dollar_index", "ICE US Dollar Index"),
@@ -790,19 +809,6 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
     stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
     info, info_source = get_stock_info_with_retry(stock, retries=2)
-
-    # 💡 [추가] 야후 원본 UNIX 타임스탬프(regularMarketTime) 추출 및 KST 변환
-    regular_market_time = info.get("regularMarketTime", None) if isinstance(info, dict) else None
-    market_time_kst_str = "N/A"
-    
-    if regular_market_time:
-        try:
-            # UNIX 타임스탬프를 UTC로 변환 후 KST로 변경
-            dt_utc = datetime.fromtimestamp(regular_market_time, timezone.utc)
-            dt_kst = dt_utc.astimezone(KST)
-            market_time_kst_str = dt_kst.strftime('%Y-%m-%d %H:%M:%S')
-        except Exception:
-            pass
 
     fast_info = {}
     try:
@@ -1992,18 +1998,23 @@ if st.session_state.last_analysis_result:
     sector_data = res.get("sector_data", {})
     info_source = res.get("info_source", "stock.info")
 
-    # 💡 [UI 추가] API 통신 회신 시간 및 실제 거래 UNIX 타임스탬프(KST) 표시
+    # 💡 [UI 추가] API 통신 회신 시간 표시
     api_reply_time = st.session_state.history.get(res['ticker'], {}).get('time', get_current_kst_time_str())
     
-    # 펀더멘털 데이터에서 넘겨받은 실제 거래 KST 시간
-    market_time_kst = fund_data.get('market_time_kst', 'N/A')
-    
-    st.info(f"🔄 **API 데이터 회신 시간:** `{api_reply_time}` (KST)  |  📈 **API 원본 실거래 타임스탬프:** `{market_time_kst}` (KST)")
+    st.info(f"🔄 **API 데이터 회신 시간:** `{api_reply_time}` (KST)")
 
+    # 💡 3대 API 상태 판별 로직
+    fred_val = macro_data.get("us_10y_yield", {}).get("value", "N/A")
+    fred_status = "🔴 실패 (N/A)" if fred_val == "N/A" else "🟢 정상"
+    
+    gemini_content = res.get("response_content", "")
+    gemini_status = "🔴 실패 (API 에러)" if gemini_content.startswith("⚠️") else "🟢 정상"
+
+    # 기존 UI 유지 + API 상태 표기 병합
     if info_source == "stock.info":
-        st.markdown("📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` (상세 펀더멘털 & 밸류에이션 정상 수집)")
+        st.markdown(f"📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` (상세 펀더멘털 & 밸류에이션 정상 수집) ｜ **FRED API:** `{fred_status}` ｜ **Gemini AI:** `{gemini_status}`")
     else:
-        st.markdown("📡 **데이터 소스:** `🟡 Yahoo Finance stock.fast_info` (야후 서버 지연으로 인한 간이 시세 백업 데이터 적용)")
+        st.markdown(f"📡 **데이터 소스:** `🟡 Yahoo Finance stock.fast_info` (야후 서버 지연으로 인한 간이 시세 백업 데이터 적용) ｜ **FRED API:** `{fred_status}` ｜ **Gemini AI:** `{gemini_status}`")
 
     if res["is_holding"] and res["user_avg_price"] > 0 and res["user_shares"] > 0 and curr_p > 0:
         total_invested = res["user_avg_price"] * res["user_shares"]
