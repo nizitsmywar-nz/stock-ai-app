@@ -6,8 +6,13 @@ import json
 import math
 import time
 import re
+import logging
 import warnings
 from datetime import datetime, timedelta, timezone
+
+# 💡 실시간 터미널 로깅 설정
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("StockAppLogger")
 
 import requests
 from requests.adapters import HTTPAdapter
@@ -164,11 +169,13 @@ if "last_analysis_result" not in st.session_state:
 def get_stock_info_with_retry(stock, retries=2):
     for attempt in range(retries):
         try:
+            start_t = time.time()
             info = stock.info
+            logger.info(f"👉 stock.info 호출 완료 (소요 시간: {time.time() - start_t:.2f}초)")
             if isinstance(info, dict) and len(info) > 10 and any(k in info for k in ['marketCap', 'trailingPE', 'forwardPE', 'trailingEps', 'bookValue', 'currentPrice']):
                 return info, "stock.info"
-        except Exception:
-            pass
+        except Exception as e:
+            logger.warning(f"⚠️ stock.info 시도 {attempt+1} 실패: {e}")
         if attempt < retries - 1:
             time.sleep(0.5 * (attempt + 1))
             
@@ -181,13 +188,29 @@ def get_stock_info_with_retry(stock, retries=2):
     return {}, "stock.fast_info"
 
 def fetch_stock_technical_data(ticker: str):
+    logger.info(f"⏳ [시작] 기술적 데이터 수집: {ticker}")
+    start_t = time.time()
     stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
     df = stock.history(period="1y")
+    
     if df.empty:
         df = stock.history(period="6mo")
+        
     if df.empty:
+        logger.error(f"❌ 기술적 데이터 수집 실패 (데이터 없음): {ticker}")
         return {}, "N/A", {}, "N/A", "N/A", pd.DataFrame(), {}
     
+    # 💡 [핵심 해결 코드 추가] yfinance 결측치(NaN) 껍데기 행 완벽 제거
+    df = df.dropna(subset=['Close', 'Volume'])
+    
+    # 불량 데이터를 지우고 났더니 데이터가 하나도 안 남은 경우의 방어 로직
+    if df.empty:
+        logger.error(f"❌ 기술적 데이터 수집 실패 (유효한 종가/거래량 데이터 없음): {ticker}")
+        return {}, "N/A", {}, "N/A", "N/A", pd.DataFrame(), {}
+    
+    # -------------------------------------------------------------
+    # 아래부터는 기존 지표 연산 로직 그대로 유지
+    # -------------------------------------------------------------
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
     df['SMA_60'] = df['Close'].rolling(window=60).mean()
     df['SMA_120'] = df['Close'].rolling(window=120).mean()
@@ -331,6 +354,7 @@ def fetch_stock_technical_data(ticker: str):
         "poc_price_6m": volume_profile.get("poc_price", "N/A"),
         "value_area_range_6m": volume_profile.get("value_area_range", "N/A")
     }
+    logger.info(f"✅ [완료] 기술적 데이터 수집: {ticker} (총 소요: {time.time() - start_t:.2f}초)")
     return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc, df, volume_profile
 
 # =============================================================================
@@ -452,17 +476,20 @@ def run_strategy_backtest(df: pd.DataFrame):
     }
 
 # =============================================================================
-# [BLOCK 06] 시장 수급 & 외부 데이터 수집기 (옵션/매크로/섹터/뉴스/지분)
+# [BLOCK 06] 시장 수급 & 외부 데이터 수집기 (로깅 강화 및 전체 함수 복구 버전)
 # =============================================================================
 # -------------------------------------------------------------
 # 📌 옵션 체인 스마트머니 수급 수집기
 # -------------------------------------------------------------
 def fetch_nearest_options_data(ticker: str, retries: int = 2):
+    logger.info(f"⏳ [시작] 옵션 체인 수급 수집: {ticker}")
+    start_t = time.time()
     for attempt in range(retries):
         try:
             stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
             expirations = getattr(stock, 'options', None)
             if not expirations:
+                logger.info(f"ℹ️ 만기 옵션 데이터 없음: {ticker}")
                 return None
             
             nearest_exp = expirations[0]
@@ -486,6 +513,7 @@ def fetch_nearest_options_data(ticker: str, retries: int = 2):
             tot_put_vol = puts['volume'].sum() if puts['volume'].notnull().any() else 0
             pc_ratio = round(tot_put_vol / tot_call_vol, 2) if tot_call_vol > 0 else "N/A"
 
+            logger.info(f"✅ [완료] 옵션 체인 수급 수집: {ticker} (총 소요: {time.time() - start_t:.2f}초)")
             return {
                 "expiration_date": nearest_exp,
                 "pc_volume_ratio": pc_ratio,
@@ -510,7 +538,8 @@ def fetch_nearest_options_data(ticker: str, retries: int = 2):
                     "price": round(float(put_max_vol_row.get("lastPrice", 0)), 2)
                 }
             }
-        except Exception:
+        except Exception as e:
+            logger.warning(f"⚠️ 옵션 수집 시도 {attempt+1} 실패 ({ticker}): {e}")
             if attempt < retries - 1:
                 time.sleep(0.5 * (attempt + 1))
                 continue
@@ -518,24 +547,42 @@ def fetch_nearest_options_data(ticker: str, retries: int = 2):
     return None
 
 # -------------------------------------------------------------
-# 📌 매크로 지표 수집기 (5분 캐싱 복구 + 일괄 다운로드 최적화)
+# 📌 매크로 지표 수집기 (5분 캐싱 + 로깅)
 # -------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_macro_indicators():
+    logger.info("⏳ [시작] 매크로 지표 수집 (FRED 및 6대 자산)")
+    start_t = time.time()
     macro_data = {}
+    
+    # 💡 [수정됨] pandas-datareader 대신 requests를 사용한 브라우저 위장 방식으로 FRED 데이터 수집
     try:
-        end = datetime.now()
-        start = end - timedelta(days=30)
-        fred_res = web.DataReader('DGS10', 'fred', start, end, session=GLOBAL_SESSION).dropna()
-        dgs10 = fred_res.iloc[-1, 0]
-        macro_data["us_10y_yield"] = {
-            "source": "FRED (Federal Reserve Economic Data)",
-            "value": f"{round(float(dgs10), 2)}%",
-            "date": fred_res.index[-1].strftime("%Y-%m-%d")
+        import io
+        url = "https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
         }
-    except Exception:
-        macro_data["us_10y_yield"] = {"source": "FRED", "value": "N/A", "date": "N/A"}
         
+        response = requests.get(url, headers=headers, timeout=10)
+        
+        if response.status_code == 200:
+            # FRED CSV 데이터는 결측치가 '.'으로 올 수 있으므로 na_values="." 처리 후 드랍
+            fred_res = pd.read_csv(io.StringIO(response.text), index_col=0, parse_dates=True, na_values=".").dropna()
+            dgs10 = fred_res.iloc[-1, 0]
+            
+            macro_data["us_10y_yield"] = {
+                "source": "FRED (Federal Reserve Economic Data)",
+                "value": f"{round(float(dgs10), 2)}%",
+                "date": fred_res.index[-1].strftime("%Y-%m-%d")
+            }
+        else:
+            raise Exception(f"HTTP Status {response.status_code}")
+            
+    except Exception as e:
+        logger.warning(f"⚠️ FRED 금리 수집 실패: {e}")
+        macro_data["us_10y_yield"] = {"source": "FRED", "value": "N/A", "date": "N/A"}
+    
+    # 📌 여기에 asset_map이 반드시 정의되어 있어야 아래 yf.download가 정상 작동합니다.
     asset_map = {
         "^VIX": ("vix", "CBOE Volatility Index"),
         "DX-Y.NYB": ("dollar_index", "ICE US Dollar Index"),
@@ -561,10 +608,12 @@ def fetch_macro_indicators():
                     macro_data[name] = {"source": src_name, "value": "N/A", "date": "N/A"}
             except Exception:
                 macro_data[name] = {"source": src_name, "value": "N/A", "date": "N/A"}
-    except Exception:
+    except Exception as e:
+        logger.warning(f"⚠️ 매크로 자산 일괄 다운로드 실패: {e}")
         for ticker, (name, src_name) in asset_map.items():
             macro_data[name] = {"source": src_name, "value": "N/A", "date": "N/A"}
             
+    logger.info(f"✅ [완료] 매크로 지표 수집 (총 소요: {time.time() - start_t:.2f}초)")
     return macro_data
 
 def format_market_cap(market_cap):
@@ -741,6 +790,19 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
     stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
     info, info_source = get_stock_info_with_retry(stock, retries=2)
+
+    # 💡 [추가] 야후 원본 UNIX 타임스탬프(regularMarketTime) 추출 및 KST 변환
+    regular_market_time = info.get("regularMarketTime", None) if isinstance(info, dict) else None
+    market_time_kst_str = "N/A"
+    
+    if regular_market_time:
+        try:
+            # UNIX 타임스탬프를 UTC로 변환 후 KST로 변경
+            dt_utc = datetime.fromtimestamp(regular_market_time, timezone.utc)
+            dt_kst = dt_utc.astimezone(KST)
+            market_time_kst_str = dt_kst.strftime('%Y-%m-%d %H:%M:%S')
+        except Exception:
+            pass
 
     fast_info = {}
     try:
@@ -996,6 +1058,8 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
 # -------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_sector_performance():
+    logger.info("⏳ [시작] S&P 500 11개 섹터 수집")
+    start_t = time.time()
     sector_etfs = {
         "XLK": "IT/기술 (Technology)", "XLC": "커뮤니케이션 (Communication Services)",
         "XLY": "임의소비재 (Consumer Discretionary)", "XLP": "필수소비재 (Consumer Staples)",
@@ -1030,8 +1094,12 @@ def fetch_sector_performance():
         for etf, name in sector_etfs.items():
             summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
             
+    logger.info(f"✅ [완료] 11개 섹터 수집 (총 소요: {time.time() - start_t:.2f}초)")
     return summary
 
+# -------------------------------------------------------------
+# 📌 뉴스 수집기 (복구 완료)
+# -------------------------------------------------------------
 @st.cache_data(ttl=300)
 def fetch_news(ticker: str, limit: int = 5):
     try:
@@ -1923,6 +1991,14 @@ if st.session_state.last_analysis_result:
     fund_data = res["fund_data"]
     sector_data = res.get("sector_data", {})
     info_source = res.get("info_source", "stock.info")
+
+    # 💡 [UI 추가] API 통신 회신 시간 및 실제 거래 UNIX 타임스탬프(KST) 표시
+    api_reply_time = st.session_state.history.get(res['ticker'], {}).get('time', get_current_kst_time_str())
+    
+    # 펀더멘털 데이터에서 넘겨받은 실제 거래 KST 시간
+    market_time_kst = fund_data.get('market_time_kst', 'N/A')
+    
+    st.info(f"🔄 **API 데이터 회신 시간:** `{api_reply_time}` (KST)  |  📈 **API 원본 실거래 타임스탬프:** `{market_time_kst}` (KST)")
 
     if info_source == "stock.info":
         st.markdown("📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` (상세 펀더멘털 & 밸류에이션 정상 수집)")
