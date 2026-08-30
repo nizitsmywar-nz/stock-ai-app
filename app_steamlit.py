@@ -930,15 +930,30 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
 
     earnings_growth = info.get("earningsGrowth", None) if isinstance(info, dict) else None
     revenue_growth = info.get("revenueGrowth", None) if isinstance(info, dict) else None
-    
-    if earnings_growth and earnings_growth > 0:
+    shares_outstanding = info.get("sharesOutstanding", None) if isinstance(info, dict) else None
+
+    # 💡 [개선 1] 성장률 fallback: 실적 악화(적자 확대 포함) 종목에 무조건 +15%를
+    # 주입하던 로직을 제거. 실측 EPS 성장률이 없으면 매출 성장률을 보수적으로(50%만)
+    # 대체 반영하고, 그마저도 없으면 est_growth를 None으로 두어 성장 기반 모델
+    # 자체를 계산하지 않도록(=산출불가) 한다. 어떤 값을 어떤 근거로 썼는지는
+    # growth_factors에 그대로 노출해 리포트/LLM이 "가정치"임을 알 수 있게 한다.
+    if earnings_growth is not None and earnings_growth > 0:
         est_growth = min(earnings_growth * 100, 35.0)
+        growth_source = "실측 EPS 성장률(YoY)"
+    elif revenue_growth is not None and revenue_growth > 0:
+        est_growth = min(revenue_growth * 100 * 0.5, 20.0)
+        growth_source = "매출 성장률 기반 보수적 추정치(이익 성장 데이터 부재/마이너스)"
     else:
-        est_growth = 15.0
+        est_growth = None
+        growth_source = None
+
+    used_growth_fallback = growth_source != "실측 EPS 성장률(YoY)"
 
     growth_factors = {
         "revenue_growth_yoy": f"{revenue_growth * 100:.2f}%" if revenue_growth is not None else "N/A",
-        "earnings_growth_yoy": f"{earnings_growth * 100:.2f}%" if earnings_growth is not None else "N/A"
+        "earnings_growth_yoy": f"{earnings_growth * 100:.2f}%" if earnings_growth is not None else "N/A",
+        "growth_model_input_used": f"{est_growth:.1f}%" if est_growth is not None else "N/A",
+        "growth_model_input_source": growth_source or "해당없음 (성장 기반 모델 산출불가)"
     }
 
     def _value_model_sanity(value, label):
@@ -985,8 +1000,6 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     except Exception:
         value_models["roe_pbr"] = "산출불가 (해당없음)"
 
-    used_growth_fallback = not (earnings_growth and earnings_growth > 0)
-
     def _sanity_capped(value, label):
         try:
             if not isinstance(value, (int, float)):
@@ -1002,43 +1015,105 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         except Exception:
             return "산출불가 (해당없음)"
 
+    # 💡 [개선 3] PEG/PSR 고정 배수를 성장률 구간에 연동해 차등 적용하고,
+    # 실제로 어떤 배수를 썼는지 growth_models에 노출한다.
+    def _get_fair_peg_multiple(g):
+        if g is None:
+            return None
+        if g >= 30:
+            return 1.8   # 고성장주는 시장이 PEG 프리미엄을 용인하는 경향 반영
+        elif g >= 15:
+            return 1.3
+        else:
+            return 1.0   # 저성장주는 Lynch 원칙(PEG=1) 그대로
+
+    def _get_psr_multiple(g):
+        if g is None:
+            return 3.0   # 성장 데이터 없으면 보수적 기본값
+        if g >= 30:
+            return 8.0
+        elif g >= 15:
+            return 5.0
+        elif g >= 5:
+            return 3.0
+        else:
+            return 1.5   # 저성장/성숙 기업엔 5배 자체가 과대평가 배수
+
     growth_models = {}
     f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
+
+    peg_multiple = _get_fair_peg_multiple(est_growth)
     try:
-        if f_eps and f_eps > 0:
-            raw_peg = round(float(f_eps) * (est_growth * 1.5), 2)
+        if f_eps and f_eps > 0 and est_growth is not None and peg_multiple:
+            raw_peg = round(float(f_eps) * (est_growth * peg_multiple), 2)
             growth_models["forward_peg"] = _sanity_capped(raw_peg, "forward_peg")
+        elif est_growth is None:
+            growth_models["forward_peg"] = "산출불가 (신뢰 가능한 성장률 데이터 없음)"
         else:
             growth_models["forward_peg"] = "산출불가 (해당없음)"
     except Exception:
         growth_models["forward_peg"] = "산출불가 (해당없음)"
 
+    psr_multiple = _get_psr_multiple(est_growth)
     try:
         if revenue_per_share and revenue_per_share > 0:
-            raw_psr = round(float(revenue_per_share) * 5.0, 2)
+            raw_psr = round(float(revenue_per_share) * psr_multiple, 2)
             growth_models["psr_target"] = _sanity_capped(raw_psr, "psr_target")
         else:
             growth_models["psr_target"] = "산출불가 (해당없음)"
     except Exception:
         growth_models["psr_target"] = "산출불가 (해당없음)"
 
-    try:
-        if f_eps and f_eps > 0:
+    # 💡 [개선 2] DCF를 EPS가 아닌 실제 FCF(잉여현금흐름) 기반으로 재구성.
+    # - 최근 FCF가 마이너스면 애초에 계산하지 않는다 (EPS는 플러스인데 FCF가
+    #   마이너스인 성장주에서 자주 발생하는 왜곡 케이스를 원천 차단).
+    # - 5년간 성장률을 est_growth → terminal growth로 선형 감쇠시켜
+    #   "5년 내내 고성장 유지"라는 비현실적 가정을 완화.
+    # - Enterprise Value를 발행주식수로 나눠 실제 '주당' 가치를 산출.
+    def _calc_real_fcf_dcf(stock_obj, growth_rate, shares_out):
+        try:
+            cf = stock_obj.cashflow
+            if cf.empty or "Free Cash Flow" not in cf.index:
+                return "산출불가 (FCF 데이터 없음)"
+            fcf_series = cf.loc["Free Cash Flow"].dropna()
+            if fcf_series.empty:
+                return "산출불가 (FCF 데이터 없음)"
+            if not shares_out or shares_out <= 0:
+                return "산출불가 (발행주식수 데이터 없음)"
+
+            latest_fcf = float(fcf_series.iloc[0])
+            if latest_fcf <= 0:
+                return "산출불가 (최근 FCF 마이너스 - 성장할인모델 부적합)"
+            if growth_rate is None:
+                return "산출불가 (신뢰 가능한 성장률 데이터 없음)"
+
             wacc = 0.09
             g_long = 0.025
-            pv_sum = 0
-            cur_cf = float(f_eps)
+            g_start = growth_rate / 100
+            pv_sum = 0.0
+            cur_fcf = latest_fcf
             for y in range(1, 6):
-                cur_cf *= (1 + est_growth / 100)
-                pv_sum += cur_cf / ((1 + wacc) ** y)
-            terminal_val = (cur_cf * (1 + g_long)) / (wacc - g_long)
+                yearly_g = g_start - (g_start - g_long) * (y - 1) / 4  # 성장률 선형 감쇠
+                cur_fcf *= (1 + yearly_g)
+                pv_sum += cur_fcf / ((1 + wacc) ** y)
+            terminal_val = (cur_fcf * (1 + g_long)) / (wacc - g_long)
             pv_terminal = terminal_val / ((1 + wacc) ** 5)
-            raw_dcf = round(pv_sum + pv_terminal, 2)
-            growth_models["dcf_growth"] = _sanity_capped(raw_dcf, "dcf_growth")
-        else:
-            growth_models["dcf_growth"] = "산출불가 (해당없음)"
-    except Exception:
-        growth_models["dcf_growth"] = "산출불가 (해당없음)"
+            enterprise_value = pv_sum + pv_terminal
+            return round(enterprise_value / shares_out, 2)
+        except Exception:
+            return "산출불가 (해당없음)"
+
+    raw_dcf = _calc_real_fcf_dcf(stock, est_growth, shares_outstanding)
+    growth_models["dcf_growth"] = _sanity_capped(raw_dcf, "dcf_growth") if isinstance(raw_dcf, (int, float)) else raw_dcf
+
+    # 어떤 가정치/배수가 실제로 계산에 쓰였는지 그대로 노출 (LLM이 가정치를
+    # 실측 데이터처럼 서술하지 않도록 방지)
+    growth_models["_assumptions_used"] = {
+        "growth_rate_used": f"{est_growth:.1f}%" if est_growth is not None else "N/A",
+        "growth_rate_source": growth_source or "해당없음",
+        "peg_multiple_used": peg_multiple,
+        "psr_multiple_used": psr_multiple
+    }
 
     return {
         "info_source": info_source,
