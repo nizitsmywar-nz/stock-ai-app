@@ -1124,6 +1124,16 @@ with st.sidebar:
 # [BLOCK 09] LLM RAG 추론 파이프라인 & 헬퍼 함수
 # =============================================================================
 # [패치 1] 목표가 산출 및 손익비
+def grade_entry_by_rr(ratio):
+    # [개선] 신규 진입 등급을 손익비(RR ratio) 기반으로 완전 사전계산 - LLM 자유판단으로 인한
+    # "등급은 B인데 손익비는 0.07:1" 같은 내부 모순을 구조적으로 차단하기 위함.
+    if not isinstance(ratio, (int, float)):
+        return "판정불가 (손익비 계산 불가)"
+    if ratio >= 2.0: return "A (매력적 진입 기회 - 손익비 우수)"
+    elif ratio >= 1.0: return "B (준수한 진입 기회 - 손익비 양호)"
+    elif ratio >= 0.5: return "C (조건부 관심 - 손익비 다소 불리, 신중한 분할 접근 권장)"
+    else: return "D (진입 비추천 - 손익비 열위, 되돌림/조정 이후 재평가 권장)"
+
 def calculate_targets_and_risk_reward(curr_price, fib, tech):
     fib_pairs = [
         ("피보나치 23.6%", fib.get('fib_23.6%')),
@@ -1136,15 +1146,31 @@ def calculate_targets_and_risk_reward(curr_price, fib, tech):
 
     resistances = [(label, p) for label, p in valid if p > curr_price]
 
+    # [개선] 피보나치 레벨 부재 시 폴백 목표가를 고정 비율(+10%/+20%) 대신 R-멀티플(R=ATR×2.0, 손절거리와 동일 단위)
+    # 기반으로 산출 - 1차 목표가 1.5R(앱이 이미 쓰는 최소 손익비 기준 1.5와 동일), 2차 목표가 3.0R.
+    # ATR 데이터가 없는 예외 상황에서는 기존 고정 비율 방식을 세이프티넷으로 유지.
+    atr14 = tech.get('atr_14')
+    has_atr = isinstance(atr14, (int, float)) and atr14 > 0
+
     if len(resistances) >= 2:
         t1_label, t1_price = resistances[0]
         t2_label, t2_price = resistances[1]
     elif len(resistances) == 1:
         t1_label, t1_price = resistances[0]
-        t2_label, t2_price = "현재가 +20%(피보나치 레벨 부재)", round(curr_price * 1.20, 2)
+        if has_atr:
+            t2_price = round(curr_price + atr14 * 6.0, 2)
+            t2_label = "현재가 +3.0R(ATR×6.0배, 피보나치 2차 레벨 부재)"
+        else:
+            t2_label, t2_price = "현재가 +20%(피보나치 레벨 부재)", round(curr_price * 1.20, 2)
     else:
-        t1_label, t1_price = "현재가 +10%(피보나치 레벨 부재)", round(curr_price * 1.10, 2)
-        t2_label, t2_price = "현재가 +20%(피보나치 레벨 부재)", round(curr_price * 1.20, 2)
+        if has_atr:
+            t1_price = round(curr_price + atr14 * 3.0, 2)
+            t1_label = "현재가 +1.5R(ATR×3.0배, 피보나치 레벨 부재)"
+            t2_price = round(curr_price + atr14 * 6.0, 2)
+            t2_label = "현재가 +3.0R(ATR×6.0배, 피보나치 레벨 부재)"
+        else:
+            t1_label, t1_price = "현재가 +10%(피보나치 레벨 부재)", round(curr_price * 1.10, 2)
+            t2_label, t2_price = "현재가 +20%(피보나치 레벨 부재)", round(curr_price * 1.20, 2)
 
     stop_p = tech.get('atr_stop_2_0x')
     if not isinstance(stop_p, (int, float)) or stop_p >= curr_price:
@@ -1156,8 +1182,9 @@ def calculate_targets_and_risk_reward(curr_price, fib, tech):
 
     targets_text = f"1차 목표가: {t1_label} (${t1_price}) | 2차 목표가: {t2_label} (${t2_price})"
     rr_text = f"(1차 목표가 {t1_label} ${t1_price} 기준) 기대수익 {up_pct:+.2f}% : 예상손실 {down_pct:+.2f}% (손익비 {ratio:.2f} : 1)"
+    entry_grade_text = grade_entry_by_rr(ratio)
     # [패치7 연동] 손절가(stop_p)를 호출부(물타기 2단계 게이트)에서도 쓸 수 있도록 함께 반환
-    return targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p
+    return targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p, entry_grade_text
 
 # [패치 2] 사용자 대응 전략 프롬프트
 def build_strategy_instruction(is_holding, user_avg_price, user_shares, curr_price, my_return_str, t1_price, t2_price, t1_label, t2_label):
@@ -1236,7 +1263,19 @@ def evaluate_strategy_backtest(bt):
     if q1 >= q2: best_name, best_data, best_score, other_score = "모멘텀 스퀴즈(추세추종형 돌파매매)", s1, q1, q2
     else: best_name, best_data, best_score, other_score = "VWAP 평균회귀(눌림목/되돌림 매매)", s2, q2, q1
 
-    verdict_text = f"최근 {bt_years}년 백테스트 결과, '{best_name}' 전략이 통계적으로 더 우수함 (승률 {best_data.get('win_rate')}%, 손익비(PF) {best_data.get('profit_factor')}, 샤프지수 {best_data.get('sharpe_ratio_annualized')}, MDD {best_data.get('mdd')}%, 검증점수 {best_score}/10 vs 대안전략 {other_score}/10). 따라서 정밀 매매 시나리오의 진입/청산 로직은 '{best_name}' 스타일을 우선 근거로 서술할 것."
+    # [개선] 벤치마크(단순 매수 후 보유) 대비 성과 비교 - 절대수익만으로 "통계적 우수성"을 주장하지 않도록 명시
+    best_total_ret = _num(best_data.get('total_ret')) if isinstance(best_data.get('total_ret'), (int, float)) else None
+    if best_total_ret is not None and benchmark > 0:
+        if best_total_ret >= benchmark:
+            benchmark_note = f"동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)을 상회하여 액티브 전략으로서의 초과수익(알파)이 확인됨."
+        else:
+            underperform_ratio = round(benchmark / best_total_ret, 1) if best_total_ret > 0 else None
+            ratio_text = f" (벤치마크가 전략 대비 약 {underperform_ratio}배)" if underperform_ratio else ""
+            benchmark_note = f"⚠️ 동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)에 미달함{ratio_text} — 절대수익 지표(PF·샤프지수 등)가 양호하더라도 벤치마크 대비 초과수익(알파)은 없으므로, 이 종목은 트레이딩보다 장기 보유가 유리했을 수 있음을 반드시 함께 언급할 것."
+    else:
+        benchmark_note = "벤치마크(단순 매수 후 보유) 데이터가 없어 비교 불가."
+
+    verdict_text = f"최근 {bt_years}년 백테스트 결과, '{best_name}' 전략이 통계적으로 더 우수함 (승률 {best_data.get('win_rate')}%, 손익비(PF) {best_data.get('profit_factor')}, 샤프지수 {best_data.get('sharpe_ratio_annualized')}, MDD {best_data.get('mdd')}%, 검증점수 {best_score}/10 vs 대안전략 {other_score}/10). {benchmark_note} 따라서 정밀 매매 시나리오의 진입/청산 로직은 '{best_name}' 스타일을 우선 근거로 서술할 것."
     return best_name, best_score, verdict_text, bt_years
 
 # [패치 7] 물타기(Averaging Down) 2단계 게이트 (1단계 적격성 심사 하드게이트 -> 2단계 실효성/손익비 평가)
@@ -1528,7 +1567,7 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
     elif total_score >= 7.5: badge = "🥇 적격 우량주"
     elif total_score >= 6.0: badge = "⚠️ 조건부 종목"
     else: badge = "🚨 비우량주"
-    scorecard_text = f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f} · {s_mom3_note}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
+    scorecard_text = f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
     # [패치7] 물타기 2단계 게이트(stage1_outlook_gate)가 숫자 종합점수(total_score)를 필요로 해서 튜플로 반환
     return scorecard_text, total_score, s_val
 
@@ -1574,7 +1613,7 @@ if analyze_btn:
         earnings_info = fund_data.get('earnings_calendar', {})
         
         # 패치 1 적용: 동적 목표가 및 손익비 (stop_p: 패치7 물타기 2단계 게이트에서 재사용)
-        targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p = calculate_targets_and_risk_reward(curr_p, fib_levels, tech_data)
+        targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p, entry_grade_text = calculate_targets_and_risk_reward(curr_p, fib_levels, tech_data)
         # 패치 7 적용: 숫자 종합점수(precalc_total_score)도 함께 반환받도록 변경
         precalc_scorecard, precalc_total_score, precalc_s_val = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p, price_df=raw_df)
 
@@ -1633,6 +1672,7 @@ if analyze_btn:
             "precalculated_scorecard": precalc_scorecard, 
             "precalculated_risk_reward": rr_text,
             "precalculated_targets": targets_text,
+            "precalculated_entry_grade": entry_grade_text,
             "averaging_down_check": avg_down_check
         }
 
@@ -1660,7 +1700,7 @@ if analyze_btn:
 5. 가장 빠른 만기 옵션 체인 수급 (콜/풋 Max OI & Volume):
 {options_json}
 
-6. 내부자/기관 지분율 및 유명 헤지펀드/공매도 세력 분석 (Short Squeeze Analysis):
+6. 내부자/기관 지분율 및 주요 기관투자자 보유·공매도 세력 분석 (Short Squeeze Analysis) - ⚠️ top_holders는 대형 패시브 인덱스 운용사 위주 데이터이며 헤지펀드 데이터가 아님, "헤지펀드"로 지칭하지 말 것:
 {hedge_short_json}
 
 7. 실적 발표 일정 및 52주 고저:
@@ -1708,6 +1748,9 @@ if analyze_btn:
 21. 파이썬 알고리즘 사전 연산 물타기(비중확대) 판정 (절대 임의 수정 금지):
 {avg_down_json}
 
+22. 파이썬 알고리즘 사전 연산 신규 진입 등급 (예상 손익비 기반, 절대 임의 수정 금지):
+{entry_grade_json}
+
 ---
 
 [지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 POC 매물벽 검증 규칙]
@@ -1723,14 +1766,16 @@ if analyze_btn:
 
 3. 밸류에이션, 스마트머니 및 공매도 세력 분석
 - **[장기 복리 체력]**: 3개년 FCF·ROIC·주주환원 분석.
-- **유명 헤지펀드 포지션 / 공매도 세력 및 숏스퀴즈 리스크 / IB 투자의견 신뢰도 가중**.
+- **주요 기관투자자 보유 현황(대형 패시브 인덱스 운용사 위주이므로 특정 종목에 대한 액티브 확신 매수 시그널로 과대 해석하지 말 것) / 공매도 세력 및 숏스퀴즈 리스크 / IB 투자의견 신뢰도 가중**.
 
 4. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가 ({ticker})
 - **스코어카드 산출**: ⚠️ 15번 [사전 연산 스코어카드] 텍스트를 그대로 복사 출력.
 - **[백테스트 신뢰도 표기 필수]**: JSON에 포함된 reliability(신뢰도 라벨)와 period_split(전반부/후반부 성과)을 반드시 언급하고, 표본 부족 시 참고 지표로만 서술할 것.
+- **[벤치마크 비교 필수 - 절대 임의 누락 금지]**: 19번 [백테스트 전략 비교 및 매매 스타일 판정]에 포함된 벤치마크(단순 매수 후 보유) 대비 성과 비교 문장을 반드시 그대로 인용하여 언급할 것. 전략의 절대수익(총수익률, PF, 샤프지수 등)이 양호하더라도, 벤치마크에 미달하는 경우 "통계적으로 우수하다"는 식으로 단정하지 말고 벤치마크 대비 초과수익(알파)이 없다는 점을 반드시 함께 명시할 것.
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
-- **신규 진입 등급 / 진입 적합성 종합 판정**.
+- **신규 진입 등급**: ⚠️ 22번 [사전 연산 신규 진입 등급] 텍스트를 그대로 복사 출력할 것 (임의로 등급을 상향/하향하지 말 것). 등급이 낮게(C/D) 나온 경우 이를 완화하는 서술을 하지 말고, 왜 손익비가 불리한지(목표가 근접/손절폭 과다 등)를 그대로 설명할 것.
+- **진입 적합성 분석**: 위 등급의 근거를 기술적 지표(스퀴즈, 이평선, POC 매물대 등) 기반으로 서술.
 - **예상 손익비 (Risk/Reward)**: ⚠️ 16번 [사전 연산 예상 손익비] 텍스트 그대로 출력.
 
 6. [정밀 매매 시나리오]
@@ -1756,7 +1801,7 @@ if analyze_btn:
 
 [3. 밸류에이션, 스마트머니 및 공매도 세력/옵션 분석]
 * **장기 복리 체력**: [내용]
-* **유명 헤지펀드 포지션**: [내용]
+* **주요 기관투자자 보유 현황**: [내용 - 패시브 인덱스 운용사 위주임을 감안해 과도한 긍정적 해석 지양]
 * **공매도 세력 및 숏스퀴즈 리스크**: [내용]
 * **IB 투자의견 신뢰도 가중**: [내용]
 
@@ -1765,7 +1810,7 @@ if analyze_btn:
 * **백테스트 평가**: [내용]
 
 [5. 신규 진입 적격성 평가]
-* **신규 진입 등급**: [선택]
+* **신규 진입 등급**: [22번 사전 연산 신규 진입 등급 값을 그대로 복사 출력]
 * **진입 적합성 분석**: [내용]
 * **예상 손익비 (Risk/Reward)**: [16번 결과값 그대로 복사]
 
@@ -1783,7 +1828,7 @@ if analyze_btn:
 {strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "avg_down_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "avg_down_json", "entry_grade_json"],
                 template=template
             )
             llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
@@ -1809,7 +1854,7 @@ if analyze_btn:
                 "score_json": precalc_scorecard, "rr_json": rr_text,
                 "targets_json": targets_text, "consistency_note": consistency_note,
                 "backtest_verdict": backtest_verdict, "atr_labels_json": atr_labels_text,
-                "avg_down_json": avg_down_text
+                "avg_down_json": avg_down_text, "entry_grade_json": entry_grade_text
             }
             
             for delay in [0, 5, 10]:
