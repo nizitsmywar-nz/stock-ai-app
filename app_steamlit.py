@@ -706,6 +706,12 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
     low_52w = (info.get("fiftyTwoWeekLow", None) if isinstance(info, dict) else None) or low_52_calc
     return {"earnings_date": earnings_date_str, "d_day": d_day_str, "fiftyTwoWeekHigh": high_52w, "fiftyTwoWeekLow": low_52w}
 
+# [밸류에이션 개선안 1안] 성장률 구간별 "적정 PSR 배수". fetch_fundamentals_and_valuation()의
+# PSR 목표가(growth_models['psr_target']) 산출과, calculate_pre_scores()의 s_val(PSR 성장연동
+# 채점) 양쪽에서 같은 기준을 공유하도록 모듈 레벨로 승격 (기존에는 fetch_fundamentals_and_valuation
+# 내부에만 있던 함수라 스코어카드 쪽에서 재사용할 수 없었음).
+def _get_psr_multiple(g): return 8.0 if g and g >= 30 else (5.0 if g and g >= 15 else (3.0 if g and g >= 5 else (1.5 if g else 3.0)))
+
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
     stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
     info, info_source = get_stock_info_with_retry(stock, retries=2)
@@ -830,7 +836,7 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
         except Exception: return "산출불가 (해당없음)"
 
     def _get_fair_peg_multiple(g): return 1.8 if g and g >= 30 else (1.3 if g and g >= 15 else (1.0 if g else None))
-    def _get_psr_multiple(g): return 8.0 if g and g >= 30 else (5.0 if g and g >= 15 else (3.0 if g and g >= 5 else (1.5 if g else 3.0)))
+    # _get_psr_multiple()는 이제 모듈 레벨 함수(위쪽)로 승격되어 있어 여기서 다시 정의하지 않음.
 
     growth_models = {}
     f_eps = forward_eps if forward_eps and forward_eps > 0 else eps
@@ -955,7 +961,7 @@ def summarize_user_strategy(raw_text: str) -> str:
     return text
 
 def parse_full_trading_scenario(text):
-    action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, user_strategy_raw, quality_badge = "홀딩", "분석 리포트 참조", "분석 리포트 참조", "분석 리포트 참조", "", "분석 리포트 참조", "분석 리포트 참조", "분석 리포트 참조", "", "", ""
+    action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, averaging_down, user_strategy_raw, quality_badge = "홀딩", "분석 리포트 참조", "분석 리포트 참조", "분석 리포트 참조", "", "분석 리포트 참조", "분석 리포트 참조", "분석 리포트 참조", "", "", "", ""
     if "최상위 핵심 우량주" in text or "👑" in text: quality_badge = "👑 "
     elif "적격 우량주" in text or "🥇" in text: quality_badge = "🥇 "
     elif "조건부 종목" in text or "⚠️" in text: quality_badge = "⚠️ "
@@ -985,6 +991,7 @@ def parse_full_trading_scenario(text):
         elif ("분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean) and buy_band == "분석 리포트 참조" and ":" in line_clean: buy_band = ":".join(line_clean.split(":")[1:]).strip()
         elif ("손절" in line_clean or "Stop-loss" in line_clean) and stop_loss == "분석 리포트 참조" and ":" in line_clean: stop_loss = ":".join(line_clean.split(":")[1:]).strip()
         elif ("불타기 조건" in line_clean or "불타기" in line_clean) and not pyramiding and ":" in line_clean: pyramiding = ":".join(line_clean.split(":")[1:]).strip()
+        elif ("물타기" in line_clean or "비중 확대" in line_clean) and not averaging_down and ":" in line_clean: averaging_down = ":".join(line_clean.split(":")[1:]).strip()
 
     match_opinion_sec = re.search(r"\[최종\s*투자의견\](.*?)(?=\Z|\[|\n\n#)", text, re.DOTALL)
     opinion_block = match_opinion_sec.group(1) if match_opinion_sec else text
@@ -1001,7 +1008,7 @@ def parse_full_trading_scenario(text):
             elif line_clean: strategy_lines.append(line_clean)
 
     if strategy_lines: user_strategy_raw = " ".join(strategy_lines)
-    return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, summarize_user_strategy(user_strategy_raw), quality_badge
+    return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, averaging_down, summarize_user_strategy(user_strategy_raw), quality_badge
 
 TIER_1_FIRMS = ["goldman", "morgan stanley", "jpmorgan", "jp morgan", "citi", "citigroup", "bank of america", "bofa", "merrill", "ubs", "barclays", "deutsche bank", "hsbc", "bernstein", "credit suisse", "bnp paribas"]
 TIER_2_FIRMS = ["wells fargo", "rbc", "mizuho", "jefferies", "piper sandler", "wedbush", "baird", "oppenheimer", "bmo", "stifel", "td cowen", "cowen", "wolfe", "keybanc", "raymond james", "canaccord", "evercore", "truist", "guggenheim", "btig", "da davidson", "needham", "mmpm", "loop capital", "roth mkm", "bernstein"]
@@ -1014,7 +1021,7 @@ def classify_analyst_tier(firm_name: str):
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
-        stock = yf.Ticker(ticker)
+        stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
         upgrades = stock.upgrades_downgrades
         if upgrades is None or upgrades.empty: return []
         cutoff_date = datetime.now() - timedelta(days=months * 30)
@@ -1084,6 +1091,7 @@ with st.sidebar:
                 st.markdown(f"- **📥 분할매수 밴드:** `{data.get('buy_band', '분석 리포트 참조')}`")
                 st.markdown(f"- **🛑 손절선:** `{data.get('stop_loss', '분석 리포트 참조')}`")
                 if data.get('pyramiding'): st.markdown(f"- **🔥 불타기 조건:** `{data['pyramiding']}`")
+                if data.get('averaging_down'): st.markdown(f"- **💧 물타기(비중 확대) 조건:** `{data['averaging_down']}`")
                 strat_text = data.get('user_strategy', '')
                 st.markdown(f"- **💡 대응 전략:** `{strat_text if strat_text and strat_text != '분석 리포트 참조' else '분석 리포트 참조'}`")
                 st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
@@ -1148,7 +1156,8 @@ def calculate_targets_and_risk_reward(curr_price, fib, tech):
 
     targets_text = f"1차 목표가: {t1_label} (${t1_price}) | 2차 목표가: {t2_label} (${t2_price})"
     rr_text = f"(1차 목표가 {t1_label} ${t1_price} 기준) 기대수익 {up_pct:+.2f}% : 예상손실 {down_pct:+.2f}% (손익비 {ratio:.2f} : 1)"
-    return targets_text, rr_text, t1_price, t2_price, t1_label, t2_label
+    # [패치7 연동] 손절가(stop_p)를 호출부(물타기 2단계 게이트)에서도 쓸 수 있도록 함께 반환
+    return targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p
 
 # [패치 2] 사용자 대응 전략 프롬프트
 def build_strategy_instruction(is_holding, user_avg_price, user_shares, curr_price, my_return_str, t1_price, t2_price, t1_label, t2_label):
@@ -1174,7 +1183,8 @@ def build_strategy_instruction(is_holding, user_avg_price, user_shares, curr_pri
 
 # [패치 3] 백테스트-기술적 신호 정합성 체크 (기간 동적 연동)
 def build_backtest_consistency_note(backtest_results, bb_squeeze_status, bt_years):
-    squeeze_bt = backtest_results.get('strategy_1_momentum_squeeze', {})
+    # [버그수정] 신규 상장 종목 등 데이터 부족으로 backtest_results가 None인 경우 AttributeError 방지
+    squeeze_bt = (backtest_results or {}).get('strategy_1_momentum_squeeze', {})
     win_rate = squeeze_bt.get('win_rate')
     total_ret = squeeze_bt.get('total_ret')
     if "스퀴즈" in str(bb_squeeze_status) and isinstance(win_rate, (int, float)) and win_rate < 40:
@@ -1183,6 +1193,16 @@ def build_backtest_consistency_note(backtest_results, bb_squeeze_status, bt_year
 
 # [패치 4] 백테스트 성과 평가 (기간 파싱 추가)
 def evaluate_strategy_backtest(bt):
+    # [버그수정] SPCX 등 신규 상장 종목은 60거래일 미만이라 run_strategy_backtest_v2()가 None을
+    # 반환하는데, 이걸 그대로 bt.get(...)에 넘기면 AttributeError: 'NoneType' object has no
+    # attribute 'get' 로 앱 전체가 죽는다. 데이터 부족 시 안전하게 "판정불가" 처리.
+    if not bt:
+        return (
+            "판정불가 (백테스트 데이터 부족)",
+            0.0,
+            "⚠️ 신규 상장 등으로 백테스트에 필요한 최소 거래일(약 60거래일) 데이터가 확보되지 않아 전략 검증을 수행하지 못했습니다. 백테스트 근거를 제시하지 말고, 데이터 부족으로 신뢰도가 낮다는 점을 명시할 것.",
+            "N/A"
+        )
     s1 = bt.get('strategy_1_momentum_squeeze', {}) or {}
     s2 = bt.get('strategy_2_vwap_mean_reversion', {}) or {}
     benchmark = bt.get('benchmark_buy_and_hold', 0) or 0
@@ -1219,69 +1239,165 @@ def evaluate_strategy_backtest(bt):
     verdict_text = f"최근 {bt_years}년 백테스트 결과, '{best_name}' 전략이 통계적으로 더 우수함 (승률 {best_data.get('win_rate')}%, 손익비(PF) {best_data.get('profit_factor')}, 샤프지수 {best_data.get('sharpe_ratio_annualized')}, MDD {best_data.get('mdd')}%, 검증점수 {best_score}/10 vs 대안전략 {other_score}/10). 따라서 정밀 매매 시나리오의 진입/청산 로직은 '{best_name}' 스타일을 우선 근거로 서술할 것."
     return best_name, best_score, verdict_text, bt_years
 
-# [패치 6] 물타기(Averaging Down) 엄격 통제
-def evaluate_averaging_down(curr_price, user_avg_price, user_shares, tech, fund, backtest_results, earnings_info, add_shares=None):
-    checks = {}
-    
-    # 1) [필수 게이트] 손절선 상회 여부
-    stop_price = tech.get('atr_stop_2_0x')
-    gate_pass = isinstance(stop_price, (int, float)) and isinstance(curr_price, (int, float)) and curr_price > stop_price
-    checks['① 손절선 상회 여부'] = f"{'✅ 통과' if gate_pass else '🚫 손절선 이탈'} (현재가 ${curr_price} vs 손절선 ${stop_price})"
-    if not gate_pass: return {"판정": "🚫 물타기 부적합 (이미 손절 구간 - 리스크 관리 우선)", "세부": checks}
+# [패치 7] 물타기(Averaging Down) 2단계 게이트 (1단계 적격성 심사 하드게이트 -> 2단계 실효성/손익비 평가)
+# 1단계는 "하나라도 걸리면 즉시 차단"하는 하드 게이트로, 통과한 종목에 한해서만 2단계(절대 금액 기준 손익비)를 계산한다.
+def stage1_outlook_gate(curr_price, tech, fund, total_score, backtest_results, short_intel, stop_price=None):
+    reasons_block = []
 
-    # 2) 장기추세 훼손 여부 (4단계 세분화 적용)
+    # (0) [필수 게이트 - 패치6에서 이어받음] 손절선 이미 이탈 여부는 최우선으로 즉시 차단
+    #     stage2에서 (curr_price - stop_price)로 손실액을 계산하는데, 이미 손절선 아래인 경우
+    #     이 값이 음수가 되어 "-$-500" 같은 이중 음수 표기가 나오는 것을 막기 위한 목적도 겸함.
+    if isinstance(stop_price, (int, float)) and isinstance(curr_price, (int, float)) and curr_price <= stop_price:
+        reasons_block.append(f"손절선 이미 이탈 (현재가 ${curr_price} ≤ 손절선 ${stop_price}) - 물타기 대신 리스크 관리(전량 손절) 우선")
+
+    # (a) 기술적 하락 추세 훼손
     sma60, sma120 = tech.get('sma_60'), tech.get('sma_120')
-    trend_score = 0
     if isinstance(sma60, (int, float)) and isinstance(sma120, (int, float)):
-        if sma60 < sma120 and curr_price < sma60:
-            trend_note, trend_score = "🚫 완전 역배열 + 이평선 하회 (추세 훼손)", 0
-        elif sma60 >= sma120 and curr_price < sma120:
-            trend_note, trend_score = "🔴 정배열이나 가격이 장기 지지선(SMA120) 하회 (주의)", 0
-        elif sma60 >= sma120 and curr_price < sma60:
-            trend_note, trend_score = "🔶 정배열 유지 + 단기 지지선(SMA60) 하회 (눌림목)", 1
-        else:
-            trend_note, trend_score = "✅ 가격이 모든 주요 이평선 상회", 2
-    else: 
-        trend_note, trend_score = "데이터 부족", 1
-    checks['② 장기추세 상태'] = trend_note
+        ma_dead_cross = sma60 < sma120  # 단/장기 완전 역배열
+        price_below_support = curr_price < sma120  # 장기 지지선(SMA120) 붕괴
+        if ma_dead_cross or price_below_support:
+            reasons_block.append(
+                f"기술적 추세 훼손 (SMA60 ${sma60} {'<' if ma_dead_cross else '≥'} SMA120 ${sma120}, "
+                f"현재가 ${curr_price}가 SMA120 {'하회' if price_below_support else '상회'})"
+            )
 
-    # 3) 가치평가 모델 컨센서스
+    # (b) 펀더멘털/가치평가 악화
+    if isinstance(total_score, (int, float)) and total_score < 6.0:
+        reasons_block.append(f"펀더멘털 스코어 기준치 미달 (종합 평점 {total_score:.2f} < 6.0)")
+
     vm = fund.get('value_models', {}) or {}
     numeric_models = {k: v for k, v in vm.items() if isinstance(v, (int, float))}
-    below_cnt, total_cnt = sum(1 for v in numeric_models.values() if v > curr_price), len(numeric_models)
-    val_score = 1 if total_cnt and below_cnt >= (total_cnt / 2) else 0
-    checks['③ 가치평가 모델 컨센서스'] = f"{below_cnt}/{total_cnt}개 모델이 현재가보다 높은 적정가 제시" + (" (과반수 저평가 시그널)" if val_score else " (과반 미만 - 근거 약함)")
+    overvalued_cnt = sum(1 for v in numeric_models.values() if v < curr_price)
+    total_cnt = len(numeric_models)
+    # [최소 표본수 요건] 그레이엄/피터린치/ROE-PBR 중 산출 가능한 모델이 1개뿐이면 "다수(과반)"라고
+    # 부를 근거가 없다 (표본 1개 = 그냥 그 모델 하나의 의견). 애널리스트 컨센서스 실무에서도
+    # 커버리지가 3~5개 미만이면 "컨센서스"라는 표현 자체를 신중히 쓰는 것과 같은 맥락 —
+    # 최소 2개 이상 모델이 살아있을 때만 이 체크를 작동시킨다.
+    if total_cnt >= 2 and overvalued_cnt >= (total_cnt / 2) + (total_cnt % 2 and 0.5 or 0):
+        # 과반수 이상 모델이 "적정가 < 현재가"(고평가) 판정
+        if overvalued_cnt > total_cnt / 2:
+            reasons_block.append(
+                f"다수 가치평가 모델 고평가 신호 ({overvalued_cnt}/{total_cnt}개 모델이 "
+                f"현재가보다 낮은 적정가 제시)"
+            )
 
-    # 4) 평균회귀 전략 백테스트
+    # (c) 백테스트 및 수급 이탈
     s2 = (backtest_results or {}).get('strategy_2_vwap_mean_reversion', {}) or {}
-    win_rate, reliability = s2.get('win_rate'), s2.get('reliability', 'N/A')
-    bt_score = 2 if isinstance(win_rate, (int, float)) and win_rate >= 60 and '⚠️' not in str(reliability) else (1 if isinstance(win_rate, (int, float)) and win_rate >= 50 else 0)
-    checks['④ 평균회귀 전략 백테스트'] = f"승률 {win_rate}%, 손익비 {s2.get('profit_factor')}, {reliability}"
+    win_rate = s2.get('win_rate')
+    trades_cnt = s2.get('trades_count')
+    reliability = s2.get('reliability', 'N/A')
+    # [최소 표본수 요건] 이 하드 게이트는 걸리면 즉시·영구 차단이라, calc_stats_v2()가 스스로
+    # "✅ 표본 충분(통계적 신뢰 가능)"이라고 인정하는 30건 이상일 때만 승률로 판단한다.
+    # 30건 미만(⚠️ 표본 부족 / 🔶 제한적 신뢰)인데도 승률만으로 차단하면, 실제로는 대부분의
+    # 종목이 표본 부족을 이유로 차단당하는 결과가 되어 게이트의 취지(가짜 신호 배제)를 벗어난다.
+    if isinstance(win_rate, (int, float)) and isinstance(trades_cnt, (int, float)) and trades_cnt >= 30 and win_rate < 50:
+        reasons_block.append(f"평균회귀 전략 백테스트 승률 저조 ({win_rate}% < 50%, {trades_cnt}회 매매, {reliability})")
 
-    # 5) 실적 발표 임박 여부
-    d_day = str((earnings_info or {}).get('d_day', ''))
-    digits = ''.join(ch for ch in d_day if ch.isdigit())
-    days_left = int(digits) if digits else 999
-    event_score = 1 if days_left > 14 else 0
-    checks['⑤ 실적 이벤트 리스크'] = f"✅ 실적까지 {days_left}일 여유" if days_left > 14 else f"🔶 실적 {days_left}일 앞둠 - 변동성 확대 리스크"
+    squeeze_level = str((short_intel or {}).get('squeeze_risk_level', ''))
+    if '🔴' in squeeze_level or '🟡' in squeeze_level:
+        reasons_block.append(f"숏스퀴즈 리스크 상승 ({squeeze_level})")
 
-    # 6) 평단가 개선 시뮬레이션
-    if user_avg_price and user_shares and add_shares:
-        new_avg = (user_avg_price * user_shares + curr_price * add_shares) / (user_shares + add_shares)
-        improve_pct = (user_avg_price - new_avg) / user_avg_price * 100
-        checks['⑥ 평단가 개선 시뮬레이션'] = f"보유수량의 약 25% 수준({add_shares:.1f}주) 분할 매수 시 평단 ${user_avg_price:.2f} → ${new_avg:.2f} ({improve_pct:+.2f}%p 개선)"
+    short_mom_raw = str((short_intel or {}).get('short_mom_change', '0'))
+    try:
+        short_mom_pct = float(short_mom_raw.replace('%', '').replace('+', ''))
+    except ValueError:
+        short_mom_pct = 0.0
+    if short_mom_pct > 20:  # 숏 비중이 급격히 증가하는 중
+        reasons_block.append(f"숏 비중 급증 ({short_mom_raw}) - 스마트머니 이탈 가능성")
 
-    # 최종 점수 산출 및 밸류에이션 하드 캡(Hard Cap) 적용
-    total_score = trend_score + val_score + bt_score + event_score
-    
-    if total_score >= 4: verdict = "🟢 물타기 근거 양호 - 분할 재매수 검토 가능"
-    elif total_score >= 2: verdict = "🟡 조건부 - 소액 분할로만 신중히 검토"
-    else: verdict = "🔴 물타기 근거 부족 - 관망 권장"
+    passed = len(reasons_block) == 0
+    return {
+        "1단계_통과여부": "✅ 통과 - 비중 확대 검토 대상" if passed else "🚫 차단 - 물타기 즉시 배제",
+        "차단_사유": reasons_block if reasons_block else ["없음"],
+    }
 
-    if val_score == 0 and verdict == "🟢 물타기 근거 양호 - 분할 재매수 검토 가능":
-        verdict = "🟡 조건부 - 소액 분할로만 신중히 검토 (가치평가 모델 지지 부족으로 등급 강제 하향)"
 
-    return {"판정": verdict, "점수": f"{total_score}/6", "세부": checks}
+# 2단계: 비중 확대 실효성 및 손익비 평가 (1단계 통과 시에만 실행)
+def stage2_profitability_test(curr_price, user_avg_price, user_shares, add_shares,
+                                stop_price, target1_price):
+    if not (add_shares and add_shares > 0):
+        return {"평가": "add_shares 미지정으로 평가 생략"}
+
+    new_shares = user_shares + add_shares
+    new_avg_price = (user_avg_price * user_shares + curr_price * add_shares) / new_shares
+
+    # (a) 기대 이익금 증가분 ($) - 새로 매수하는 물량이 1차 목표가 도달 시 벌어들이는 절대 수익금
+    incremental_profit_usd = add_shares * (target1_price - curr_price)
+
+    # (b) 손실 노출도 - 추가 매수분이 손절가에 도달했을 때의 손실액 + 전체 포지션 손절 시 총 손실액
+    incremental_loss_usd = add_shares * (curr_price - stop_price)
+    total_loss_if_stopped_usd = (new_avg_price - stop_price) * new_shares
+
+    # (c) 갱신된 손익비 (새 평단가 기준)
+    new_reward = target1_price - new_avg_price
+    new_risk = new_avg_price - stop_price
+    new_rr_ratio = round(new_reward / new_risk, 2) if new_risk > 0 else None
+
+    rr_ok = isinstance(new_rr_ratio, (int, float)) and new_rr_ratio >= 1.5
+
+    return {
+        "매수후_평단가": f"${user_avg_price:.2f} → ${new_avg_price:.2f}",
+        "① 기대 이익금 증가분": f"+${incremental_profit_usd:,.2f} (추가매수 {add_shares:.1f}주가 1차목표가(${target1_price}) 도달 시)",
+        "② 손실 노출도": (
+            f"추가매수분 손절 시 -${incremental_loss_usd:,.2f} / "
+            f"전체 포지션({new_shares:.1f}주) 손절 시 총 -${total_loss_if_stopped_usd:,.2f}"
+        ),
+        "③ 갱신된 손익비(R/R)": (
+            f"{new_rr_ratio} : 1 {'✅ 기준(1.5) 충족' if rr_ok else '⚠️ 기준(1.5) 미달 - 비중확대 매력도 낮음'}"
+            if new_rr_ratio is not None else "계산불가"
+        ),
+        "2단계_최종판단": "🟢 비중 확대 실효성 있음" if rr_ok else "🟡 비중 확대는 가능하나 손익비 매력도 낮음",
+    }
+
+
+# 통합 함수 (patch6의 evaluate_averaging_down 대체)
+def evaluate_averaging_down_v2(curr_price, user_avg_price, user_shares, add_shares,
+                                 tech, fund, total_score, backtest_results,
+                                 short_intel, stop_price, target1_price):
+    stage1 = stage1_outlook_gate(curr_price, tech, fund, total_score, backtest_results, short_intel, stop_price)
+
+    if stage1["1단계_통과여부"].startswith("🚫"):
+        return {
+            "최종_판정": "🚫 물타기 부적합 (1단계 적격성 심사 탈락)",
+            "1단계_결과": stage1,
+            "2단계_결과": "1단계 탈락으로 평가 생략",
+        }
+
+    stage2 = stage2_profitability_test(curr_price, user_avg_price, user_shares, add_shares,
+                                         stop_price, target1_price)
+
+    final_verdict = stage2.get("2단계_최종판단", "🟡 조건부")
+    return {
+        "최종_판정": final_verdict,
+        "1단계_결과": stage1,
+        "2단계_결과": stage2,
+    }
+
+
+# Section 6 "물타기(비중 확대) 조건" 프롬프트 출력용 텍스트 포맷터
+def format_averaging_down_text(avg_down_check, is_holding):
+    if not is_holding:
+        return "해당없음 (미보유 - 신규 진입 검토 대상이라 물타기/비중확대 판정 비적용)"
+
+    final_verdict = avg_down_check.get("최종_판정", "판정불가")
+
+    if final_verdict.startswith("🚫"):
+        stage1 = avg_down_check.get("1단계_결과", {}) or {}
+        block_reasons = stage1.get("차단_사유", [])
+        reasons_text = " / ".join(block_reasons) if block_reasons else "데이터 근거 부족"
+        return f"{final_verdict} | 차단 사유: {reasons_text} | 물타기(추가매수로 평단 낮추기) 의견 절대 제시 금지. 손절선 이탈 시에는 물타기 대신 전량 손절을 우선할 것."
+
+    stage2 = avg_down_check.get("2단계_결과", {}) or {}
+    if not isinstance(stage2, dict):
+        return f"{final_verdict} | 상세 평가 생략 ({stage2})"
+
+    detail_parts = [f"{k}: {v}" for k, v in stage2.items() if k != "2단계_최종판단"]
+    detail_text = " / ".join(detail_parts) if detail_parts else "상세 데이터 없음"
+    return (
+        f"{final_verdict} | 1단계 적격성 심사 통과. 현재가가 분할 매수 밴드 안일 경우에 한해 "
+        f"'평단가를 낮추기 위한 소액 분할 재매수' 의견을 아래 실효성 근거(퍼센트 대신 반드시 달러 금액 명시)와 함께 제시 가능: "
+        f"{detail_text}. 단, 손절선 이탈 시에는 물타기 대신 전량 손절을 우선할 것."
+    )
 
 # 스코어카드 연산 (기존 함수 유지)
 def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
@@ -1326,7 +1442,40 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
         elif val <= b3: return 5.5
         elif val <= b4: return 3.5
         return 1.5
-    s_val = (score_v(pe, 15, 25, 40, 60) + score_v(fpe, 12, 20, 28, 35) + score_v(ps, 3, 6, 10, 15) + score_v(pbr, 3, 6, 10, 15)) / 4.0
+    # [밸류에이션 개선안 1안] PSR을 절대 문턱(3/6/10/15배)이 아니라 "성장률 구간별 적정 PSR 배수"
+    # (_get_psr_multiple, growth_models['psr_target']과 동일 기준) 대비 몇 배인지로 채점.
+    # 예: 고성장(30%+) 종목의 적정 PSR은 8배이므로, PSR 17배는 "절대 기준 초과"가 아니라
+    # "적정가 대비 2.2배"로 평가됨 — 성장 없이 비싼 종목과 성장 때문에 비싼 종목을 구분.
+    growth_input_str = fund.get('growth_factors', {}).get('growth_model_input_used', 'N/A')
+    growth_for_val = parse_num(growth_input_str) if growth_input_str != 'N/A' else None
+    def score_ps_growth_adjusted(val, growth):
+        if not isinstance(val, (int, float)) or val < 0: return 1.5
+        if growth is None or growth <= 0:
+            return score_v(val, 3, 6, 10, 15)  # 성장률 데이터 없으면 기존 절대 문턱으로 폴백
+        fair_ps = _get_psr_multiple(growth)
+        ratio = val / fair_ps
+        if ratio <= 0.7: return 9.5
+        elif ratio <= 1.0: return 7.5
+        elif ratio <= 1.3: return 5.5
+        elif ratio <= 1.8: return 3.5
+        return 1.5
+    # [밸류에이션 개선안 2안] PBR도 절대 문턱(3/6/10/15배) 대신 "ROE 대비 적정 PBR"
+    # (value_models['roe_pbr']와 동일 기준: 적정 PBR ≈ ROE% ÷ 10%) 대비 몇 배인지로 채점.
+    # 예: ROE 100%대 초고수익 기업은 적정 PBR이 10배라, PBR 23배는 "절대 기준 초과"가 아니라
+    # "ROE 대비 적정가의 2.3배"로 평가됨 — 고ROE라서 장부가 프리미엄이 정당한 종목을 구분.
+    roe_for_val = parse_num(fund.get('roe', 0))
+    def score_pbr_roe_adjusted(val, roe_pct):
+        if not isinstance(val, (int, float)) or val < 0: return 1.5
+        if not isinstance(roe_pct, (int, float)) or roe_pct <= 0:
+            return score_v(val, 3, 6, 10, 15)  # ROE 데이터 없거나 마이너스면 기존 절대 문턱으로 폴백
+        fair_pbr = roe_pct / 10.0
+        ratio = val / fair_pbr
+        if ratio <= 0.7: return 9.5
+        elif ratio <= 1.0: return 7.5
+        elif ratio <= 1.3: return 5.5
+        elif ratio <= 1.8: return 3.5
+        return 1.5
+    s_val = (score_v(pe, 15, 25, 40, 60) + score_v(fpe, 12, 20, 28, 35) + score_ps_growth_adjusted(ps, growth_for_val) + score_pbr_roe_adjusted(pbr, roe_for_val)) / 4.0
     vwap_20d = parse_num(tech.get('vwap_20d'))
     vwap_dev = ((curr_price - vwap_20d) / vwap_20d * 100) if vwap_20d > 0 else 0
     if vwap_dev >= 5: s_mom1 = 9.5
@@ -1379,7 +1528,9 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
     elif total_score >= 7.5: badge = "🥇 적격 우량주"
     elif total_score >= 6.0: badge = "⚠️ 조건부 종목"
     else: badge = "🚨 비우량주"
-    return f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f} · {s_mom3_note}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
+    scorecard_text = f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f} · {s_mom3_note}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
+    # [패치7] 물타기 2단계 게이트(stage1_outlook_gate)가 숫자 종합점수(total_score)를 필요로 해서 튜플로 반환
+    return scorecard_text, total_score, s_val
 
 # -------------------------------------------------------------
 # 메인 분석 실행
@@ -1422,9 +1573,10 @@ if analyze_btn:
         hedge_short_intel = fund_data.get('hedge_and_short_intel', {})
         earnings_info = fund_data.get('earnings_calendar', {})
         
-        # 패치 1 적용: 동적 목표가 및 손익비
-        targets_text, rr_text, t1_price, t2_price, t1_label, t2_label = calculate_targets_and_risk_reward(curr_p, fib_levels, tech_data)
-        precalc_scorecard = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p, price_df=raw_df)
+        # 패치 1 적용: 동적 목표가 및 손익비 (stop_p: 패치7 물타기 2단계 게이트에서 재사용)
+        targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p = calculate_targets_and_risk_reward(curr_p, fib_levels, tech_data)
+        # 패치 7 적용: 숫자 종합점수(precalc_total_score)도 함께 반환받도록 변경
+        precalc_scorecard, precalc_total_score, precalc_s_val = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p, price_df=raw_df)
 
         my_return_str = "N/A"
         if is_holding and user_avg_price > 0 and user_shares > 0 and isinstance(curr_p, (int, float)) and curr_p > 0:
@@ -1441,18 +1593,17 @@ if analyze_btn:
         # 패치 4 적용: 백테스트 비교 및 검증 점수 (동적 기간 반환 포함)
         best_name, backtest_score, backtest_verdict, bt_years = evaluate_strategy_backtest(backtest_results)
         
-        # 패치 6 & 개선안 적용: 물타기 엄격 판정 (보유수량의 약 25% 수준 소액 분할 할당)
+        # 패치 7 적용: 물타기 2단계 게이트 (1단계 적격성 하드게이트 -> 2단계 실효성/손익비 평가, 보유수량의 약 25% 소액 분할 할당)
         simulated_add_shares = round(user_shares * 0.25, 1) if user_shares > 0 else 1.0
-        avg_down_check = evaluate_averaging_down(
+        avg_down_check = evaluate_averaging_down_v2(
             curr_price=curr_p, user_avg_price=user_avg_price, user_shares=user_shares,
-            tech=tech_data, fund=fund_data, backtest_results=backtest_results,
-            earnings_info=earnings_info, add_shares=simulated_add_shares
+            add_shares=simulated_add_shares, tech=tech_data, fund=fund_data,
+            total_score=precalc_total_score, backtest_results=backtest_results,
+            short_intel=fund_data.get('hedge_and_short_intel', {}).get('short_intel', {}),
+            stop_price=stop_p, target1_price=t1_price
         )
-        if avg_down_check["판정"].startswith(("🟢", "🟡")):
-            averaging_clause = f"\n⚠️[조건부 허용] 데이터 기반 판정 결과 '{avg_down_check['판정']}'입니다. 현재가가 분할 매수 밴드 안에 있다고 판단될 경우에 한해 '평단가를 낮추기 위한 소액 분할 재매수' 의견을 근거({avg_down_check['세부']})와 함께 제시해도 됨. 단 손절선 이탈 시에는 절대 물타기 대신 전량 손절할 것을 명시할 것."
-        else:
-            averaging_clause = "\n⚠️ 물타기(추가매수로 평단 낮추기) 의견은 데이터 근거가 부족하므로 절대 제시하지 말 것."
-        strategy_instruction_text += averaging_clause
+        # 물타기 판정 결과는 Section 6 전용 데이터 항목(21번)으로 분리하여 프롬프트에 주입 (아래 avg_down_text)
+        avg_down_text = format_averaging_down_text(avg_down_check, is_holding)
 
         # 패치 3 적용: 스퀴즈 백테스트 정합성 경고 (동적 기간 변수 주입)
         consistency_note = build_backtest_consistency_note(backtest_results, tech_data.get('bb_squeeze_status'), bt_years)
@@ -1554,6 +1705,9 @@ if analyze_btn:
 20. ATR 손절선 고정 라벨 (절대 임의 수정 금지):
 {atr_labels_json}
 
+21. 파이썬 알고리즘 사전 연산 물타기(비중확대) 판정 (절대 임의 수정 금지):
+{avg_down_json}
+
 ---
 
 [지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 POC 매물벽 검증 규칙]
@@ -1622,13 +1776,14 @@ if analyze_btn:
 * **매도가 밴드**: [내용 (오름차순)]
 * **손절(Stop-loss) 기준선**: [20번 ATR 손절선 고정 라벨 텍스트를 그대로 인용할 것, 배수와 금액을 임의로 재조합하지 말 것]
 * **불타기 조건**: [스퀴즈 상방 돌파 등 (19번 전략 스타일에 맞춰 서술)]
+* **물타기(비중 확대) 조건**: [21번 사전 연산 물타기 판정 결과를 그대로 인용할 것 — 보유자에 한해 서술, 미보유자는 '해당없음(미보유)'으로 표기]
 
 [7. 최종 투자의견]
 * **최종 투자의견**: [선택]
 {strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict"],
+                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "avg_down_json"],
                 template=template
             )
             llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
@@ -1653,10 +1808,8 @@ if analyze_btn:
                 "analyst_json": json.dumps(analyst_data, indent=2, ensure_ascii=False),
                 "score_json": precalc_scorecard, "rr_json": rr_text,
                 "targets_json": targets_text, "consistency_note": consistency_note,
-                "backtest_verdict": backtest_verdict,
-                "score_json": precalc_scorecard, "rr_json": rr_text,
-                "targets_json": targets_text, "consistency_note": consistency_note,
-                "backtest_verdict": backtest_verdict, "atr_labels_json": atr_labels_text
+                "backtest_verdict": backtest_verdict, "atr_labels_json": atr_labels_text,
+                "avg_down_json": avg_down_text
             }
             
             for delay in [0, 5, 10]:
@@ -1669,9 +1822,9 @@ if analyze_btn:
             if not response_content: response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
         if response_content and not response_content.startswith("⚠️"):
-            act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, u_strat_summary, q_badge = parse_full_trading_scenario(response_content)
+            act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, avg_dn, u_strat_summary, q_badge = parse_full_trading_scenario(response_content)
             st.session_state.history[ticker_input] = {
-                "action": act, "entry_grade": ent_grade, "entry_rr": ent_rr, "quality_badge": q_badge, "price": curr_p, "my_avg": user_avg_price if is_holding else 0, "my_return": my_return_str if is_holding else "미보유", "target_1": t1, "target_2": t2, "take_profit": t1, "sell_target": sell_b, "buy_band": buy_b, "stop_loss": sl_b, "pyramiding": pyr, "user_strategy": u_strat_summary, "time": get_current_kst_time_str()
+                "action": act, "entry_grade": ent_grade, "entry_rr": ent_rr, "quality_badge": q_badge, "price": curr_p, "my_avg": user_avg_price if is_holding else 0, "my_return": my_return_str if is_holding else "미보유", "target_1": t1, "target_2": t2, "take_profit": t1, "sell_target": sell_b, "buy_band": buy_b, "stop_loss": sl_b, "pyramiding": pyr, "averaging_down": avg_dn, "user_strategy": u_strat_summary, "time": get_current_kst_time_str()
             }
             save_history(st.session_state.history)
 
