@@ -1389,6 +1389,78 @@ def evaluate_strategy_backtest(bt):
     verdict_qualifier_text = build_verdict_style_qualifier(category)
     return best_name, best_score, verdict_text, bt_years, trading_caution_text, verdict_qualifier_text
 
+# [개선/2026-09, item 21 그룹 B] "그대로 복사 출력" 지시가 프롬프트 문구만으로는 강제되지 않는다는 문제
+# (item 22/27/28에서 반복 확인, 특히 TSLA 재현 사례에서는 LLM이 스스로 오인식한 현재가를 기준으로
+# 여러 "절대 임의 수정 금지" 필드를 동시에 재계산해버리는 것까지 확인됨)를 코드 레벨에서 원천 차단하기
+# 위한 후처리 계층. 설계 논의 결론(사용자 승인):
+#   1) 9개 "그대로 복사" 필드는 LLM에게 실제 문구 대신 플레이스홀더 토큰(`[[F##]]`)만 출력하게 하고,
+#      응답을 받은 뒤 Python이 단순 문자열 치환으로 실제 값을 채워 넣는다 (토큰이 없으면 기존 방식대로
+#      불릿 경계를 정규식으로 추정해 내용 전체를 강제 치환하는 폴백을 유지 - 이중 안전장치).
+#   2) 24번(verdict_qualifier)은 애초에 "판정 근거로 사용 금지"라는 설계 원칙(item 15) 때문에 LLM에게
+#      보여줄 필요 자체가 없으므로, 프롬프트에서 완전히 제거하고 Python이 최종 투자의견 뒤에 항상 직접
+#      부기한다.
+#   3) 위 두 가지로도 못 막는 잔여 리스크(자유 서술문 안에 "현재가($...)" 형태로 잘못된 현재가가
+#      섞여 들어가는 경우, TSLA 사례의 발원지)는 리포트 전체를 대상으로 "현재가/현재 주가($...)"
+#      패턴만 정규식으로 찾아 진짜 현재가로 강제 치환하는 별도 스윕으로 보완한다. 서술 자체(왜 그런
+#      판단을 내렸는지)는 LLM 자유 서술을 그대로 유지 - 괄호 안 숫자 하나만 고정.
+def force_copy_field(report_text, label, value, token=None, logger=None):
+    """불릿 '* **{label}**: ...' 의 내용을 value로 강제 치환.
+    1) token이 주어지고 응답 안에 그대로 있으면 단순 문자열 치환(가장 안전, 우선 시도).
+    2) token이 없으면(LLM이 지시를 어기고 실제 내용을 써버린 경우) 불릿 경계를 정규식으로 추정해
+       내용 전체를 강제 치환(기존 방식, 폴백).
+    3) 그마저 실패하면(레이블 자체를 못 찾음 - LLM이 출력 포맷을 이탈) 원문을 그대로 두고 경고 로그만 남김
+       (item 4의 "크래시 대신 안전 폴백" 철학과 동일)."""
+    if token and token in report_text:
+        return report_text.replace(token, value, 1)
+    pattern = re.compile(
+        r'(\*\s*\*\*' + re.escape(label) + r'\*\*\s*:\s*)(.*?)(?=\n\s*\*\s*\*\*|\n\s*\[\d+\.|\Z)',
+        re.DOTALL
+    )
+    new_text, n = pattern.subn(lambda m: m.group(1) + value, report_text, count=1)
+    if n == 0 and logger:
+        logger.warning(f"[강제치환 실패] '{label}' 불릿을 리포트에서 찾지 못함 (토큰/폴백 모두 실패 - LLM이 출력 포맷을 이탈했을 가능성)")
+    return new_text
+
+def fix_current_price_mentions(report_text, curr_price):
+    """리포트 전체에서 '현재가($X)' / '현재 주가($X)' (괄호 없는 '현재가 $X' 포함) 패턴을 찾아
+    괄호/문장 구조는 그대로 두고 숫자만 실제 current_price로 강제 치환. 자유 서술문(진입 적합성
+    분석 등) 안에서 LLM이 현재가를 스스로 오인식해 재기입하는 경우를 서술의 자유를 건드리지 않고
+    발원지에서만 고정하기 위한 보완 조치."""
+    if not isinstance(curr_price, (int, float)): return report_text
+    pattern = re.compile(r'(현재\s*주?가[는가이]?\s*\(?\$)([\d,]+\.?\d*)(\)?)')
+    return pattern.sub(lambda m: f"{m.group(1)}{curr_price}{m.group(3)}", report_text)
+
+def apply_verdict_qualifier(report_text, verdict_qualifier_text, logger=None):
+    """24번(verdict_qualifier)은 프롬프트에서 완전히 제외했으므로, LLM이 자유롭게 결정한
+    매수/관망/홀딩 뒤에 Python이 항상 직접 부기(빈 문자열이면 아무것도 안 붙임)."""
+    pattern = re.compile(r'(\*\s*\*\*최종\s*투자의견\*\*\s*:\s*)(매수|관망|홀딩)(\s*\([^)]*\))?')
+    def repl(m):
+        suffix = f" ({verdict_qualifier_text})" if verdict_qualifier_text else ""
+        return m.group(1) + m.group(2) + suffix
+    new_text, n = pattern.subn(repl, report_text, count=1)
+    if n == 0 and logger:
+        logger.warning("[부기 실패] '최종 투자의견' 불릿에서 매수/관망/홀딩 판정어를 찾지 못함")
+    return new_text
+
+def enforce_precalculated_fields(report_text, ctx, logger=None):
+    """9개 '그대로 복사' 필드 강제 치환 + 24번 부기 + 현재가 오기재 스윕을 한 번에 적용."""
+    field_map = [
+        ("스코어카드 관점", ctx["precalc_scorecard"], "[[F15]]"),
+        ("예상 손익비 (Risk/Reward)", ctx["rr_text"], "[[F16]]"),
+        ("1차 목표가", f'{ctx["t1_label"]} (${ctx["t1_price"]})', "[[F17T1]]"),
+        ("2차 목표가", f'{ctx["t2_label"]} (${ctx["t2_price"]})', "[[F17T2]]"),
+        ("벤치마크 대비 평가", ctx["backtest_verdict"], "[[F19]]"),
+        ("손절(Stop-loss) 기준선", ctx["atr_labels_text"], "[[F20]]"),
+        ("물타기(비중 확대) 조건", ctx["avg_down_text"], "[[F21]]"),
+        ("신규 진입 등급", ctx["entry_grade_text"], "[[F22]]"),
+        ("매매 접근 방식 주의사항", ctx["trading_caution_text"], "[[F23]]"),
+    ]
+    for label, value, token in field_map:
+        report_text = force_copy_field(report_text, label, value, token=token, logger=logger)
+    report_text = apply_verdict_qualifier(report_text, ctx["verdict_qualifier_text"], logger=logger)
+    report_text = fix_current_price_mentions(report_text, ctx["curr_p"])
+    return report_text
+
 # [패치 7] 물타기(Averaging Down) 2단계 게이트 (1단계 적격성 심사 하드게이트 -> 2단계 실효성/손익비 평가)
 # 1단계는 "하나라도 걸리면 즉시 차단"하는 하드 게이트로, 통과한 종목에 한해서만 2단계(절대 금액 기준 손익비)를 계산한다.
 def stage1_outlook_gate(curr_price, tech, fund, total_score, backtest_results, short_intel, stop_price=None):
@@ -1865,13 +1937,12 @@ if analyze_btn:
 23. 파이썬 알고리즘 사전 연산 매매 접근방식 주의사항 (벤치마크 기반, 절대 임의 수정 금지):
 {trading_caution_json}
 
-24. 파이썬 알고리즘 사전 연산 최종 투자의견 매매 스타일 부기 문구 (빈 문자열이면 부기 없음, 절대 임의 수정 금지):
-{verdict_qualifier_json}
-
 ---
 
 [지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 POC 매물벽 검증 규칙]
 위 데이터를 바탕으로 최고 수준의 퀀트/금융 애널리스트 관점에서 정밀 리포트를 작성할 것:
+
+0. [플레이스홀더 규칙 - 반드시 준수] 아래 [지시사항]과 [출력 포맷]에 `[[F15]]`, `[[F16]]`처럼 대괄호 두 개로 감싼 자리가 나오면, 그 자리는 시스템이 응답을 받은 뒤 실제 계산값으로 자동 치환하는 자리이다. 해당 자리에는 반드시 그 플레이스홀더 문자열만 대괄호 두 개를 포함해 정확히, 앞뒤에 다른 설명이나 숫자 없이 출력할 것 - 직접 값을 계산하거나 요약하거나 풀어쓰지 말 것.
 
 1. 거시환경 및 시장 국면
 - **[참고자료 및 기준일자]**: 분석에 활용된 핵심 매크로 지표의 **출처 및 수집 기준일자**를 명시할 것.
@@ -1886,25 +1957,24 @@ if analyze_btn:
 - **주요 기관투자자 보유 현황(대형 패시브 인덱스 운용사 위주이므로 특정 종목에 대한 액티브 확신 매수 시그널로 과대 해석하지 말 것) / 공매도 세력 및 숏스퀴즈 리스크 / IB 투자의견 신뢰도 가중**.
 
 4. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가 ({ticker})
-- **스코어카드 산출**: ⚠️ 15번 [사전 연산 스코어카드] 텍스트를 그대로 복사 출력.
+- **스코어카드 산출**: ⚠️ 아래 [출력 포맷]의 해당 자리에 플레이스홀더 `[[F15]]`만 출력할 것.
 - **[백테스트 신뢰도 표기 필수]**: JSON에 포함된 reliability(신뢰도 라벨)와 period_split(전반부/후반부 성과)을 반드시 언급하고, 표본 부족 시 참고 지표로만 서술할 것.
-- **[벤치마크 비교 필수 - 절대 임의 누락 금지]**: 19번 [백테스트 전략 비교 및 매매 스타일 판정]에 포함된 벤치마크(단순 매수 후 보유) 대비 성과 비교 문장을 반드시 그대로 인용하여 언급할 것. 전략의 절대수익(총수익률, PF, 샤프지수 등)이 양호하더라도, 벤치마크에 미달하는 경우 "통계적으로 우수하다"는 식으로 단정하지 말고 벤치마크 대비 초과수익(알파)이 없다는 점을 반드시 함께 명시할 것.
+- **[벤치마크 대비 평가]**: ⚠️ 아래 [출력 포맷]의 해당 자리에 플레이스홀더 `[[F19]]`만 출력할 것.
 
 5. [신규 진입 적격성 평가 (미보유자 관점 핵심 진단)]
-- **신규 진입 등급**: ⚠️ 22번 [사전 연산 신규 진입 등급] 텍스트를 그대로 복사 출력할 것 (임의로 등급을 상향/하향하지 말 것). 등급이 낮게(C/D) 나온 경우 이를 완화하는 서술을 하지 말고, 왜 손익비가 불리한지(목표가 근접/손절폭 과다 등)를 그대로 설명할 것.
-- **진입 적합성 분석**: 위 등급의 근거를 기술적 지표(스퀴즈, 이평선, POC 매물대 등) 기반으로 서술.
-- **예상 손익비 (Risk/Reward)**: ⚠️ 16번 [사전 연산 예상 손익비] 텍스트 그대로 출력.
+- **신규 진입 등급**: ⚠️ 아래 [출력 포맷]의 해당 자리에 플레이스홀더 `[[F22]]`만 출력할 것.
+- **진입 적합성 분석**: 22번 [사전 연산 신규 진입 등급]과 16번 [사전 연산 예상 손익비]의 근거를 기술적 지표(스퀴즈, 이평선, POC 매물대 등)와 함께 자유롭게 서술할 것. ⚠️[숫자 정확성] 이 문단에서 현재가를 언급할 경우 반드시 1번 데이터의 current_price 값을 그대로 사용할 것 - 반올림하거나 다른 값으로 재계산하지 말 것.
+- **예상 손익비 (Risk/Reward)**: ⚠️ 아래 [출력 포맷]의 해당 자리에 플레이스홀더 `[[F16]]`만 출력할 것.
 
 6. [정밀 매매 시나리오]
 - **[매매 스타일 일치 규칙 (필수)]**: 반드시 [19. 백테스트 전략 비교]에서 판정된 전략 스타일에 맞춰 분할 매수 밴드/목표가/불타기 조건의 논리를 서술할 것.
 - **[매수 밴드 및 진입 가격 상/하단 논리 일치 규칙]**: 하단 [사용자 대응 전략] 가격과 상단 [분할 매수 밴드] 가격 100% 일치시킬 것.
 - **[가격 표기]**: 밴드는 오름차순(낮은 가격 ~ 높은 가격)으로 표기.
-- **손절(Stop-loss) 기준선**.
+- **[플레이스홀더 대상]**: 매매 접근 방식 주의사항(`[[F23]]`), 1차 목표가(`[[F17T1]]`), 2차 목표가(`[[F17T2]]`), 손절(Stop-loss) 기준선(`[[F20]]`), 물타기(비중 확대) 조건(`[[F21]]`)은 아래 [출력 포맷]의 해당 자리에 각 플레이스홀더만 출력할 것 - 분할 매수 밴드/매도가 밴드/불타기 조건 서술은 자유롭게 작성.
 
 7. [최종 투자의견 규칙 (엄격 준수)]
 - 관망이 유리하면 최종 투자의견을 절대 '매수'로 적지 말고 '관망' 또는 '홀딩'으로 명시.
-- 위 매수/관망/홀딩 판정 로직 자체는 아래 [매매 스타일 부기] 규칙과 무관하게 독립적으로 결정할 것 (24번 데이터는 판정 근거로 사용 금지, 판정 이후에만 참고).
-- **[매매 스타일 부기]**: 24번 [사전 연산 최종 투자의견 매매 스타일 부기 문구]가 빈 문자열이 아니면, 위에서 결정한 매수/관망/홀딩 뒤에 괄호로 묶어 그대로 이어붙여 출력할 것(문구 재작성 금지). 24번이 빈 문자열이면 매수/관망/홀딩만 단독으로 출력하고 괄호를 추가하지 말 것.
+- 매수/관망/홀딩 중 하나만 명확히 단독으로 출력할 것 (뒤에 괄호나 부기 문구를 붙이지 말 것 - 필요한 부기는 시스템이 사후에 자동으로 추가함).
 
 ---
 
@@ -1925,30 +1995,31 @@ if analyze_btn:
 * **IB 투자의견 신뢰도 가중**: [내용]
 
 [4. 정밀 기술적 지표, VWAP, POC 매물대 및 백테스팅 평가]
-* **스코어카드 관점**: [15번 결과값 그대로 복사]
-* **백테스트 평가**: [내용]
+* **스코어카드 관점**: [[F15]]
+* **백테스트 신뢰도**: [내용 - reliability/period_split 자유 서술]
+* **벤치마크 대비 평가**: [[F19]]
 
 [5. 신규 진입 적격성 평가]
-* **신규 진입 등급**: [22번 사전 연산 신규 진입 등급 값을 그대로 복사 출력]
+* **신규 진입 등급**: [[F22]]
 * **진입 적합성 분석**: [내용]
-* **예상 손익비 (Risk/Reward)**: [16번 결과값 그대로 복사]
+* **예상 손익비 (Risk/Reward)**: [[F16]]
 
 [6. 정밀 매매 시나리오]
-* **매매 접근 방식 주의사항**: [23번 사전 연산 결과를 그대로 복사 출력할 것 (임의로 재작성하거나 다른 문구로 대체하지 말 것)]
+* **매매 접근 방식 주의사항**: [[F23]]
 * **분할 매수 밴드**: [내용 (오름차순)]
-* **1차 목표가**: [17번 파이썬 알고리즘 사전 연산 목표가의 1차 목표가 값을 그대로 복사 출력]
-* **2차 목표가**: [17번 파이썬 알고리즘 사전 연산 목표가의 2차 목표가 값을 그대로 복사 출력]
+* **1차 목표가**: [[F17T1]]
+* **2차 목표가**: [[F17T2]]
 * **매도가 밴드**: [내용 (오름차순)]
-* **손절(Stop-loss) 기준선**: [20번 ATR 손절선 고정 라벨 텍스트를 그대로 인용할 것, 배수와 금액을 임의로 재조합하지 말 것]
+* **손절(Stop-loss) 기준선**: [[F20]]
 * **불타기 조건**: [스퀴즈 상방 돌파 등 (19번 전략 스타일에 맞춰 서술)]
-* **물타기(비중 확대) 조건**: [21번 사전 연산 물타기 판정 결과를 그대로 복사 출력할 것 (임의로 재작성하거나 다른 문구로 대체하지 말 것)]
+* **물타기(비중 확대) 조건**: [[F21]]
 
 [7. 최종 투자의견]
-* **최종 투자의견**: [매수/관망/홀딩 중 택1 + 24번 부기 문구가 있으면 괄호로 이어붙여 출력]
+* **최종 투자의견**: [매수/관망/홀딩 중 택1, 단독으로만 출력]
 {strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "avg_down_json", "entry_grade_json", "trading_caution_json", "verdict_qualifier_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "avg_down_json", "entry_grade_json", "trading_caution_json"],
                 template=template
             )
             # [개선] SDK 자체 재시도/타임아웃을 명시적으로 짧게 제한해서, 아래 앱 자체 재시도 루프(0/5/10초 간격)가
@@ -1978,7 +2049,7 @@ if analyze_btn:
                 "targets_json": targets_text, "consistency_note": consistency_note,
                 "backtest_verdict": backtest_verdict, "atr_labels_json": atr_labels_text,
                 "avg_down_json": avg_down_text, "entry_grade_json": entry_grade_text,
-                "trading_caution_json": trading_caution_text, "verdict_qualifier_json": verdict_qualifier_text
+                "trading_caution_json": trading_caution_text
             }
             
             # [개선] LLM 호출 소요시간 로깅 - timeout(30초) 값이 실제 정상 케이스 응답시간에 비해 적절한지
@@ -1997,6 +2068,22 @@ if analyze_btn:
                     logger.info(f"[LLM 호출] {ticker_input} 시도 {attempt_no}/3 실패 - 소요시간 {elapsed:.1f}초, 에러: {e}")
                     continue
             if not response_content: response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
+            elif not response_content.startswith("⚠️"):
+                # [개선/2026-09, item 21 그룹 B] LLM이 "그대로 복사" 지시를 어기고 스스로 재작성/재계산한
+                # 경우를 코드 레벨에서 강제 교정 - 9개 사전연산 필드 플레이스홀더 치환 + 24번 부기 + 리포트
+                # 전체의 "현재가($...)" 오기재 스윕. 예외 발생 시에도 원본 리포트는 보존(안전 폴백).
+                try:
+                    _enforce_ctx = {
+                        "precalc_scorecard": precalc_scorecard, "rr_text": rr_text,
+                        "t1_label": t1_label, "t1_price": t1_price, "t2_label": t2_label, "t2_price": t2_price,
+                        "backtest_verdict": backtest_verdict, "atr_labels_text": atr_labels_text,
+                        "avg_down_text": avg_down_text, "entry_grade_text": entry_grade_text,
+                        "trading_caution_text": trading_caution_text, "verdict_qualifier_text": verdict_qualifier_text,
+                        "curr_p": curr_p,
+                    }
+                    response_content = enforce_precalculated_fields(response_content, _enforce_ctx, logger=logger)
+                except Exception as e:
+                    logger.warning(f"[강제치환 계층 오류] {ticker_input}: {e} - 원본 리포트 그대로 사용")
 
         if response_content and not response_content.startswith("⚠️"):
             act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, avg_dn, u_strat_summary, q_badge = parse_full_trading_scenario(response_content)
