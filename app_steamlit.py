@@ -389,13 +389,17 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
             if pos == 1:
                 daily_ret = (cur['Close'] - prev['Close']) / prev['Close']
                 equity *= (1 + daily_ret)
-            equity_daily.append((date, equity))
 
             if pos == 1 and exit_fn(cur, entry_p):
                 raw_ret = (cur['Close'] - entry_p) / entry_p
                 net_ret = raw_ret - cost_pct
                 trades.append((entry_date, date, net_ret))
+                # [개선] equity_daily를 MDD 계산에도 쓰기 위해, 청산 시 거래비용을
+                # trades와 동일하게 equity 곡선에도 반영(청산일에 반영되도록 append 이전에 적용).
+                equity *= (1 - cost_pct)
                 pos, entry_p, entry_date = 0, 0, None
+
+            equity_daily.append((date, equity))
 
             if pos == 0 and entry_fn(cur, prev):
                 pos, entry_p, entry_date = 1, cur['Close'], date
@@ -433,13 +437,23 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
                      "profit_factor": "N/A(거래없음)", "mdd": 0.0,
                      "sharpe_ratio_annualized": 0.0, "reliability": "⚠️ 표본 없음"}
 
-        cum, peak, mdd = 1.0, 1.0, 0.0
+        cum = 1.0
         wins = [r for r in rets if r > 0]
         losses = [r for r in rets if r < 0]
         for r in rets:
             cum *= (1 + r)
-            peak = max(peak, cum)
-            mdd = max(mdd, (peak - cum) / peak)
+
+        # [개선] MDD는 거래 단위(rets, 청산 시점 수익률만) 대신 일별 equity_daily
+        # 기준으로 계산. rets 기반은 보유 중 발생했다가 청산 전에 회복된 낙폭을
+        # 놓치므로 실제 리스크를 과소평가할 수 있음 - 벤치마크(Buy&Hold) MDD를
+        # 일별로 계산하는 것과 측정 해상도를 맞추기 위해 함께 변경 (2026-09).
+        if equity_daily:
+            peak_e, mdd = 1.0, 0.0
+            for _, e in equity_daily:
+                peak_e = max(peak_e, e)
+                mdd = max(mdd, (peak_e - e) / peak_e) if peak_e > 0 else mdd
+        else:
+            mdd = 0.0
 
         tot_ret = (cum - 1) * 100
         win_rate = (len(wins) / n) * 100
@@ -478,7 +492,7 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
             "reliability": reliability
         }
 
-    def split_by_period(trades):
+    def split_by_period(trades, equity_daily):
         if len(trades) < 4:
             return "표본 부족으로 구간 분할 생략"
         mid = len(trades) // 2
@@ -489,21 +503,52 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
             if not rets:
                 return "거래없음"
             wr = round((len([r for r in rets if r > 0]) / len(rets)) * 100, 1)
-            tot = 1.0
+            cum = 1.0
             for r in rets:
-                tot *= (1 + r)
-            tot_pct = round((tot - 1) * 100, 2)
-            return f"{len(rets)}건, 승률{wr}%, 수익{tot_pct:+.2f}%"
+                cum *= (1 + r)
+            tot_pct = round((cum - 1) * 100, 2)
+
+            # [개선] 전체기간 MDD 하나만으론 그 낙폭이 전반부/후반부 중 어느 국면에서 발생했는지
+            # 알 수 없어("MDD가 노이즈인지 구조적 리스크인지" 확인 불가) 절반 구간별로도 계산.
+            # 전체기간 MDD와 측정 해상도를 맞추기 위해 이 구간에 해당하는 equity_daily(일별)를
+            # 슬라이스해서 계산하되, "구간 시작 시점(1.0)부터 새로 계산"하는 기존 의미를 유지하려고
+            # 구간 시작일 equity 값을 기준(1.0)으로 재정규화한다 - 앞 구간의 절대적인 equity 레벨이
+            # 이 구간의 국소 낙폭 측정에 영향을 주지 않도록 하기 위함 (앞 구간 낙폭 이월 방지).
+            half_start, half_end = sub[0][0], sub[-1][1]
+            eq_slice = [(d, e) for d, e in equity_daily if half_start <= d <= half_end]
+            if eq_slice:
+                base_e = eq_slice[0][1]
+                peak_n, mdd = 1.0, 0.0
+                for _, e in eq_slice:
+                    norm_e = (e / base_e) if base_e > 0 else 1.0
+                    peak_n = max(peak_n, norm_e)
+                    mdd = max(mdd, (peak_n - norm_e) / peak_n) if peak_n > 0 else mdd
+            else:
+                mdd = 0.0
+            return f"{len(rets)}건, 승률{wr}%, 수익{tot_pct:+.2f}%, 구간내MDD{round(mdd * 100, 2)}%"
 
         return (f"전반부({first_half[0][0].date()}~{first_half[-1][1].date()}): {_period_stat(first_half)} | "
                 f"후반부({second_half[0][0].date()}~{second_half[-1][1].date()}): {_period_stat(second_half)}")
 
+    # [신규] 벤치마크(Buy&Hold) 자체의 MDD. 일별 종가로 낙폭을 추적하며,
+    # 전략 쪽 MDD를 equity_daily(일별) 기준으로 바꾼 것과 동일한 해상도를 사용해야
+    # Calmar 비율(수익률÷MDD) 비교가 "동일 기준" 비교가 된다 (2026-09, 아이디어 A).
+    def calc_benchmark_mdd(close_series):
+        base = close_series.iloc[0]
+        peak, mdd = 1.0, 0.0
+        for p in close_series:
+            norm = (p / base) if base > 0 else 1.0
+            peak = max(peak, norm)
+            mdd = max(mdd, (peak - norm) / peak) if peak > 0 else mdd
+        return round(mdd * 100, 2)
+
     return {
         "benchmark_buy_and_hold": round(bh_return, 2),
+        "benchmark_mdd": calc_benchmark_mdd(b_df['Close']),
         "strategy_1_momentum_squeeze": calc_stats_v2(trades1, eq1),
-        "strategy_1_period_split": split_by_period(trades1),
+        "strategy_1_period_split": split_by_period(trades1, eq1),
         "strategy_2_vwap_mean_reversion": calc_stats_v2(trades2, eq2),
-        "strategy_2_period_split": split_by_period(trades2),
+        "strategy_2_period_split": split_by_period(trades2, eq2),
     }
 
 # =============================================================================
@@ -991,7 +1036,11 @@ def parse_full_trading_scenario(text):
         elif ("분할 매수 밴드" in line_clean or "분할매수 밴드" in line_clean) and buy_band == "분석 리포트 참조" and ":" in line_clean: buy_band = ":".join(line_clean.split(":")[1:]).strip()
         elif ("손절" in line_clean or "Stop-loss" in line_clean) and stop_loss == "분석 리포트 참조" and ":" in line_clean: stop_loss = ":".join(line_clean.split(":")[1:]).strip()
         elif ("불타기 조건" in line_clean or "불타기" in line_clean) and not pyramiding and ":" in line_clean: pyramiding = ":".join(line_clean.split(":")[1:]).strip()
-        elif ("물타기" in line_clean or "비중 확대" in line_clean) and not averaging_down and ":" in line_clean: averaging_down = ":".join(line_clean.split(":")[1:]).strip()
+        # [버그수정] "비중 확대"만으로도 매칭되던 조건 제거 - 이 표현은 매크로/자산배분 코멘트 등
+        # 다른 문장에도 흔히 등장해서, 실제 "물타기(비중 확대) 조건:" 줄에 도달하기 전에 엉뚱한
+        # 줄을 먼저 캡처해버리는 오탐이 발생했음(not averaging_down 가드로 한번 잡히면 고정됨).
+        # 레이블은 항상 "물타기"를 포함하므로 이 단어 하나로 매칭해도 충분함.
+        elif "물타기" in line_clean and not averaging_down and ":" in line_clean: averaging_down = ":".join(line_clean.split(":")[1:]).strip()
 
     match_opinion_sec = re.search(r"\[최종\s*투자의견\](.*?)(?=\Z|\[|\n\n#)", text, re.DOTALL)
     opinion_block = match_opinion_sec.group(1) if match_opinion_sec else text
@@ -1219,6 +1268,55 @@ def build_backtest_consistency_note(backtest_results, bb_squeeze_status, bt_year
     return "관련 백테스트 데이터와 현재 기술적 신호 간 특이 모순 없음."
 
 # [패치 4] 백테스트 성과 평가 (기간 파싱 추가)
+# [개선/2026-09, 아이디어 A] 원시 수익률(total_ret)만으로 벤치마크와 비교하면 "수익은 이겼지만
+# 훨씬 큰 낙폭(MDD)을 감수한" 경우(예: TSLA VWAP 평균회귀 전략)를 "초과수익 확인"으로 잘못
+# 판정하게 됨. Calmar 비율(수익률÷MDD, 리스크 조정 성과)을 함께 계산해 상대 비교하되, 절대
+# 기준값(예: "Calmar 3 이상 우수")은 쓰지 않는다 - 이 백테스트는 연환산이 아니라서 업계 통상
+# 절대 기준을 적용할 근거가 없기 때문. MDD가 0이거나 데이터가 없으면 Calmar 비교를 생략하고
+# 기존처럼 원시 수익률만으로 판단한다(0 나눗셈 방지 및 무낙폭 구간이라는 극단적 예외 처리).
+def classify_vs_benchmark(strat_ret, strat_mdd, bench_ret, bench_mdd):
+    if not isinstance(strat_ret, (int, float)) or not isinstance(bench_ret, (int, float)) or bench_ret <= 0:
+        return "no_data", None, None
+    if strat_ret < bench_ret:
+        return "underperform", None, None
+    if isinstance(strat_mdd, (int, float)) and isinstance(bench_mdd, (int, float)) and strat_mdd > 0 and bench_mdd > 0:
+        strat_calmar = round(strat_ret / strat_mdd, 2)
+        bench_calmar = round(bench_ret / bench_mdd, 2)
+        if strat_calmar >= bench_calmar:
+            return "outperform_both", strat_calmar, bench_calmar
+        return "return_only", strat_calmar, bench_calmar
+    return "outperform_both", None, None
+
+# [개선] 백테스트 승자 전략이 벤치마크(단순 매수 후 보유) 대비 열위이거나, 원시 수익률은
+# 앞서지만 리스크 조정 성과(Calmar)로는 열위일 경우, Section 6 매매 시나리오 서술에 함께
+# 반영할 주의사항 텍스트. Section 6에서 "그대로 복사 출력"하는 데이터이므로 지시문("~할 것")이
+# 아닌 서술형 문장으로만 구성한다 (LLM이 지시문과 혼동하지 않도록).
+def build_trading_style_caution(best_name, category, best_total_ret, benchmark, strat_calmar, bench_calmar, bt_years):
+    if category == "no_data":
+        return "해당없음 (벤치마크 비교 데이터 부족)"
+    if category == "outperform_both":
+        return "해당없음 (선택된 전략이 벤치마크를 수익률과 리스크 조정 성과(Calmar) 모두에서 상회하여 별도 주의 불필요)"
+    if category == "return_only":
+        return (f"⚠️ '{best_name}' 전략이 최근 {bt_years}년간 단순 매수 후 보유(Buy&Hold, +{benchmark}%)보다 원시 수익률은 "
+                f"높지만, 리스크 조정 성과(Calmar 비율=수익률÷MDD)로 비교하면 전략 {strat_calmar} vs 벤치마크 {bench_calmar}로 "
+                f"오히려 열위입니다. 더 큰 낙폭을 감수하고 얻은 초과수익이라는 의미이므로, 공격적인 전액 매수나 잦은 재진입보다 "
+                f"보수적인 분할 접근과 리스크 관리가 권장됩니다.")
+    ratio = round(benchmark / best_total_ret, 1) if isinstance(best_total_ret, (int, float)) and best_total_ret > 0 else None
+    ratio_text = f" (벤치마크가 약 {ratio}배 우수)" if ratio else ""
+    return (f"⚠️ 두 트레이딩 전략 모두 최근 {bt_years}년간 단순 매수 후 보유(Buy&Hold, +{benchmark}%) 대비 열위{ratio_text}했습니다. "
+            f"'{best_name}' 스타일로 접근하더라도 공격적인 전액 매수나 잦은 재진입보다 보수적인 분할 접근과 리스크 관리가 권장되며, "
+            f"이 종목은 트레이딩보다 장기 보유가 유리했을 수 있습니다.")
+
+# [개선] Section 7 [최종 투자의견]에 붙일 짧은 부기 문구. 매수/관망/홀딩 "결정" 자체에는 전혀
+# 개입하지 않고, 이미 결정된 의견 뒤에 조건부로만 덧붙는 순수 표시용 텍스트 — 서술형으로만 구성.
+# 벤치마크를 수익률·Calmar 모두에서 상회하거나 비교 데이터가 없으면 빈 문자열("")을 반환한다.
+def build_verdict_style_qualifier(category):
+    if category in ("no_data", "outperform_both"):
+        return ""
+    if category == "return_only":
+        return "단, 백테스트상 수익률은 벤치마크를 상회했으나 리스크 조정 성과(Calmar 비율)는 벤치마크보다 낮아 더 큰 낙폭을 감수한 결과로 나타나 보수적 접근이 권장됨"
+    return "단, 백테스트상 액티브 트레이딩보다 매수 후 장기 보유가 유리했던 것으로 나타나 잦은 진입/청산보다 보유 전략이 권장됨"
+
 def evaluate_strategy_backtest(bt):
     # [버그수정] SPCX 등 신규 상장 종목은 60거래일 미만이라 run_strategy_backtest_v2()가 None을
     # 반환하는데, 이걸 그대로 bt.get(...)에 넘기면 AttributeError: 'NoneType' object has no
@@ -1227,12 +1325,15 @@ def evaluate_strategy_backtest(bt):
         return (
             "판정불가 (백테스트 데이터 부족)",
             0.0,
-            "⚠️ 신규 상장 등으로 백테스트에 필요한 최소 거래일(약 60거래일) 데이터가 확보되지 않아 전략 검증을 수행하지 못했습니다. 백테스트 근거를 제시하지 말고, 데이터 부족으로 신뢰도가 낮다는 점을 명시할 것.",
-            "N/A"
+            "⚠️ 신규 상장 등으로 백테스트에 필요한 최소 거래일(약 60거래일) 데이터가 확보되지 않아 전략 검증을 수행하지 못했으며, 이에 따라 백테스트 근거 없이 데이터 부족으로 신뢰도가 낮은 상태입니다.",
+            "N/A",
+            "해당없음 (백테스트 데이터 부족)",
+            ""
         )
     s1 = bt.get('strategy_1_momentum_squeeze', {}) or {}
     s2 = bt.get('strategy_2_vwap_mean_reversion', {}) or {}
     benchmark = bt.get('benchmark_buy_and_hold', 0) or 0
+    benchmark_mdd = bt.get('benchmark_mdd', 0) or 0
 
     # 백테스트 기간 동적 계산 (strategy_1_period_split 활용)
     bt_years = 5.0
@@ -1263,20 +1364,30 @@ def evaluate_strategy_backtest(bt):
     if q1 >= q2: best_name, best_data, best_score, other_score = "모멘텀 스퀴즈(추세추종형 돌파매매)", s1, q1, q2
     else: best_name, best_data, best_score, other_score = "VWAP 평균회귀(눌림목/되돌림 매매)", s2, q2, q1
 
-    # [개선] 벤치마크(단순 매수 후 보유) 대비 성과 비교 - 절대수익만으로 "통계적 우수성"을 주장하지 않도록 명시
+    # [개선/2026-09, 아이디어 A] 벤치마크(단순 매수 후 보유) 대비 성과 비교 - 원시 수익률뿐 아니라
+    # Calmar 비율(수익률÷MDD)까지 함께 판정해 "수익은 이겼지만 리스크는 훨씬 나쁜" 경우를 구분한다.
     best_total_ret = _num(best_data.get('total_ret')) if isinstance(best_data.get('total_ret'), (int, float)) else None
-    if best_total_ret is not None and benchmark > 0:
-        if best_total_ret >= benchmark:
-            benchmark_note = f"동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)을 상회하여 액티브 전략으로서의 초과수익(알파)이 확인됨."
-        else:
-            underperform_ratio = round(benchmark / best_total_ret, 1) if best_total_ret > 0 else None
-            ratio_text = f" (벤치마크가 전략 대비 약 {underperform_ratio}배)" if underperform_ratio else ""
-            benchmark_note = f"⚠️ 동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)에 미달함{ratio_text} — 절대수익 지표(PF·샤프지수 등)가 양호하더라도 벤치마크 대비 초과수익(알파)은 없으므로, 이 종목은 트레이딩보다 장기 보유가 유리했을 수 있음을 반드시 함께 언급할 것."
-    else:
-        benchmark_note = "벤치마크(단순 매수 후 보유) 데이터가 없어 비교 불가."
+    best_mdd = best_data.get('mdd')
+    category, strat_calmar, bench_calmar = classify_vs_benchmark(best_total_ret, best_mdd, benchmark, benchmark_mdd)
 
-    verdict_text = f"최근 {bt_years}년 백테스트 결과, '{best_name}' 전략이 통계적으로 더 우수함 (승률 {best_data.get('win_rate')}%, 손익비(PF) {best_data.get('profit_factor')}, 샤프지수 {best_data.get('sharpe_ratio_annualized')}, MDD {best_data.get('mdd')}%, 검증점수 {best_score}/10 vs 대안전략 {other_score}/10). {benchmark_note} 따라서 정밀 매매 시나리오의 진입/청산 로직은 '{best_name}' 스타일을 우선 근거로 서술할 것."
-    return best_name, best_score, verdict_text, bt_years
+    if category == "no_data":
+        benchmark_note = "벤치마크(단순 매수 후 보유) 데이터가 없어 비교 불가."
+    elif category == "underperform":
+        underperform_ratio = round(benchmark / best_total_ret, 1) if isinstance(best_total_ret, (int, float)) and best_total_ret > 0 else None
+        ratio_text = f" (벤치마크가 전략 대비 약 {underperform_ratio}배)" if underperform_ratio else ""
+        benchmark_note = f"⚠️ 동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)에 미달함{ratio_text} — 절대수익 지표(PF·샤프지수 등)가 양호하더라도 벤치마크 대비 초과수익(알파)은 없으므로, 이 종목은 트레이딩보다 장기 보유가 유리했을 수 있습니다."
+    elif category == "return_only":
+        benchmark_note = (f"동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)을 원시 수익률로는 상회하지만, "
+                           f"리스크 조정 성과(Calmar 비율=수익률÷MDD)로 비교하면 전략 {strat_calmar} vs 벤치마크 {bench_calmar}로 "
+                           f"오히려 열위입니다 — 더 큰 낙폭(MDD)을 감수하고 얻은 초과수익이라는 의미이며, 원시 수익률 비교만으로 "
+                           f"초과수익(알파) 확인이라 단정하기 어렵습니다.")
+    else:  # outperform_both
+        benchmark_note = f"동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)을 상회하여 액티브 전략으로서의 초과수익(알파)이 확인됨."
+
+    verdict_text = f"최근 {bt_years}년 백테스트 결과, '{best_name}' 전략이 통계적으로 더 우수한 것으로 판정됩니다 (승률 {best_data.get('win_rate')}%, 손익비(PF) {best_data.get('profit_factor')}, 샤프지수 {best_data.get('sharpe_ratio_annualized')}, MDD {best_data.get('mdd')}%, 검증점수 {best_score}/10 vs 대안전략 {other_score}/10). {benchmark_note}"
+    trading_caution_text = build_trading_style_caution(best_name, category, best_total_ret, benchmark, strat_calmar, bench_calmar, bt_years)
+    verdict_qualifier_text = build_verdict_style_qualifier(category)
+    return best_name, best_score, verdict_text, bt_years, trading_caution_text, verdict_qualifier_text
 
 # [패치 7] 물타기(Averaging Down) 2단계 게이트 (1단계 적격성 심사 하드게이트 -> 2단계 실효성/손익비 평가)
 # 1단계는 "하나라도 걸리면 즉시 차단"하는 하드 게이트로, 통과한 종목에 한해서만 2단계(절대 금액 기준 손익비)를 계산한다.
@@ -1424,7 +1535,7 @@ def format_averaging_down_text(avg_down_check, is_holding):
         stage1 = avg_down_check.get("1단계_결과", {}) or {}
         block_reasons = stage1.get("차단_사유", [])
         reasons_text = " / ".join(block_reasons) if block_reasons else "데이터 근거 부족"
-        return f"{final_verdict} | 차단 사유: {reasons_text} | 물타기(추가매수로 평단 낮추기) 의견 절대 제시 금지. 손절선 이탈 시에는 물타기 대신 전량 손절을 우선할 것."
+        return f"{final_verdict} | 차단 사유: {reasons_text} | 물타기(추가매수로 평단 낮추기) 의견 제시는 부적절한 상황입니다. 손절선 이탈 시에는 물타기보다 전량 손절이 우선되는 상황입니다."
 
     stage2 = avg_down_check.get("2단계_결과", {}) or {}
     if not isinstance(stage2, dict):
@@ -1435,7 +1546,7 @@ def format_averaging_down_text(avg_down_check, is_holding):
     return (
         f"{final_verdict} | 1단계 적격성 심사 통과. 현재가가 분할 매수 밴드 안일 경우에 한해 "
         f"'평단가를 낮추기 위한 소액 분할 재매수' 의견을 아래 실효성 근거(퍼센트 대신 반드시 달러 금액 명시)와 함께 제시 가능: "
-        f"{detail_text}. 단, 손절선 이탈 시에는 물타기 대신 전량 손절을 우선할 것."
+        f"{detail_text}. 단, 손절선 이탈 시에는 물타기보다 전량 손절이 우선되는 상황입니다."
     )
 
 # 스코어카드 연산 (기존 함수 유지)
@@ -1630,7 +1741,7 @@ if analyze_btn:
         )
 
         # 패치 4 적용: 백테스트 비교 및 검증 점수 (동적 기간 반환 포함)
-        best_name, backtest_score, backtest_verdict, bt_years = evaluate_strategy_backtest(backtest_results)
+        best_name, backtest_score, backtest_verdict, bt_years, trading_caution_text, verdict_qualifier_text = evaluate_strategy_backtest(backtest_results)
         
         # 패치 7 적용: 물타기 2단계 게이트 (1단계 적격성 하드게이트 -> 2단계 실효성/손익비 평가, 보유수량의 약 25% 소액 분할 할당)
         simulated_add_shares = round(user_shares * 0.25, 1) if user_shares > 0 else 1.0
@@ -1751,6 +1862,12 @@ if analyze_btn:
 22. 파이썬 알고리즘 사전 연산 신규 진입 등급 (예상 손익비 기반, 절대 임의 수정 금지):
 {entry_grade_json}
 
+23. 파이썬 알고리즘 사전 연산 매매 접근방식 주의사항 (벤치마크 기반, 절대 임의 수정 금지):
+{trading_caution_json}
+
+24. 파이썬 알고리즘 사전 연산 최종 투자의견 매매 스타일 부기 문구 (빈 문자열이면 부기 없음, 절대 임의 수정 금지):
+{verdict_qualifier_json}
+
 ---
 
 [지시사항 - 분석 정합성, 11개 섹터 전수 분석 및 POC 매물벽 검증 규칙]
@@ -1786,6 +1903,8 @@ if analyze_btn:
 
 7. [최종 투자의견 규칙 (엄격 준수)]
 - 관망이 유리하면 최종 투자의견을 절대 '매수'로 적지 말고 '관망' 또는 '홀딩'으로 명시.
+- 위 매수/관망/홀딩 판정 로직 자체는 아래 [매매 스타일 부기] 규칙과 무관하게 독립적으로 결정할 것 (24번 데이터는 판정 근거로 사용 금지, 판정 이후에만 참고).
+- **[매매 스타일 부기]**: 24번 [사전 연산 최종 투자의견 매매 스타일 부기 문구]가 빈 문자열이 아니면, 위에서 결정한 매수/관망/홀딩 뒤에 괄호로 묶어 그대로 이어붙여 출력할 것(문구 재작성 금지). 24번이 빈 문자열이면 매수/관망/홀딩만 단독으로 출력하고 괄호를 추가하지 말 것.
 
 ---
 
@@ -1815,23 +1934,27 @@ if analyze_btn:
 * **예상 손익비 (Risk/Reward)**: [16번 결과값 그대로 복사]
 
 [6. 정밀 매매 시나리오]
+* **매매 접근 방식 주의사항**: [23번 사전 연산 결과를 그대로 복사 출력할 것 (임의로 재작성하거나 다른 문구로 대체하지 말 것)]
 * **분할 매수 밴드**: [내용 (오름차순)]
 * **1차 목표가**: [17번 파이썬 알고리즘 사전 연산 목표가의 1차 목표가 값을 그대로 복사 출력]
 * **2차 목표가**: [17번 파이썬 알고리즘 사전 연산 목표가의 2차 목표가 값을 그대로 복사 출력]
 * **매도가 밴드**: [내용 (오름차순)]
 * **손절(Stop-loss) 기준선**: [20번 ATR 손절선 고정 라벨 텍스트를 그대로 인용할 것, 배수와 금액을 임의로 재조합하지 말 것]
 * **불타기 조건**: [스퀴즈 상방 돌파 등 (19번 전략 스타일에 맞춰 서술)]
-* **물타기(비중 확대) 조건**: [21번 사전 연산 물타기 판정 결과를 그대로 인용할 것 — 보유자에 한해 서술, 미보유자는 '해당없음(미보유)'으로 표기]
+* **물타기(비중 확대) 조건**: [21번 사전 연산 물타기 판정 결과를 그대로 복사 출력할 것 (임의로 재작성하거나 다른 문구로 대체하지 말 것)]
 
 [7. 최종 투자의견]
-* **최종 투자의견**: [선택]
+* **최종 투자의견**: [매수/관망/홀딩 중 택1 + 24번 부기 문구가 있으면 괄호로 이어붙여 출력]
 {strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "avg_down_json", "entry_grade_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "avg_down_json", "entry_grade_json", "trading_caution_json", "verdict_qualifier_json"],
                 template=template
             )
-            llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key)
+            # [개선] SDK 자체 재시도/타임아웃을 명시적으로 짧게 제한해서, 아래 앱 자체 재시도 루프(0/5/10초 간격)가
+            # 재시도 정책의 주도권을 갖도록 함. 기존엔 SDK 기본 정책(수 회, 최대 16초씩 늘어나는 지수 백오프)에 맡겨져
+            # chain.invoke() 한 번이 2분 넘게 걸리는 경우가 관측됨.
+            llm = ChatGoogleGenerativeAI(model=selected_model_id, google_api_key=api_key, max_retries=1, timeout=30)
             chain = prompt | llm
             
             payload = {
@@ -1854,16 +1977,25 @@ if analyze_btn:
                 "score_json": precalc_scorecard, "rr_json": rr_text,
                 "targets_json": targets_text, "consistency_note": consistency_note,
                 "backtest_verdict": backtest_verdict, "atr_labels_json": atr_labels_text,
-                "avg_down_json": avg_down_text, "entry_grade_json": entry_grade_text
+                "avg_down_json": avg_down_text, "entry_grade_json": entry_grade_text,
+                "trading_caution_json": trading_caution_text, "verdict_qualifier_json": verdict_qualifier_text
             }
             
-            for delay in [0, 5, 10]:
+            # [개선] LLM 호출 소요시간 로깅 - timeout(30초) 값이 실제 정상 케이스 응답시간에 비해 적절한지
+            # 나중에 실측 로그로 검증할 수 있도록 시도별 소요시간을 남김.
+            for attempt_no, delay in enumerate([0, 5, 10], start=1):
                 if delay > 0: time.sleep(delay)
+                call_start = time.time()
                 try:
                     res_llm = chain.invoke(payload)
+                    elapsed = time.time() - call_start
                     response_content = extract_clean_text(res_llm.content)
+                    logger.info(f"[LLM 호출] {ticker_input} 시도 {attempt_no}/3 성공 - 소요시간 {elapsed:.1f}초")
                     break
-                except Exception: continue
+                except Exception as e:
+                    elapsed = time.time() - call_start
+                    logger.info(f"[LLM 호출] {ticker_input} 시도 {attempt_no}/3 실패 - 소요시간 {elapsed:.1f}초, 에러: {e}")
+                    continue
             if not response_content: response_content = "⚠️ Gemini API 일시적 지연이 발생했습니다. [분석용 JSON 데이터 다운로드]를 통해 확인하세요."
 
         if response_content and not response_content.startswith("⚠️"):
