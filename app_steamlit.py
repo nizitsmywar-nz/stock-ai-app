@@ -155,26 +155,33 @@ if "last_analysis_result" not in st.session_state:
 # [BLOCK 04] 기술적 지표 & 퀀트 매물대 연산 엔진
 # =============================================================================
 def get_stock_info_with_retry(stock, retries=2):
+    ticker_label = getattr(stock, 'ticker', '?')
     for attempt in range(retries):
         try:
             info = stock.info
             if isinstance(info, dict) and len(info) > 10 and any(k in info for k in ['marketCap', 'trailingPE', 'forwardPE', 'trailingEps', 'bookValue', 'currentPrice']):
                 return info, "stock.info"
         except Exception as e:
-            pass
+            # [stock.info 진단용, 2026-09] 사용자가 "10회 이상 재시도해도 전부 N/A"라고 보고한 증상의
+            # 원인을 확인하기 위한 로깅. yfinance 0.2.61+ 부터 커스텀 session(requests.Session) 전달 시
+            # "Yahoo API requires curl_cffi session..." 예외를 던지도록 바뀌었는데(GitHub Issue #2496),
+            # 이 except가 그 예외를 조용히 삼키고 있었다면 재시도를 아무리 늘려도 매번 동일하게 즉시
+            # 실패해 지금 증상과 정확히 일치한다. 아래에서 session=GLOBAL_SESSION 제거로 이 원인 자체를
+            # 선제 조치했으나, 혹시 남은 실패가 있다면 이 로그로 원인을 계속 구분할 수 있게 남겨둔다.
+            logger.warning(f"[stock.info 조회 실패] {ticker_label} (시도 {attempt+1}/{retries}): {type(e).__name__}: {e}")
         if attempt < retries - 1:
             time.sleep(0.5 * (attempt + 1))
-            
+
     try:
         fallback_info = stock.info or {}
         if fallback_info and len(fallback_info) > 5:
             return fallback_info, "stock.info"
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"[stock.info 최종 폴백 조회 실패] {ticker_label}: {type(e).__name__}: {e}")
     return {}, "stock.fast_info"
 
 def fetch_stock_technical_data(ticker: str):
-    stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
+    stock = yf.Ticker(ticker)
     df = stock.history(period="1y")
     
     if df.empty:
@@ -344,7 +351,7 @@ def fetch_stock_technical_data(ticker: str):
 # [BLOCK 05] 퀀트 전략 백테스팅 엔진 (V2 - 5년치 데이터 및 OOS 분할 검증 적용)
 # =============================================================================
 def fetch_backtest_data(ticker: str, period: str = "5y"):
-    stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
+    stock = yf.Ticker(ticker)
     df = stock.history(period=period)
     if df.empty:
         df = stock.history(period="1y")  # 5년치 조회 실패 시 폴백
@@ -616,7 +623,7 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
 def fetch_nearest_options_data(ticker: str, retries: int = 2):
     for attempt in range(retries):
         try:
-            stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
+            stock = yf.Ticker(ticker)
             expirations = getattr(stock, 'options', None)
             if not expirations:
                 return None
@@ -678,7 +685,7 @@ def fetch_macro_indicators():
     asset_map = {"^VIX": ("vix", "CBOE Volatility Index"), "DX-Y.NYB": ("dollar_index", "ICE US Dollar Index"), "CL=F": ("wti_oil", "NYMEX WTI Crude Oil"), "GC=F": ("gold", "COMEX Gold Futures"), "BTC-USD": ("bitcoin", "Binance/Coinbase Crypto Market")}
     try:
         tickers = list(asset_map.keys())
-        df = yf.download(tickers, period="5d", progress=False, session=GLOBAL_SESSION)['Close']
+        df = yf.download(tickers, period="5d", progress=False)['Close']
         for ticker, (name, src_name) in asset_map.items():
             try:
                 hist = df[ticker].dropna()
@@ -817,7 +824,7 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
 def _get_psr_multiple(g): return 8.0 if g and g >= 30 else (5.0 if g and g >= 15 else (3.0 if g and g >= 5 else (1.5 if g else 3.0)))
 
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
-    stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
+    stock = yf.Ticker(ticker)
     info, info_source = get_stock_info_with_retry(stock, retries=2)
 
     # (item 30-2 fade out, 2026-09-03) stock.fast_info 백업 폴백 제거.
@@ -987,7 +994,7 @@ def fetch_sector_performance():
     sector_etfs = {"XLK": "IT/기술 (Technology)", "XLC": "커뮤니케이션 (Communication Services)", "XLY": "임의소비재 (Consumer Discretionary)", "XLP": "필수소비재 (Consumer Staples)", "XLF": "금융 (Financials)", "XLV": "헬스케어 (Health Care)", "XLI": "산업재 (Industrials)", "XLE": "에너지 (Energy)", "XLB": "소재 (Materials)", "XLU": "유틸리티 (Utilities)", "XLRE": "부동산 (Real Estate)"}
     summary = {}
     try:
-        df = yf.download(list(sector_etfs.keys()), period="1mo", progress=False, session=GLOBAL_SESSION)['Close']
+        df = yf.download(list(sector_etfs.keys()), period="1mo", progress=False)['Close']
         for etf, name in sector_etfs.items():
             try:
                 hist = df[etf].dropna()
@@ -1001,7 +1008,7 @@ def fetch_sector_performance():
 @st.cache_data(ttl=300)
 def fetch_news(ticker: str, limit: int = 5):
     try:
-        stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
+        stock = yf.Ticker(ticker)
         raw_news = getattr(stock, 'news', None)
         if not raw_news: return []
         articles = []
@@ -1026,7 +1033,7 @@ def fetch_macro_news(limit: int = 4):
     macro_articles = []
     for sym in ["SPY", "TLT"]:
         try:
-            stock = yf.Ticker(sym, session=GLOBAL_SESSION)
+            stock = yf.Ticker(sym)
             raw = getattr(stock, 'news', None)
             if raw:
                 for n in raw[:2]:
@@ -1132,7 +1139,7 @@ def classify_analyst_tier(firm_name: str):
 
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
-        stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
+        stock = yf.Ticker(ticker)
         upgrades = stock.upgrades_downgrades
         if upgrades is None or upgrades.empty: return []
         cutoff_date = datetime.now() - timedelta(days=months * 30)
