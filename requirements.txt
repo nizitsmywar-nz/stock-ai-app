@@ -8,3 +8,4 @@ pandas-datareader
 ta
 python-dotenv
 pydantic
+yahooquery
