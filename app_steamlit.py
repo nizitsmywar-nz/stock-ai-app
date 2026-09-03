@@ -180,6 +180,49 @@ def get_stock_info_with_retry(stock, retries=2):
         logger.warning(f"[stock.info 최종 폴백 조회 실패] {ticker_label}: {type(e).__name__}: {e}")
     return {}, "stock.fast_info"
 
+
+def _diagnostic_test_yahooquery(ticker: str):
+    """
+    [임시 테스트 코드, 2026-09] stock.info의 "Invalid Crumb"/"User is unable to access
+    this feature" 실패가 실제 운영 환경(Streamlit Cloud)에서도 재현되는지, 같은 시점에
+    yahooquery는 성공하는지 비교하기 위한 순수 진단용 함수. 반환값을 실제 fund_data에
+    반영하지 않고 로그만 남긴다 - 앱의 실제 동작(화면 표시/스코어링)에는 전혀 영향 없음.
+    채택 여부를 논의해 결정이 나면 이 함수와 호출부는 정리(제거 또는 정식 통합)할 예정.
+
+    requirements.txt에 yahooquery가 없으면 ImportError로 조용히 스킵되어 앱이 크래시나지
+    않는다 - 실제로 테스트하려면 requirements.txt에 `yahooquery` 한 줄만 추가하면 됨.
+    """
+    try:
+        from yahooquery import Ticker as YQTicker
+    except ImportError:
+        logger.warning("[yahooquery 진단] yahooquery 미설치 - requirements.txt에 'yahooquery' 추가 필요")
+        return
+
+    try:
+        t0 = time.time()
+        yq = YQTicker(ticker)
+        sd, ks, fd, ap = yq.summary_detail, yq.key_stats, yq.financial_data, yq.asset_profile
+        elapsed = time.time() - t0
+
+        def _unwrap(name, module_result):
+            if isinstance(module_result, dict) and ticker in module_result and isinstance(module_result[ticker], dict):
+                return module_result[ticker]
+            logger.warning(f"[yahooquery 진단] {ticker} {name} 모듈 실패/비정상: {module_result!r}")
+            return {}
+
+        sd_d = _unwrap("summary_detail", sd)
+        ks_d = _unwrap("key_stats", ks)
+        fd_d = _unwrap("financial_data", fd)
+        ap_d = _unwrap("asset_profile", ap)
+        total_keys = len(sd_d) + len(ks_d) + len(fd_d) + len(ap_d)
+        logger.info(
+            f"[yahooquery 진단] {ticker} (소요 {elapsed:.1f}s): 필드 합계 {total_keys}개 - "
+            f"summary_detail={sorted(sd_d.keys())} | key_stats={sorted(ks_d.keys())} | "
+            f"financial_data={sorted(fd_d.keys())} | asset_profile={sorted(ap_d.keys())}"
+        )
+    except Exception as e:
+        logger.warning(f"[yahooquery 진단] {ticker} 예외 발생: {type(e).__name__}: {e}")
+
 def fetch_stock_technical_data(ticker: str):
     stock = yf.Ticker(ticker)
     df = stock.history(period="1y")
@@ -826,6 +869,7 @@ def _get_psr_multiple(g): return 8.0 if g and g >= 30 else (5.0 if g and g >= 15
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
     stock = yf.Ticker(ticker)
     info, info_source = get_stock_info_with_retry(stock, retries=2)
+    _diagnostic_test_yahooquery(ticker)  # [임시 테스트, 2026-09] yahooquery 비교 진단 로그 - info/fund_data에는 영향 없음
 
     # (item 30-2 fade out, 2026-09-03) stock.fast_info 백업 폴백 제거.
     # 기존엔 marketCap 결측 시(ETF/ADR/신규상장 등 stock.info 자체는 정상 응답한 경우 포함)
