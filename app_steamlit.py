@@ -181,48 +181,12 @@ def get_stock_info_with_retry(stock, retries=2):
     return {}, "stock.fast_info"
 
 
-def _diagnostic_test_yahooquery(ticker: str):
-    """
-    [임시 테스트 코드, 2026-09] stock.info의 "Invalid Crumb"/"User is unable to access
-    this feature" 실패가 실제 운영 환경(Streamlit Cloud)에서도 재현되는지, 같은 시점에
-    yahooquery는 성공하는지 비교하기 위한 순수 진단용 함수. 반환값을 실제 fund_data에
-    반영하지 않고 로그만 남긴다 - 앱의 실제 동작(화면 표시/스코어링)에는 전혀 영향 없음.
-    채택 여부를 논의해 결정이 나면 이 함수와 호출부는 정리(제거 또는 정식 통합)할 예정.
+# [yahooquery 진단 코드 제거, 2026-09] yahooquery도 동일 티커/동일 시점에 yfinance와
+# 완전히 같은 "Invalid Crumb" 에러로 실패하는 것이 실제 운영 로그로 확인되어(두 라이브러리
+# 모두 Yahoo의 같은 crumb 기반 인증 레이어에 의존), 라이브러리 전환은 해결책이 아님이
+# 판명됨에 따라 진단용 함수와 호출부를 정리함.
 
-    requirements.txt에 yahooquery가 없으면 ImportError로 조용히 스킵되어 앱이 크래시나지
-    않는다 - 실제로 테스트하려면 requirements.txt에 `yahooquery` 한 줄만 추가하면 됨.
-    """
-    try:
-        from yahooquery import Ticker as YQTicker
-    except ImportError:
-        logger.warning("[yahooquery 진단] yahooquery 미설치 - requirements.txt에 'yahooquery' 추가 필요")
-        return
-
-    try:
-        t0 = time.time()
-        yq = YQTicker(ticker)
-        sd, ks, fd, ap = yq.summary_detail, yq.key_stats, yq.financial_data, yq.asset_profile
-        elapsed = time.time() - t0
-
-        def _unwrap(name, module_result):
-            if isinstance(module_result, dict) and ticker in module_result and isinstance(module_result[ticker], dict):
-                return module_result[ticker]
-            logger.warning(f"[yahooquery 진단] {ticker} {name} 모듈 실패/비정상: {module_result!r}")
-            return {}
-
-        sd_d = _unwrap("summary_detail", sd)
-        ks_d = _unwrap("key_stats", ks)
-        fd_d = _unwrap("financial_data", fd)
-        ap_d = _unwrap("asset_profile", ap)
-        total_keys = len(sd_d) + len(ks_d) + len(fd_d) + len(ap_d)
-        logger.info(
-            f"[yahooquery 진단] {ticker} (소요 {elapsed:.1f}s): 필드 합계 {total_keys}개 - "
-            f"summary_detail={sorted(sd_d.keys())} | key_stats={sorted(ks_d.keys())} | "
-            f"financial_data={sorted(fd_d.keys())} | asset_profile={sorted(ap_d.keys())}"
-        )
-    except Exception as e:
-        logger.warning(f"[yahooquery 진단] {ticker} 예외 발생: {type(e).__name__}: {e}")
-
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_stock_technical_data(ticker: str):
     stock = yf.Ticker(ticker)
     df = stock.history(period="1y")
@@ -393,6 +357,7 @@ def fetch_stock_technical_data(ticker: str):
 # =============================================================================
 # [BLOCK 05] 퀀트 전략 백테스팅 엔진 (V2 - 5년치 데이터 및 OOS 분할 검증 적용)
 # =============================================================================
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_backtest_data(ticker: str, period: str = "5y"):
     stock = yf.Ticker(ticker)
     df = stock.history(period=period)
@@ -663,6 +628,7 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
 # =============================================================================
 # [BLOCK 06] 시장 수급 & 외부 데이터 수집기
 # =============================================================================
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_nearest_options_data(ticker: str, retries: int = 2):
     for attempt in range(retries):
         try:
@@ -866,10 +832,10 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
 # 내부에만 있던 함수라 스코어카드 쪽에서 재사용할 수 없었음).
 def _get_psr_multiple(g): return 8.0 if g and g >= 30 else (5.0 if g and g >= 15 else (3.0 if g and g >= 5 else (1.5 if g else 3.0)))
 
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
     stock = yf.Ticker(ticker)
     info, info_source = get_stock_info_with_retry(stock, retries=2)
-    _diagnostic_test_yahooquery(ticker)  # [임시 테스트, 2026-09] yahooquery 비교 진단 로그 - info/fund_data에는 영향 없음
 
     # (item 30-2 fade out, 2026-09-03) stock.fast_info 백업 폴백 제거.
     # 기존엔 marketCap 결측 시(ETF/ADR/신규상장 등 stock.info 자체는 정상 응답한 경우 포함)
@@ -1181,6 +1147,7 @@ def classify_analyst_tier(firm_name: str):
     elif any(k in f_lower for k in TIER_2_FIRMS): return "✨ Tier 2 (주요 전문리서치)", 2
     else: return "🔎 Tier 3 (독립/부티크)", 3
 
+@st.cache_data(ttl=300, show_spinner=False)
 def fetch_recent_upgrades_downgrades(ticker: str, months: int = 2):
     try:
         stock = yf.Ticker(ticker)
@@ -2029,7 +1996,28 @@ if analyze_btn:
     with st.spinner(f"🔍 [{ticker_input}] 정밀 지표 및 5Y 백테스팅 실행 중..."):
         from concurrent.futures import ThreadPoolExecutor
 
-        with ThreadPoolExecutor(max_workers=6) as executor:
+        # [Yahoo crumb 워밍업 + 동시성 완화, 2026-09] 아래 병렬 실행 블록은 fetch_stock_technical_data/
+        # fetch_backtest_data/fetch_nearest_options_data/fetch_recent_upgrades_downgrades/fetch_news 등
+        # 최소 5곳에서 같은 티커에 대해 각자 yf.Ticker(...)를 만들어 동시에 Yahoo에 요청을 쏜다.
+        # 이 앱 프로세스에 아직 crumb가 캐싱되지 않은 "콜드 스타트" 시점(신규 티커 최초 조회 등)에는
+        # 여러 스레드가 거의 동시에 crumb 발급을 시도하게 되고, 이 순간적인 요청 폭주(burst)가
+        # 실제 운영 로그에서 확인된 "Crumb fetch rate-limited (HTTP 429), continuing without crumb"
+        # 로 이어졌을 가능성이 있다(429 발생 시 yfinance가 crumb 없이 강행 -> 이후 모든 요청이
+        # 결정론적으로 "Invalid Crumb" 401로 실패). 병렬 실행 전에 가벼운 요청을 한 번 먼저 보내
+        # crumb 협상을 단일 스레드로 끝내두면, 이후 병렬 호출들은 이미 캐싱된 crumb를 재사용하게
+        # 되어 이 폭주 빈도를 낮출 수 있다. 다만 이는 Yahoo 쪽 외부 rate-limit 자체를 없애는
+        # 근본 해결책이 아니라 발생 빈도를 낮추는 완화책(mitigation)이며, 100% 재현/검증은
+        # 사용자의 운영 환경(Streamlit Cloud)에서만 가능함을 명확히 해둔다.
+        # fast_info는 quoteSummary(=crumb 필요) 엔드포인트를 타지 않고 1y 시세/메타데이터
+        # 기반으로 동작해 crumb 협상을 유발하지 않으므로, 반드시 crumb가 필요한 .info로
+        # 워밍업해야 실제로 의미가 있다.
+        try:
+            _ = yf.Ticker(ticker_input).info
+        except Exception as e:
+            logger.warning(f"[crumb 워밍업 실패] {ticker_input}: {type(e).__name__}: {e}")
+
+        # max_workers를 6 -> 4로 낮춰 동시 순간에 Yahoo로 나가는 요청 수 자체도 함께 줄인다.
+        with ThreadPoolExecutor(max_workers=4) as executor:
             future_tech = executor.submit(fetch_stock_technical_data, ticker_input)
             future_backtest = executor.submit(fetch_backtest_data, ticker_input, "5y")
             future_options = executor.submit(fetch_nearest_options_data, ticker_input, 2)
@@ -2378,6 +2366,16 @@ if st.session_state.last_analysis_result:
     fred_status = "🔴 실패 (N/A)" if fred_val == "N/A" else "🟢 정상"
     gemini_content = res.get("response_content", "")
     gemini_status = "🔴 실패 (API 에러)" if gemini_content.startswith("⚠️") else "🟢 정상"
+
+    # [데이터 접근 실패 투명성 배너, 2026-09] Yahoo Finance의 "Invalid Crumb"/레이트리밋
+    # 이슈는 이 앱이 통제할 수 없는 외부 요인이므로, 실패가 발생했을 때 조용히 N/A로만
+    # 표시하지 않고 사용자에게 명시적으로 알린다. 가격/기술적 지표까지 아예 못 가져온
+    # 경우(curr_p==0 또는 tech_data 비어있음)가 가장 심각하므로 st.error로, 펀더멘털/
+    # 밸류에이션만 일부 실패한 경우(info_source가 stock.info가 아님)는 st.warning으로 구분.
+    if curr_p == 0 or not tech_data:
+        st.error("🚨 **가격/기술적 지표 데이터 조회 실패** — Yahoo Finance 접근 문제(레이트리밋 등 일시적인 외부 요인)로 이번 분석은 가격 데이터 자체를 가져오지 못했습니다. 이 리포트의 지표는 신뢰할 수 없으니 몇 분 후 다시 시도해 주세요.")
+    elif info_source != "stock.info":
+        st.warning("⚠️ **펀더멘털/밸류에이션 데이터 일부 조회 실패** — Yahoo Finance 접근 문제(Invalid Crumb/레이트리밋 등 외부 서비스 이슈)로 일부 펀더멘털 지표가 N/A로 표시되었을 수 있습니다. 가격/기술적 지표는 정상 반영되었습니다.")
 
     if info_source == "stock.info": st.markdown(f"📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` ｜ **FRED API:** `{fred_status}` ｜ **Gemini AI:** `{gemini_status}`")
     else: st.markdown(f"📡 **데이터 소스:** `🟡 Yahoo Finance 조회 실패` (일부 항목 N/A) ｜ **FRED API:** `{fred_status}` ｜ **Gemini AI:** `{gemini_status}`")
