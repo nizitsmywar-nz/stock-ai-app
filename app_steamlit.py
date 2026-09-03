@@ -188,9 +188,12 @@ def fetch_stock_technical_data(ticker: str):
     if df.empty:
         return {}, "N/A", {}, "N/A", "N/A", pd.DataFrame(), {}
     
+    # [이평선 기준 수정, 2026-09] 60일/120일선은 한국 주식시장 관습(분기/반기 단위)이며,
+    # 미국 주식시장의 표준 기준은 50일/200일선(골든크로스/데드크로스의 기준)이다.
+    # 이 앱은 미국 주식을 분석하므로 미국 시장 관습에 맞춰 50일/200일로 교체한다.
     df['SMA_20'] = df['Close'].rolling(window=20).mean()
-    df['SMA_60'] = df['Close'].rolling(window=60).mean()
-    df['SMA_120'] = df['Close'].rolling(window=120).mean()
+    df['SMA_50'] = df['Close'].rolling(window=50).mean()
+    df['SMA_200'] = df['Close'].rolling(window=200).mean()
     
     df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
     macd = ta.trend.MACD(df['Close'])
@@ -201,7 +204,11 @@ def fetch_stock_technical_data(ticker: str):
     try:
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
         has_valid_atr = df['ATR'].notna().any()
-    except Exception:
+    except Exception as e:
+        # [item 19 진단용] ATR N/A의 원인이 (1)상장 초기 데이터 부족(무해, 예외 미발생)인지
+        # (2)실제 계산 오류(이 except가 실제로 발동하는 경우)인지 구분하기 위한 로깅.
+        # 데이터 행수(len(df))를 함께 남겨, 행수가 충분한데도 여기가 찍히면 (2)번임을 확인할 수 있음.
+        logger.warning(f"[ATR 계산 실패] {ticker}: {type(e).__name__}: {e} - 데이터 행수: {len(df)}")
         df['ATR'] = np.nan
         has_valid_atr = False
 
@@ -314,8 +321,8 @@ def fetch_stock_technical_data(ticker: str):
         "atr_stop_1_5x": round(float(latest['Close']) - (1.5 * float(latest['ATR'])), 2) if pd.notnull(latest['ATR']) else "N/A",
         "atr_stop_2_0x": round(float(latest['Close']) - (2.0 * float(latest['ATR'])), 2) if pd.notnull(latest['ATR']) else "N/A",
         "sma_20": round(float(latest['SMA_20']), 2) if pd.notnull(latest['SMA_20']) else "N/A",
-        "sma_60": round(float(latest['SMA_60']), 2) if pd.notnull(latest['SMA_60']) else "N/A",
-        "sma_120": round(float(latest['SMA_120']), 2) if pd.notnull(latest['SMA_120']) else "N/A",
+        "sma_50": round(float(latest['SMA_50']), 2) if pd.notnull(latest['SMA_50']) else "N/A",
+        "sma_200": round(float(latest['SMA_200']), 2) if pd.notnull(latest['SMA_200']) else "N/A",
         "rsi_14": round(float(latest['RSI']), 2) if pd.notnull(latest['RSI']) else "N/A",
         "mfi_14": round(float(latest['MFI']), 2) if pd.notnull(latest['MFI']) else "N/A",
         "macd": round(float(latest['MACD']), 2) if pd.notnull(latest['MACD']) else "N/A",
@@ -354,7 +361,10 @@ def fetch_backtest_data(ticker: str, period: str = "5y"):
     df['RSI'] = ta.momentum.rsi(df['Close'], window=14)
     try:
         df['ATR'] = ta.volatility.average_true_range(df['High'], df['Low'], df['Close'], window=14)
-    except Exception:
+    except Exception as e:
+        # [item 19 진단용] fetch_stock_technical_data()와 동일한 이유로 로깅 - 이쪽은
+        # 백테스트 손절가(run_single_strategy 등, entry_p*0.93 폴백)에 영향을 주는 별도 지점.
+        logger.warning(f"[백테스트 ATR 계산 실패] {ticker}: {type(e).__name__}: {e} - 데이터 행수: {len(df)}")
         df['ATR'] = np.nan
     bb = ta.volatility.BollingerBands(df['Close'], window=20, window_dev=2)
     df['BB_Low'] = bb.bollinger_lband()
@@ -434,8 +444,10 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
         n = len(rets)
         if n == 0:
             return {"total_ret": 0.0, "win_rate": 0.0, "trades_count": 0,
-                     "profit_factor": "N/A(거래없음)", "mdd": 0.0,
-                     "sharpe_ratio_annualized": 0.0, "reliability": "⚠️ 표본 없음"}
+                     "profit_factor": 0.0, "profit_factor_note": "거래없음",
+                     "mdd": 0.0,
+                     "sharpe_ratio_annualized": 0.0, "sortino_ratio_annualized": 0.0,
+                     "reliability": "⚠️ 표본 없음"}
 
         cum = 1.0
         wins = [r for r in rets if r > 0]
@@ -459,21 +471,40 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
         win_rate = (len(wins) / n) * 100
         sum_win, sum_loss = sum(wins), abs(sum(losses))
 
+        # [개선/item26-b, 2026-09] profit_factor는 항상 숫자로 반환한다(스코어링 함수가
+        # 문자열 "N/A(...)"를 _num()으로 0.0 취급해, "손실거래 0건(사실상 완벽)"과
+        # "진짜로 나쁨(PF=0)"을 구분 못 하던 문제를 근본적으로 제거). 표본 부족 등 신뢰도
+        # 관련 주의는 새 profit_factor_note 필드로 분리하고, 샘플 크기 임계값은 새로
+        # 만들지 않고 기존 reliability 3단계(n<10/n<30/n>=30) 판단에 맡긴다.
+        pf_note = ""
         if sum_loss > 0:
             pf = round(sum_win / sum_loss, 2)
-        elif sum_win > 0 and n < 10:
-            pf = "N/A(표본부족·손실거래0건)"
         elif sum_win > 0:
             pf = 99.9
+            if n < 10:
+                pf_note = "표본부족·손실거래0건(참고용, 확정적 근거로 사용 금지)"
         else:
             pf = 0.0
 
+        # [신규/item24-2, 2026-09] 소르티노 비율 추가. Sharpe와 계산 구조는 같으나 분모를
+        # "전체 변동성"이 아니라 "하방 변동성(마이너스 일별 수익률만의 표준편차)"으로 써서,
+        # 상방으로 크게 튀는 변동성 때문에 Sharpe가 부당하게 깎이는 전략을 구분해내기 위함
+        # (퀸트 실무 리서치 근거 - item 31 참고). 하락일이 아예 없는 경우(완벽한 상승 구간)엔
+        # 0으로 나누기가 아니라 item 26-b의 profit_factor 99.9 캡 패턴과 동일하게, 평균 수익률이
+        # 양수면 99.9로 캡핑(진짜 완벽한 케이스와 "데이터 부족으로 0.0" 케이스를 혼동하지 않도록).
         if len(equity_daily) > 2:
             eq_series = pd.Series([e for _, e in equity_daily])
             daily_rets = eq_series.pct_change().dropna()
             sharpe_ann = round((daily_rets.mean() / daily_rets.std()) * (252 ** 0.5), 2) if daily_rets.std() > 0 else 0.0
+            downside_rets = daily_rets[daily_rets < 0]
+            downside_std = downside_rets.std() if len(downside_rets) >= 2 else 0.0
+            if not downside_std or pd.isna(downside_std) or downside_std <= 0:
+                sortino_ann = 99.9 if daily_rets.mean() > 0 else 0.0
+            else:
+                sortino_ann = round((daily_rets.mean() / downside_std) * (252 ** 0.5), 2)
         else:
             sharpe_ann = 0.0
+            sortino_ann = 0.0
 
         if n < 10:
             reliability = "⚠️ 표본 부족(참고용, 확정적 근거로 사용 금지)"
@@ -487,8 +518,10 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
             "win_rate": round(win_rate, 1),
             "trades_count": n,
             "profit_factor": pf,
+            "profit_factor_note": pf_note,
             "mdd": round(mdd * 100, 2),
             "sharpe_ratio_annualized": sharpe_ann,
+            "sortino_ratio_annualized": sortino_ann,
             "reliability": reliability
         }
 
@@ -542,9 +575,35 @@ def run_strategy_backtest_v2(df: pd.DataFrame, cost_pct: float = TRADE_COST_PCT)
             mdd = max(mdd, (peak - norm) / peak) if peak > 0 else mdd
         return round(mdd * 100, 2)
 
+    # [신규/item24, 2026-09] 벤치마크(Buy&Hold)의 샤프지수. classify_vs_benchmark()가
+    # 기존의 "원시 수익률 우선 게이트"(수익률에서 밀리면 Calmar를 아예 확인하지 않고
+    # underperform 확정) 대신, Sharpe·Calmar 2축을 독립적으로 비교하도록 바꾸면서
+    # 벤치마크 쪽에도 Sharpe가 필요해져 추가. 전략 쪽 sharpe_ann과 동일한 방식(일별
+    # 수익률의 평균/표준편차 * sqrt(252))으로 계산해 "동일 기준" 비교를 유지한다.
+    def calc_benchmark_sharpe(close_series):
+        daily_rets = close_series.pct_change().dropna()
+        if len(daily_rets) > 2 and daily_rets.std() > 0:
+            return round((daily_rets.mean() / daily_rets.std()) * (252 ** 0.5), 2)
+        return 0.0
+
+    # [신규/item31 후속, 2026-09] 벤치마크의 소르티노 비율. 전략 쪽 calc_stats_v2()에 추가한
+    # 것과 동일한 방식(하방 변동성만 분모로 사용, 하락일 자체가 없으면 99.9로 캡)으로 계산해
+    # classify_vs_benchmark()의 Sharpe·Calmar·Sortino 3축 비교에 사용한다.
+    def calc_benchmark_sortino(close_series):
+        daily_rets = close_series.pct_change().dropna()
+        if len(daily_rets) <= 2:
+            return 0.0
+        downside_rets = daily_rets[daily_rets < 0]
+        downside_std = downside_rets.std() if len(downside_rets) >= 2 else 0.0
+        if not downside_std or pd.isna(downside_std) or downside_std <= 0:
+            return 99.9 if daily_rets.mean() > 0 else 0.0
+        return round((daily_rets.mean() / downside_std) * (252 ** 0.5), 2)
+
     return {
         "benchmark_buy_and_hold": round(bh_return, 2),
         "benchmark_mdd": calc_benchmark_mdd(b_df['Close']),
+        "benchmark_sharpe": calc_benchmark_sharpe(b_df['Close']),
+        "benchmark_sortino": calc_benchmark_sortino(b_df['Close']),
         "strategy_1_momentum_squeeze": calc_stats_v2(trades1, eq1),
         "strategy_1_period_split": split_by_period(trades1, eq1),
         "strategy_2_vwap_mean_reversion": calc_stats_v2(trades2, eq2),
@@ -760,10 +819,13 @@ def _get_psr_multiple(g): return 8.0 if g and g >= 30 else (5.0 if g and g >= 15
 def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
     stock = yf.Ticker(ticker, session=GLOBAL_SESSION)
     info, info_source = get_stock_info_with_retry(stock, retries=2)
-    fast_info = getattr(stock, 'fast_info', {}) if hasattr(stock, 'fast_info') else {}
 
+    # (item 30-2 fade out, 2026-09-03) stock.fast_info 백업 폴백 제거.
+    # 기존엔 marketCap 결측 시(ETF/ADR/신규상장 등 stock.info 자체는 정상 응답한 경우 포함)
+    # 매 분석마다 stock.fast_info 프로퍼티를 무조건 조회해 시가총액만 보정하려 했으나,
+    # market_cap_fmt는 UI "시가총액" 메트릭 표시(단 한 곳)에만 쓰이고 스코어카드/프롬프트에는
+    # 전혀 영향을 주지 않아 실익 대비 불필요한 호출로 판단, 결측 시 그냥 N/A로 표기하도록 단순화.
     market_cap = info.get("marketCap", None) if isinstance(info, dict) else None
-    if not market_cap and fast_info: market_cap = getattr(fast_info, 'market_cap', None) or (fast_info.get('market_cap', "N/A") if isinstance(fast_info, dict) else "N/A")
 
     trailing_pe = info.get("trailingPE", "N/A") if isinstance(info, dict) else "N/A"
     forward_pe = info.get("forwardPE", "N/A") if isinstance(info, dict) else "N/A"
@@ -1274,33 +1336,90 @@ def build_backtest_consistency_note(backtest_results, bb_squeeze_status, bt_year
 # 기준값(예: "Calmar 3 이상 우수")은 쓰지 않는다 - 이 백테스트는 연환산이 아니라서 업계 통상
 # 절대 기준을 적용할 근거가 없기 때문. MDD가 0이거나 데이터가 없으면 Calmar 비교를 생략하고
 # 기존처럼 원시 수익률만으로 판단한다(0 나눗셈 방지 및 무낙폭 구간이라는 극단적 예외 처리).
-def classify_vs_benchmark(strat_ret, strat_mdd, bench_ret, bench_mdd):
-    if not isinstance(strat_ret, (int, float)) or not isinstance(bench_ret, (int, float)) or bench_ret <= 0:
-        return "no_data", None, None
-    if strat_ret < bench_ret:
-        return "underperform", None, None
-    if isinstance(strat_mdd, (int, float)) and isinstance(bench_mdd, (int, float)) and strat_mdd > 0 and bench_mdd > 0:
-        strat_calmar = round(strat_ret / strat_mdd, 2)
-        bench_calmar = round(bench_ret / bench_mdd, 2)
-        if strat_calmar >= bench_calmar:
-            return "outperform_both", strat_calmar, bench_calmar
-        return "return_only", strat_calmar, bench_calmar
-    return "outperform_both", None, None
+# [재설계/item24, 2026-09] 기존엔 "원시 수익률 우선 게이트"(수익률에서 밀리면 Calmar를
+# 아예 확인하지 않고 underperform 확정) 방식이라, 전략이 원시 수익률로는 근소하게 밀려도
+# 리스크 조정 성과(Calmar)로는 확실히 이기는 경우의 신호를 완전히 죽이는 결함이 있었다
+# (퀀트 실무에서 Sharpe·Calmar는 이미 수익을 리스크로 나눈 위험조정 지표라 원시 수익률을
+# 별도 1차 게이트로 두는 게 이론적 근거가 약함). Sharpe·Calmar 2축을 독립적으로
+# 벤치마크와 비교해 결과를 5가지로 세분화한다: no_data / outperform_both(둘 다 승) /
+# sharpe_only(샤프만 승) / calmar_only(Calmar만 승) / underperform(둘 다 패).
+# PF·win_rate는 벤치마크(단일 Buy&Hold "거래")에는 구조적으로 정의되지 않아 축에서 제외.
+# [재설계/item24-2, 2026-09] Sortino 비율 추가(item 31 논의에서 사용자가 "퀸트 전문가들은
+# Sharpe/Sortino/Calmar/K-Ratio/SQN을 본다는데 지표를 더 늘려야 하지 않냐"고 질문 → Sortino는
+# 벤치마크(연속 수익률만 있으면 계산 가능)에도 적용 가능하고 Sharpe와 다른 정보(하방 변동성만
+# 봄)를 주는 것으로 판단해 채택. K-Ratio는 Calmar와 측정 정보가 상당히 겹치고, SQN은 거래별
+# R-멀티플이 필요한데 트레이드 기록에 진입 시점 리스크가 없어 구조 변경 없인 계산 불가능해
+# 이번엔 보류). 축이 2개(Sharpe/Calmar)에서 3개(+Sortino)로 늘면서, 기존의 "sharpe_only/
+# calmar_only"처럼 축 조합별로 카테고리 이름을 하드코딩하는 방식은 축이 늘수록(예: 향후
+# K-Ratio 재검토 시 4개) 조합이 기하급수적으로 늘어나 유지 불가능해짐 — 그래서 카테고리는
+# no_data/outperform_all(전부 승)/mixed(엇갈림)/underperform_all(전부 패) 4가지로만 단순화하고,
+# "어떤 지표가 이기고 졌는지"는 별도의 axes 딕셔너리로 반환해 호출부가 필요한 만큼만 조합해
+# 문장을 만들도록 한다. 이 구조라면 지표가 늘어나도(K-Ratio 추가 등) 카테고리 개수는 그대로다.
+AXIS_LABELS_VS_BENCHMARK = {"calmar": "Calmar 비율", "sharpe": "샤프지수", "sortino": "소르티노 비율"}
 
-# [개선] 백테스트 승자 전략이 벤치마크(단순 매수 후 보유) 대비 열위이거나, 원시 수익률은
-# 앞서지만 리스크 조정 성과(Calmar)로는 열위일 경우, Section 6 매매 시나리오 서술에 함께
-# 반영할 주의사항 텍스트. Section 6에서 "그대로 복사 출력"하는 데이터이므로 지시문("~할 것")이
-# 아닌 서술형 문장으로만 구성한다 (LLM이 지시문과 혼동하지 않도록).
-def build_trading_style_caution(best_name, category, best_total_ret, benchmark, strat_calmar, bench_calmar, bt_years):
+def classify_vs_benchmark(strat_ret, strat_mdd, strat_sharpe, strat_sortino, bench_ret, bench_mdd, bench_sharpe, bench_sortino):
+    if not isinstance(strat_ret, (int, float)) or not isinstance(bench_ret, (int, float)) or bench_ret <= 0:
+        return "no_data", {}
+
+    def _pair_win(s_val, b_val):
+        if isinstance(s_val, (int, float)) and isinstance(b_val, (int, float)):
+            return s_val >= b_val
+        return None
+
+    calmar_ok = (isinstance(strat_mdd, (int, float)) and isinstance(bench_mdd, (int, float))
+                 and strat_mdd > 0 and bench_mdd > 0)
+    strat_calmar = round(strat_ret / strat_mdd, 2) if calmar_ok else None
+    bench_calmar = round(bench_ret / bench_mdd, 2) if calmar_ok else None
+
+    axes = {
+        "calmar": (strat_calmar, bench_calmar, _pair_win(strat_calmar, bench_calmar) if calmar_ok else None),
+        "sharpe": (strat_sharpe, bench_sharpe, _pair_win(strat_sharpe, bench_sharpe)),
+        "sortino": (strat_sortino, bench_sortino, _pair_win(strat_sortino, bench_sortino)),
+    }
+    votes = [w for (_, _, w) in axes.values() if w is not None]
+    if not votes:
+        return "no_data", {}
+    if all(votes):
+        return "outperform_all", axes
+    if not any(votes):
+        return "underperform_all", axes
+    return "mixed", axes
+
+def _axes_win_lose_labels(axes):
+    winning = [AXIS_LABELS_VS_BENCHMARK[k] for k, (_, _, w) in axes.items() if w is True]
+    losing = [AXIS_LABELS_VS_BENCHMARK[k] for k, (_, _, w) in axes.items() if w is False]
+    return winning, losing
+
+# [item24-2 구현 중 자체 발견·수정] 지표 라벨을 "·"로 나열한 win_text/lose_text의 조사(은/는)를
+# "은"/"는"으로 하드코딩했더니, 나열되는 지표 조합에 따라(예: "샤프지수"만 단독이면 모음
+# 받침 없어 "는"이 맞는데 "은"이 붙거나, "Calmar 비율"처럼 받침 있는 단어에 "는"이 붙는 등)
+# 문법적으로 틀린 문장이 생성될 수 있음을 이번 소르티노 추가에 대한 전수 분기 테스트 중
+# 자체 발견. 마지막 글자의 받침 유무로 조사를 동적으로 결정하도록 수정.
+def _eun_neun(text):
+    if not text:
+        return "는"
+    code = ord(text[-1]) - 0xAC00
+    if 0 <= code <= 11171:
+        return "은" if code % 28 != 0 else "는"
+    return "는"
+
+# [개선] 백테스트 승자 전략이 벤치마크(단순 매수 후 보유) 대비 열위이거나, 위험조정 지표가
+# 서로 엇갈릴 경우, Section 6 매매 시나리오 서술에 함께 반영할 주의사항 텍스트. Section 6에서
+# "그대로 복사 출력"하는 데이터이므로 지시문("~할 것")이 아닌 서술형 문장으로만 구성한다
+# (LLM이 지시문과 혼동하지 않도록).
+def build_trading_style_caution(best_name, category, best_total_ret, benchmark, axes, bt_years):
     if category == "no_data":
         return "해당없음 (벤치마크 비교 데이터 부족)"
-    if category == "outperform_both":
-        return "해당없음 (선택된 전략이 벤치마크를 수익률과 리스크 조정 성과(Calmar) 모두에서 상회하여 별도 주의 불필요)"
-    if category == "return_only":
-        return (f"⚠️ '{best_name}' 전략이 최근 {bt_years}년간 단순 매수 후 보유(Buy&Hold, +{benchmark}%)보다 원시 수익률은 "
-                f"높지만, 리스크 조정 성과(Calmar 비율=수익률÷MDD)로 비교하면 전략 {strat_calmar} vs 벤치마크 {bench_calmar}로 "
-                f"오히려 열위입니다. 더 큰 낙폭을 감수하고 얻은 초과수익이라는 의미이므로, 공격적인 전액 매수나 잦은 재진입보다 "
-                f"보수적인 분할 접근과 리스크 관리가 권장됩니다.")
+    if category == "outperform_all":
+        winning, _ = _axes_win_lose_labels(axes)
+        return f"해당없음 (선택된 전략이 벤치마크를 위험조정 지표({'·'.join(winning)}) 전부에서 상회하여 별도 주의 불필요)"
+    if category == "mixed":
+        winning, losing = _axes_win_lose_labels(axes)
+        win_text = "·".join(winning) if winning else "없음"
+        lose_text = "·".join(losing) if losing else "없음"
+        return (f"⚠️ '{best_name}' 전략이 최근 {bt_years}년간 단순 매수 후 보유(Buy&Hold) 대비 {win_text}{_eun_neun(win_text)} 우위이지만, "
+                f"{lose_text}로는 열위입니다. 위험조정 성과 지표들이 서로 엇갈리는 결과이므로, 공격적인 전액 매수보다 "
+                f"지표별 성격(변동성 대비/낙폭 대비/하방리스크 대비)을 참고한 보수적 접근이 권장됩니다.")
     ratio = round(benchmark / best_total_ret, 1) if isinstance(best_total_ret, (int, float)) and best_total_ret > 0 else None
     ratio_text = f" (벤치마크가 약 {ratio}배 우수)" if ratio else ""
     return (f"⚠️ 두 트레이딩 전략 모두 최근 {bt_years}년간 단순 매수 후 보유(Buy&Hold, +{benchmark}%) 대비 열위{ratio_text}했습니다. "
@@ -1309,12 +1428,15 @@ def build_trading_style_caution(best_name, category, best_total_ret, benchmark, 
 
 # [개선] Section 7 [최종 투자의견]에 붙일 짧은 부기 문구. 매수/관망/홀딩 "결정" 자체에는 전혀
 # 개입하지 않고, 이미 결정된 의견 뒤에 조건부로만 덧붙는 순수 표시용 텍스트 — 서술형으로만 구성.
-# 벤치마크를 수익률·Calmar 모두에서 상회하거나 비교 데이터가 없으면 빈 문자열("")을 반환한다.
-def build_verdict_style_qualifier(category):
-    if category in ("no_data", "outperform_both"):
+# 벤치마크를 위험조정 지표 전부에서 상회하거나 비교 데이터가 없으면 빈 문자열("")을 반환한다.
+def build_verdict_style_qualifier(category, axes):
+    if category in ("no_data", "outperform_all"):
         return ""
-    if category == "return_only":
-        return "단, 백테스트상 수익률은 벤치마크를 상회했으나 리스크 조정 성과(Calmar 비율)는 벤치마크보다 낮아 더 큰 낙폭을 감수한 결과로 나타나 보수적 접근이 권장됨"
+    if category == "mixed":
+        winning, losing = _axes_win_lose_labels(axes)
+        win_text = "·".join(winning) if winning else "없음"
+        lose_text = "·".join(losing) if losing else "없음"
+        return f"단, 백테스트상 {win_text}{_eun_neun(win_text)} 벤치마크를 상회했으나 {lose_text}{_eun_neun(lose_text)} 벤치마크보다 낮아 위험조정 성과가 지표별로 엇갈려 보수적 접근이 권장됨"
     return "단, 백테스트상 액티브 트레이딩보다 매수 후 장기 보유가 유리했던 것으로 나타나 잦은 진입/청산보다 보유 전략이 권장됨"
 
 def evaluate_strategy_backtest(bt):
@@ -1324,7 +1446,7 @@ def evaluate_strategy_backtest(bt):
     if not bt:
         return (
             "판정불가 (백테스트 데이터 부족)",
-            0.0,
+            "0/3",
             "⚠️ 신규 상장 등으로 백테스트에 필요한 최소 거래일(약 60거래일) 데이터가 확보되지 않아 전략 검증을 수행하지 못했으며, 이에 따라 백테스트 근거 없이 데이터 부족으로 신뢰도가 낮은 상태입니다.",
             "N/A",
             "해당없음 (백테스트 데이터 부족)",
@@ -1334,6 +1456,8 @@ def evaluate_strategy_backtest(bt):
     s2 = bt.get('strategy_2_vwap_mean_reversion', {}) or {}
     benchmark = bt.get('benchmark_buy_and_hold', 0) or 0
     benchmark_mdd = bt.get('benchmark_mdd', 0) or 0
+    benchmark_sharpe = bt.get('benchmark_sharpe', 0) or 0
+    benchmark_sortino = bt.get('benchmark_sortino', 0) or 0
 
     # 백테스트 기간 동적 계산 (strategy_1_period_split 활용)
     bt_years = 5.0
@@ -1348,46 +1472,100 @@ def evaluate_strategy_backtest(bt):
 
     def _num(v, default=0.0): return float(v) if isinstance(v, (int, float)) else default
 
-    def strategy_quality(s):
-        win_rate, pf, sharpe = _num(s.get('win_rate')), _num(s.get('profit_factor')), _num(s.get('sharpe_ratio_annualized'))
-        mdd, trades = _num(s.get('mdd'), 100.0), _num(s.get('trades_count'))
-        sample_penalty = 0.0 if trades >= 5 else 1.0
-        score = 0.0
-        score += min(3.0, (win_rate / 100.0) * 3.0)
-        score += min(3.0, max(0.0, pf - 1.0) * 3.0)
-        score += min(3.0, max(0.0, sharpe) * 3.0)
-        score += 1.0 if s.get('total_ret', -999) not in (None,) and _num(s.get('total_ret'), -999) > benchmark else 0.0
-        score -= sample_penalty
-        return round(max(0.0, min(10.0, score)), 2)
+    # [재설계/item26, 2026-09] 기존엔 승률·PF·샤프·벤치마크승리보너스를 자의적인 절대 임계값
+    # (예: (pf-1)*3배)으로 가산해 0~10점 단일 점수를 만들었는데, MDD는 추출만 하고 점수에
+    # 전혀 반영하지 않는 결함이 있었다. 퀀트 실무의 "단일 블렌드 점수보다 지표별 상대 비교
+    # (체크리스트) 후 다수결" 관행(리서치 근거: Sharpe/Sortino/Calmar/SQN 등은 서로 다른 축을
+    # 측정하므로 하나로 뭉개면 정보 손실)을 반영해, 두 후보를 PF·샤프·Calmar·소르티노 4개
+    # 지표에서 1:1로 맞대결시켜 다수결로 승자를 정하는 방식으로 교체한다(item 31 후속으로
+    # 소르티노 추가 - 하방 변동성만 보는 지표라 Sharpe와 다른 정보를 줌). 원시 win_rate·
+    # total_ret는 위험조정 비교에 부적합해 투표에서 제외(참고용으로만 verdict_text에 남김).
+    # 표본 크기는 새 임계값을 만들지 않고 calc_stats_v2()의 기존 reliability 3단계 라벨을
+    # 그대로 비-투표성 별도 주의문으로 재사용한다.
+    def _calmar(s):
+        ret, mdd = _num(s.get('total_ret')), _num(s.get('mdd'))
+        return round(ret / mdd, 2) if mdd > 0 else None
 
-    q1, q2 = strategy_quality(s1), strategy_quality(s2)
-    if q1 >= q2: best_name, best_data, best_score, other_score = "모멘텀 스퀴즈(추세추종형 돌파매매)", s1, q1, q2
-    else: best_name, best_data, best_score, other_score = "VWAP 평균회귀(눌림목/되돌림 매매)", s2, q2, q1
+    def _compare(v1, v2):
+        # 1=s1 승, 2=s2 승, 0=무승부·비교불가(해당 지표는 투표에서 제외)
+        if v1 is None or v2 is None or v1 == v2:
+            return 0
+        return 1 if v1 > v2 else 2
 
-    # [개선/2026-09, 아이디어 A] 벤치마크(단순 매수 후 보유) 대비 성과 비교 - 원시 수익률뿐 아니라
-    # Calmar 비율(수익률÷MDD)까지 함께 판정해 "수익은 이겼지만 리스크는 훨씬 나쁜" 경우를 구분한다.
+    pf1, pf2 = _num(s1.get('profit_factor')), _num(s2.get('profit_factor'))
+    sh1, sh2 = _num(s1.get('sharpe_ratio_annualized')), _num(s2.get('sharpe_ratio_annualized'))
+    cal1, cal2 = _calmar(s1), _calmar(s2)
+    so1, so2 = _num(s1.get('sortino_ratio_annualized')), _num(s2.get('sortino_ratio_annualized'))
+
+    metric_votes = [("손익비(PF)", _compare(pf1, pf2)), ("샤프지수", _compare(sh1, sh2)),
+                     ("Calmar비율", _compare(cal1, cal2)), ("소르티노비율", _compare(so1, so2))]
+    n_metrics = len(metric_votes)
+    win1 = sum(1 for _, v in metric_votes if v == 1)
+    win2 = sum(1 for _, v in metric_votes if v == 2)
+
+    if win1 != win2:
+        winner = 1 if win1 > win2 else 2
+        tie_break_used = False
+    else:
+        # 동률(4개 지표라 2승2승, 1승1승+2무 등 다양하게 발생 가능) → 각 후보를 벤치마크와
+        # 개별 비교한 등급(classify_vs_benchmark)으로 타이브레이크.
+        rank = {"outperform_all": 3, "mixed": 2, "underperform_all": 1, "no_data": 0}
+        cat1, _ = classify_vs_benchmark(_num(s1.get('total_ret')), s1.get('mdd'), s1.get('sharpe_ratio_annualized'), s1.get('sortino_ratio_annualized'), benchmark, benchmark_mdd, benchmark_sharpe, benchmark_sortino)
+        cat2, _ = classify_vs_benchmark(_num(s2.get('total_ret')), s2.get('mdd'), s2.get('sharpe_ratio_annualized'), s2.get('sortino_ratio_annualized'), benchmark, benchmark_mdd, benchmark_sharpe, benchmark_sortino)
+        winner = 1 if rank.get(cat1, 0) >= rank.get(cat2, 0) else 2
+        tie_break_used = True
+
+    if winner == 1:
+        best_name, best_data, best_wins = "모멘텀 스퀴즈(추세추종형 돌파매매)", s1, win1
+    else:
+        best_name, best_data, best_wins = "VWAP 평균회귀(눌림목/되돌림 매매)", s2, win2
+
+    vote_detail = ", ".join(f"{label}:{'모멘텀 스퀴즈' if v==1 else ('VWAP 평균회귀' if v==2 else '무승부')}" for label, v in metric_votes)
+    vote_score_text = f"{best_wins}/{n_metrics} 지표 우위" + ("(동률 → 벤치마크 비교 등급으로 최종판정)" if tie_break_used else "")
+
+    # [개선/2026-09, item24] 벤치마크(단순 매수 후 보유) 대비 성과 비교 - 샤프·Calmar·소르티노
+    # 3개 위험조정 지표를 독립적으로 판정해 "일부 지표에서만 이긴" 경우를 구분한다.
     best_total_ret = _num(best_data.get('total_ret')) if isinstance(best_data.get('total_ret'), (int, float)) else None
     best_mdd = best_data.get('mdd')
-    category, strat_calmar, bench_calmar = classify_vs_benchmark(best_total_ret, best_mdd, benchmark, benchmark_mdd)
+    best_sharpe = best_data.get('sharpe_ratio_annualized')
+    best_sortino = best_data.get('sortino_ratio_annualized')
+    category, axes = classify_vs_benchmark(best_total_ret, best_mdd, best_sharpe, best_sortino, benchmark, benchmark_mdd, benchmark_sharpe, benchmark_sortino)
 
     if category == "no_data":
         benchmark_note = "벤치마크(단순 매수 후 보유) 데이터가 없어 비교 불가."
-    elif category == "underperform":
+    elif category == "underperform_all":
         underperform_ratio = round(benchmark / best_total_ret, 1) if isinstance(best_total_ret, (int, float)) and best_total_ret > 0 else None
         ratio_text = f" (벤치마크가 전략 대비 약 {underperform_ratio}배)" if underperform_ratio else ""
-        benchmark_note = f"⚠️ 동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)에 미달함{ratio_text} — 절대수익 지표(PF·샤프지수 등)가 양호하더라도 벤치마크 대비 초과수익(알파)은 없으므로, 이 종목은 트레이딩보다 장기 보유가 유리했을 수 있습니다."
-    elif category == "return_only":
-        benchmark_note = (f"동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)을 원시 수익률로는 상회하지만, "
-                           f"리스크 조정 성과(Calmar 비율=수익률÷MDD)로 비교하면 전략 {strat_calmar} vs 벤치마크 {bench_calmar}로 "
-                           f"오히려 열위입니다 — 더 큰 낙폭(MDD)을 감수하고 얻은 초과수익이라는 의미이며, 원시 수익률 비교만으로 "
+        benchmark_note = f"⚠️ 동일 기간 단순 매수 후 보유(Buy&Hold) 대비 위험조정 지표(샤프지수·Calmar 비율·소르티노 비율) 전부 열위입니다{ratio_text} — 원시 수익률이 양호하더라도 위험조정 성과 기준으로는 벤치마크 대비 우위가 없으므로, 이 종목은 트레이딩보다 장기 보유가 유리했을 수 있습니다."
+    elif category == "mixed":
+        winning, losing = _axes_win_lose_labels(axes)
+        win_text = "·".join(winning) if winning else "없음"
+        lose_text = "·".join(losing) if losing else "없음"
+        benchmark_note = (f"동일 기간 단순 매수 후 보유(Buy&Hold, +{benchmark}%) 대비 {win_text}{_eun_neun(win_text)} 우위이지만, "
+                           f"{lose_text}로는 열위입니다 — 위험조정 성과 지표가 서로 엇갈리는 결과이며, 원시 수익률만으로 "
                            f"초과수익(알파) 확인이라 단정하기 어렵습니다.")
-    else:  # outperform_both
-        benchmark_note = f"동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%)을 상회하여 액티브 전략으로서의 초과수익(알파)이 확인됨."
+    else:  # outperform_all
+        winning, _ = _axes_win_lose_labels(axes)
+        benchmark_note = f"동일 기간 단순 매수 후 보유(Buy&Hold) 수익률(+{benchmark}%) 대비 위험조정 지표({'·'.join(winning)}) 전부 상회하여 액티브 전략으로서의 위험조정 초과성과가 확인됨."
 
-    verdict_text = f"최근 {bt_years}년 백테스트 결과, '{best_name}' 전략이 통계적으로 더 우수한 것으로 판정됩니다 (승률 {best_data.get('win_rate')}%, 손익비(PF) {best_data.get('profit_factor')}, 샤프지수 {best_data.get('sharpe_ratio_annualized')}, MDD {best_data.get('mdd')}%, 검증점수 {best_score}/10 vs 대안전략 {other_score}/10). {benchmark_note}"
-    trading_caution_text = build_trading_style_caution(best_name, category, best_total_ret, benchmark, strat_calmar, bench_calmar, bt_years)
-    verdict_qualifier_text = build_verdict_style_qualifier(category)
-    return best_name, best_score, verdict_text, bt_years, trading_caution_text, verdict_qualifier_text
+    # [item26-b] profit_factor_note(표본부족 등 캐버트)가 있으면 표시에 괄호로 덧붙인다.
+    pf_note = best_data.get('profit_factor_note') or ""
+    pf_display = f"{best_data.get('profit_factor')}({pf_note})" if pf_note else f"{best_data.get('profit_factor')}"
+
+    # [item26] 표본 크기 신뢰도는 투표에 넣지 않고(비-투표성 게이트) 신뢰도가 충분(✅)이
+    # 아닐 때만 verdict_text에 별도 주의문으로 덧붙인다 - 새 임계값 없이 기존 reliability
+    # 3단계 라벨을 그대로 재사용.
+    reliability_label = str(best_data.get('reliability', ''))
+    reliability_note = f" ⚠️ 다만 {reliability_label}." if reliability_label and "✅" not in reliability_label else ""
+
+    verdict_text = (f"최근 {bt_years}년 백테스트 결과, '{best_name}' 전략이 위험조정 지표(손익비/샤프지수/Calmar비율/소르티노비율) "
+                     f"상대비교에서 더 우수한 것으로 판정됩니다 ({vote_detail} → {vote_score_text}; 참고: 승률 {best_data.get('win_rate')}%, "
+                     f"손익비(PF) {pf_display}, 샤프지수 {best_data.get('sharpe_ratio_annualized')}, 소르티노비율 {best_data.get('sortino_ratio_annualized')}, "
+                     f"MDD {best_data.get('mdd')}%)."
+                     f"{reliability_note} {benchmark_note}")
+    trading_caution_text = build_trading_style_caution(best_name, category, best_total_ret, benchmark, axes, bt_years)
+    verdict_qualifier_text = build_verdict_style_qualifier(category, axes)
+    return best_name, vote_score_text, verdict_text, bt_years, trading_caution_text, verdict_qualifier_text
 
 # [개선/2026-09, item 21 그룹 B] "그대로 복사 출력" 지시가 프롬프트 문구만으로는 강제되지 않는다는 문제
 # (item 22/27/28에서 반복 확인, 특히 TSLA 재현 사례에서는 LLM이 스스로 오인식한 현재가를 기준으로
@@ -1463,7 +1641,7 @@ def enforce_precalculated_fields(report_text, ctx, logger=None):
 
 # [패치 7] 물타기(Averaging Down) 2단계 게이트 (1단계 적격성 심사 하드게이트 -> 2단계 실효성/손익비 평가)
 # 1단계는 "하나라도 걸리면 즉시 차단"하는 하드 게이트로, 통과한 종목에 한해서만 2단계(절대 금액 기준 손익비)를 계산한다.
-def stage1_outlook_gate(curr_price, tech, fund, total_score, backtest_results, short_intel, stop_price=None):
+def stage1_outlook_gate(curr_price, tech, s_moat, moat_detail, ret6_pct, backtest_results, short_intel, stop_price=None):
     reasons_block = []
 
     # (0) [필수 게이트 - 패치6에서 이어받음] 손절선 이미 이탈 여부는 최우선으로 즉시 차단
@@ -1473,35 +1651,50 @@ def stage1_outlook_gate(curr_price, tech, fund, total_score, backtest_results, s
         reasons_block.append(f"손절선 이미 이탈 (현재가 ${curr_price} ≤ 손절선 ${stop_price}) - 물타기 대신 리스크 관리(전량 손절) 우선")
 
     # (a) 기술적 하락 추세 훼손
-    sma60, sma120 = tech.get('sma_60'), tech.get('sma_120')
-    if isinstance(sma60, (int, float)) and isinstance(sma120, (int, float)):
-        ma_dead_cross = sma60 < sma120  # 단/장기 완전 역배열
-        price_below_support = curr_price < sma120  # 장기 지지선(SMA120) 붕괴
-        if ma_dead_cross or price_below_support:
-            reasons_block.append(
-                f"기술적 추세 훼손 (SMA60 ${sma60} {'<' if ma_dead_cross else '≥'} SMA120 ${sma120}, "
-                f"현재가 ${curr_price}가 SMA120 {'하회' if price_below_support else '상회'})"
-            )
+    # [이평선 기준 수정, 2026-09] 60일/120일선(한국 시장 관습) 대신 미국 시장 표준인
+    # 50일/200일선(골든크로스/데드크로스 기준)으로 교체.
+    # [트렌드 체크 확장, 2026-09] 이평선 정배열 훼손에 더해 6개월 수익률 심각 부진(-15% 미만,
+    # calculate_pre_scores의 s_mom3 최하단 구간과 동일 기준)도 OR로 추가 - 두 신호 중 하나만
+    # 걸려도 보수적으로 차단하는 것이 리스크 관리 관점에서 안전하다고 판단.
+    sma50, sma200 = tech.get('sma_50'), tech.get('sma_200')
+    trend_reasons = []
+    if isinstance(sma50, (int, float)) and isinstance(sma200, (int, float)):
+        ma_dead_cross = sma50 < sma200  # 단/장기 완전 역배열 (데드크로스)
+        price_below_support = curr_price < sma200  # 장기 지지선(SMA200) 붕괴
+        if ma_dead_cross:
+            trend_reasons.append(f"SMA50 ${sma50} < SMA200 ${sma200}(데드크로스)")
+        if price_below_support:
+            trend_reasons.append(f"현재가 ${curr_price}가 SMA200 ${sma200} 하회")
+    if isinstance(ret6_pct, (int, float)) and ret6_pct < -15.0:
+        trend_reasons.append(f"6개월 수익률 {ret6_pct:+.1f}% (-15% 미만)")
+    if trend_reasons:
+        reasons_block.append("기술적 추세 훼손 (" + ", ".join(trend_reasons) + ")")
 
-    # (b) 펀더멘털/가치평가 악화
-    if isinstance(total_score, (int, float)) and total_score < 6.0:
-        reasons_block.append(f"펀더멘털 스코어 기준치 미달 (종합 평점 {total_score:.2f} < 6.0)")
-
-    vm = fund.get('value_models', {}) or {}
-    numeric_models = {k: v for k, v in vm.items() if isinstance(v, (int, float))}
-    overvalued_cnt = sum(1 for v in numeric_models.values() if v < curr_price)
-    total_cnt = len(numeric_models)
-    # [최소 표본수 요건] 그레이엄/피터린치/ROE-PBR 중 산출 가능한 모델이 1개뿐이면 "다수(과반)"라고
-    # 부를 근거가 없다 (표본 1개 = 그냥 그 모델 하나의 의견). 애널리스트 컨센서스 실무에서도
-    # 커버리지가 3~5개 미만이면 "컨센서스"라는 표현 자체를 신중히 쓰는 것과 같은 맥락 —
-    # 최소 2개 이상 모델이 살아있을 때만 이 체크를 작동시킨다.
-    if total_cnt >= 2 and overvalued_cnt >= (total_cnt / 2) + (total_cnt % 2 and 0.5 or 0):
-        # 과반수 이상 모델이 "적정가 < 현재가"(고평가) 판정
-        if overvalued_cnt > total_cnt / 2:
-            reasons_block.append(
-                f"다수 가치평가 모델 고평가 신호 ({overvalued_cnt}/{total_cnt}개 모델이 "
-                f"현재가보다 낮은 적정가 제시)"
-            )
+    # (b) 해자(핵심 경쟁력) 훼손 여부
+    # [게이트 재설계, 2026-09] 기존엔 total_score(밸류에이션 20% 포함) < 6.0, 또는 전통 가치평가
+    # 모델(그레이엄/린치/ROE-PBR) 과반 고평가를 기준으로 삼았음. 논의 결과 이 방식은
+    # (1) "추가 투자 유효성"이 아니라 "종목 자체가 매력적인가"라는 별개의 종목선택 질문에
+    # 답하는 것이고, (2) 전통 가치평가 모델은 이 앱 스스로도 전통 제조업/청산가치 기준으로
+    # 명시한 도구라 성장주에는 부적합함이 확인되어 폐기. 물타기든 분할매수든 "추가 투자
+    # 유효성"을 가르는 핵심은 "이 사업의 본질적 경쟁력(해자)이 여전히 살아있는가"이므로
+    # s_moat(item 18의 4대 구조적 지표 - ROIC/매출총이익률/R&D비중/3년FCF흑자, 균등가중) 자체를
+    # 직접 기준으로 삼는다. 4개 중 과반(2개) 이상 미달 시 차단 - value_models 과반 판정에
+    # 쓰던 것과 동일한 "과반" 기준을 재사용해 임의성을 줄임.
+    if isinstance(s_moat, (int, float)) and s_moat < 5.0:
+        failed_pillars = []
+        for name, detail in (moat_detail or {}).items():
+            val, ok, bar = detail
+            if ok:
+                continue
+            if bar is not None:
+                val_str = f"{val:.1f}%" if isinstance(val, (int, float)) else str(val)
+                failed_pillars.append(f"{name} {val_str}(<{bar})")
+            else:
+                failed_pillars.append(f"{name} 미충족")
+        pillar_text = ", ".join(failed_pillars) if failed_pillars else "상세 근거 없음"
+        reasons_block.append(
+            f"해자(핵심 경쟁력) 훼손 - 4대 구조지표 과반 미달 (해자점수 {s_moat:.1f} < 5.0): {pillar_text}"
+        )
 
     # (c) 백테스트 및 수급 이탈
     s2 = (backtest_results or {}).get('strategy_2_vwap_mean_reversion', {}) or {}
@@ -1574,9 +1767,9 @@ def stage2_profitability_test(curr_price, user_avg_price, user_shares, add_share
 
 # 통합 함수 (patch6의 evaluate_averaging_down 대체)
 def evaluate_averaging_down_v2(curr_price, user_avg_price, user_shares, add_shares,
-                                 tech, fund, total_score, backtest_results,
+                                 tech, s_moat, moat_detail, ret6_pct, backtest_results,
                                  short_intel, stop_price, target1_price):
-    stage1 = stage1_outlook_gate(curr_price, tech, fund, total_score, backtest_results, short_intel, stop_price)
+    stage1 = stage1_outlook_gate(curr_price, tech, s_moat, moat_detail, ret6_pct, backtest_results, short_intel, stop_price)
 
     if stage1["1단계_통과여부"].startswith("🚫"):
         return {
@@ -1647,15 +1840,33 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
     elif opm >= 15: s_prof = 7.5
     elif opm >= 8: s_prof = 5.5
     elif opm >= 0: s_prof = 3.5
-    if roic >= 15.0: s_prof = min(10.0, s_prof + 1.0)
+    # [item 18 개선, 2026-09] ROIC 보너스는 해자(moat) 점수로 이전 - 동일 데이터 이중계산 방지
+    # (기존엔 여기서 +1.0 보너스로 쓰였는데, 아래 s_moat에서 ROIC을 핵심 축으로 승격하면서 제거)
     s_moat = 0.0
-    if parse_num(fund.get('roe', 0)) >= 20.0: s_moat += 2.5
-    if parse_num(fund.get('quality_factors', {}).get('gross_margin', 0)) >= 50.0: s_moat += 2.5
-    if parse_num(fund.get('quality_factors', {}).get('rnd_to_revenue', 0)) >= 5.0: s_moat += 2.5
-    if parse_num(fund.get('ownership_and_shorts', {}).get('inst_own', 0)) >= 70.0: s_moat += 1.5
-    if parse_num(fund.get('quality_factors', {}).get('debt_to_equity', 999)) <= 100.0: s_moat += 1.0
-    if parse_num(fund.get('long_term_quality', {}).get('shares_change_pct', 0)) < 0: s_moat += 1.0
+    # [item 18 개선] 해자 재정의: 경쟁우위와 무관한 항목(기관보유율/부채비율/자사주매입) 제거.
+    # ROE 대신 ROIC(자본비용 대비 초과수익 - Damodaran/Morningstar 경제적 해자 분석의 핵심 지표,
+    # 기존 s_prof 보너스가 쓰던 15% 문턱을 그대로 재사용해 새 상수 도입 없음)을 편입하고,
+    # 3년 연속 FCF 흑자(3y_fcf_status)로 "지속성(durability)" 신호를 신규 반영.
+    # 4개 기준 전부 동일 가중치(Piotroski F-Score식 균등 이진 체크리스트) - 차등 가중치를
+    # 뒷받침할 업계 표준 공식이 없어(Morningstar 해자 등급도 정성적 애널리스트 판단이지
+    # 정량 공식이 아님), 임의의 차등 배점을 새로 만드는 대신 균등 배점으로 임의성을 최소화.
+    gross_margin_val = parse_num(fund.get('quality_factors', {}).get('gross_margin', 0))
+    rnd_pct_val = parse_num(fund.get('quality_factors', {}).get('rnd_to_revenue', 0))
+    fcf_3y_ok = fund.get('long_term_quality', {}).get('3y_fcf_status', 'N/A') == "3년 연속 흑자 (+)"
+    if roic >= 15.0: s_moat += 2.5
+    if gross_margin_val >= 50.0: s_moat += 2.5
+    if rnd_pct_val >= 5.0: s_moat += 2.5
+    if fcf_3y_ok: s_moat += 2.5
     s_moat = min(10.0, max(1.5, s_moat))
+    # [물타기 게이트 재설계, 2026-09] "추가 투자 유효성" 판정이 total_score/value_models 대신
+    # 해자(s_moat)를 직접 참조하기로 함에 따라, stage1_outlook_gate가 "어떤 지표가 미달인지"를
+    # 재계산 없이 그대로 인용할 수 있도록 4대 지표의 원값/충족여부/기준치를 패키징해 반환.
+    moat_detail = {
+        "ROIC": (roic, roic >= 15.0, "15%"),
+        "매출총이익률": (gross_margin_val, gross_margin_val >= 50.0, "50%"),
+        "R&D비중": (rnd_pct_val, rnd_pct_val >= 5.0, "5%"),
+        "3년FCF흑자": (fcf_3y_ok, fcf_3y_ok, None),
+    }
     pe, fpe, ps, pbr = fund.get('trailing_pe'), fund.get('forward_pe'), fund.get('ps_ratio'), fund.get('pbr')
     def score_v(val, b1, b2, b3, b4):
         if not isinstance(val, (int, float)) or val < 0: return 1.5
@@ -1711,12 +1922,12 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
     elif 30 <= rsi < 45: s_mom2 = 5.0
     elif rsi > 70: s_mom2 = 4.0
     else: s_mom2 = 2.0
-    def _trend_alignment_score(price, sma60, sma120):
-        if not (isinstance(price, (int, float)) and isinstance(sma60, (int, float)) and isinstance(sma120, (int, float)) and price > 0): return None
-        if price > sma60 > sma120: return 9.5
-        elif price > sma60 and price > sma120: return 7.5
-        elif price > sma120: return 5.5
-        elif price > sma60: return 4.5
+    def _trend_alignment_score(price, sma50, sma200):
+        if not (isinstance(price, (int, float)) and isinstance(sma50, (int, float)) and isinstance(sma200, (int, float)) and price > 0): return None
+        if price > sma50 > sma200: return 9.5
+        elif price > sma50 and price > sma200: return 7.5
+        elif price > sma200: return 5.5
+        elif price > sma50: return 4.5
         else: return 2.5
     def _six_month_return_score(df):
         try:
@@ -1732,7 +1943,7 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
             elif ret6 >= -15: return 3.5, ret6
             else: return 1.5, ret6
         except Exception: return None
-    trend_score = _trend_alignment_score(curr_price, tech.get('sma_60'), tech.get('sma_120'))
+    trend_score = _trend_alignment_score(curr_price, tech.get('sma_50'), tech.get('sma_200'))
     ret6_result = _six_month_return_score(price_df)
     ret6_score = ret6_result[0] if ret6_result else None
     ret6_pct = ret6_result[1] if ret6_result else None
@@ -1752,7 +1963,9 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
     else: badge = "🚨 비우량주"
     scorecard_text = f"성장성({s_growth:.1f}), 수익성({s_prof:.1f}), 밸류에이션({s_val:.1f}), 해자({s_moat:.1f}), 퀀트/모멘텀({s_mom:.1f}) | 종합 평점: {total_score:.2f} / 10 ({badge})"
     # [패치7] 물타기 2단계 게이트(stage1_outlook_gate)가 숫자 종합점수(total_score)를 필요로 해서 튜플로 반환
-    return scorecard_text, total_score, s_val
+    # [물타기 게이트 재설계, 2026-09] "추가 투자 유효성" 판정용으로 s_moat/moat_detail/ret6_pct도 함께 반환
+    # (total_score/s_val은 게이트에서는 더 이상 안 쓰지만 스코어카드 표시 등 다른 용도로 유지)
+    return scorecard_text, total_score, s_val, s_moat, moat_detail, ret6_pct
 
 # -------------------------------------------------------------
 # 메인 분석 실행
@@ -1798,7 +2011,8 @@ if analyze_btn:
         # 패치 1 적용: 동적 목표가 및 손익비 (stop_p: 패치7 물타기 2단계 게이트에서 재사용)
         targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p, entry_grade_text = calculate_targets_and_risk_reward(curr_p, fib_levels, tech_data)
         # 패치 7 적용: 숫자 종합점수(precalc_total_score)도 함께 반환받도록 변경
-        precalc_scorecard, precalc_total_score, precalc_s_val = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p, price_df=raw_df)
+        # [물타기 게이트 재설계, 2026-09] s_moat/moat_detail/ret6_pct도 함께 반환받도록 확장
+        precalc_scorecard, precalc_total_score, precalc_s_val, precalc_s_moat, precalc_moat_detail, precalc_ret6_pct = calculate_pre_scores(fund_data, tech_data, backtest_results, curr_p, price_df=raw_df)
 
         my_return_str = "N/A"
         if is_holding and user_avg_price > 0 and user_shares > 0 and isinstance(curr_p, (int, float)) and curr_p > 0:
@@ -1819,8 +2033,9 @@ if analyze_btn:
         simulated_add_shares = round(user_shares * 0.25, 1) if user_shares > 0 else 1.0
         avg_down_check = evaluate_averaging_down_v2(
             curr_price=curr_p, user_avg_price=user_avg_price, user_shares=user_shares,
-            add_shares=simulated_add_shares, tech=tech_data, fund=fund_data,
-            total_score=precalc_total_score, backtest_results=backtest_results,
+            add_shares=simulated_add_shares, tech=tech_data,
+            s_moat=precalc_s_moat, moat_detail=precalc_moat_detail, ret6_pct=precalc_ret6_pct,
+            backtest_results=backtest_results,
             short_intel=fund_data.get('hedge_and_short_intel', {}).get('short_intel', {}),
             stop_price=stop_p, target1_price=t1_price
         )
@@ -2114,7 +2329,7 @@ if st.session_state.last_analysis_result:
     gemini_status = "🔴 실패 (API 에러)" if gemini_content.startswith("⚠️") else "🟢 정상"
 
     if info_source == "stock.info": st.markdown(f"📡 **데이터 소스:** `🟢 Yahoo Finance stock.info` ｜ **FRED API:** `{fred_status}` ｜ **Gemini AI:** `{gemini_status}`")
-    else: st.markdown(f"📡 **데이터 소스:** `🟡 Yahoo Finance stock.fast_info` (간이 시세 적용) ｜ **FRED API:** `{fred_status}` ｜ **Gemini AI:** `{gemini_status}`")
+    else: st.markdown(f"📡 **데이터 소스:** `🟡 Yahoo Finance 조회 실패` (일부 항목 N/A) ｜ **FRED API:** `{fred_status}` ｜ **Gemini AI:** `{gemini_status}`")
 
     if res["is_holding"] and res["user_avg_price"] > 0 and res["user_shares"] > 0 and curr_p > 0:
         total_invested, total_current = res["user_avg_price"] * res["user_shares"], curr_p * res["user_shares"]
@@ -2227,7 +2442,10 @@ if st.session_state.last_analysis_result:
                 m1_2.metric("승률 (Win Rate)", f"{s1.get('win_rate', 0)}%", f"총 {s1.get('trades_count', 0)}회 매매")
                 m1_3.metric("Profit Factor / MDD", f"{s1.get('profit_factor', 0)}", f"MDD: -{s1.get('mdd', 0)}%")
                 m1_4.metric("Sharpe Ratio", f"{s1.get('sharpe_ratio_annualized', 0)}", "위험조정수익 (연율화)")
-                st.caption(f"🛡️ **신뢰도:** `{s1.get('reliability', 'N/A')}` | 📅 **기간분할 검증:** `{backtest_results.get('strategy_1_period_split', 'N/A')}`")
+                # [item26-b] profit_factor가 항상 숫자로 바뀌면서(예: 손실거래 0건 → 99.9)
+                # "표본부족" 같은 캐버트가 숫자 뒤에 묻히지 않도록 신뢰도 캡션에 함께 노출.
+                pf_note1 = s1.get('profit_factor_note') or ""
+                st.caption(f"🛡️ **신뢰도:** `{s1.get('reliability', 'N/A')}`" + (f" | ⚠️ PF: {pf_note1}" if pf_note1 else "") + f" | 📅 **기간분할 검증:** `{backtest_results.get('strategy_1_period_split', 'N/A')}`")
 
             with bt_col2:
                 st.markdown("**🔄 전략 B: VWAP + RSI 밸류 되돌림 (Mean Reversion)**")
@@ -2237,7 +2455,8 @@ if st.session_state.last_analysis_result:
                 m2_2.metric("승률 (Win Rate)", f"{s2.get('win_rate', 0)}%", f"총 {s2.get('trades_count', 0)}회 매매")
                 m2_3.metric("Profit Factor / MDD", f"{s2.get('profit_factor', 0)}", f"MDD: -{s2.get('mdd', 0)}%")
                 m2_4.metric("Sharpe Ratio", f"{s2.get('sharpe_ratio_annualized', 0)}", "위험조정수익 (연율화)")
-                st.caption(f"🛡️ **신뢰도:** `{s2.get('reliability', 'N/A')}` | 📅 **기간분할 검증:** `{backtest_results.get('strategy_2_period_split', 'N/A')}`")
+                pf_note2 = s2.get('profit_factor_note') or ""
+                st.caption(f"🛡️ **신뢰도:** `{s2.get('reliability', 'N/A')}`" + (f" | ⚠️ PF: {pf_note2}" if pf_note2 else "") + f" | 📅 **기간분할 검증:** `{backtest_results.get('strategy_2_period_split', 'N/A')}`")
 
     with st.container(border=True):
         st.markdown(f"##### 📐 **최근 6개월 피보나치 되돌림 지지/저항 밴드** (최고: `${fib_levels.get('high_6m', 'N/A')}` / 최저: `${fib_levels.get('low_6m', 'N/A')}`)")
