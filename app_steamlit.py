@@ -38,6 +38,37 @@ KST = timezone(timedelta(hours=9))
 def get_current_kst_time_str():
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
 
+# [신규, 2026-09] "보유자 대상 밴드 이탈(전일 종가 기준) 판정" 기능에서, 장중에 앱을 돌릴 경우
+# 최신 일봉(latest)이 아직 미완성 종가일 수 있으므로 확정 전일 종가(prev)를 대신 써야 하는지
+# 판단하기 위한 미국 정규장(9:30~16:00 ET, 월~금) 개장 여부 근사치.
+# [한계] 추수감사절/성탄절 등 미국 증시 휴장일은 반영하지 않음 - 별도 휴일 캘린더 라이브러리
+# 의존성을 추가하지 않기 위한 의도적 근사치이며, 휴장일을 '개장'으로 오판하더라도 실제 영향은
+# 밴드 이탈 판정에 전일 종가 대신 그 하루 전 종가를 쓰는 정도로 미미하다.
+def is_us_market_open_now():
+    try:
+        from zoneinfo import ZoneInfo
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+    except Exception:
+        # tzdata 미설치 등 zoneinfo 사용 불가 시, 미국 서머타임(2007년 이후 규칙: 3월 둘째 일요일
+        # 02:00 ~ 11월 첫째 일요일 02:00, UTC 기준 근사)을 수동 계산해 ET 오프셋을 추정.
+        now_utc = datetime.now(timezone.utc)
+        year = now_utc.year
+        def _nth_sunday(y, month, n):
+            d = datetime(y, month, 1, tzinfo=timezone.utc)
+            first_sunday_day = 1 + (6 - d.weekday()) % 7
+            return datetime(y, month, first_sunday_day + 7 * (n - 1), 2, 0, tzinfo=timezone.utc)
+        dst_start = _nth_sunday(year, 3, 2)
+        dst_end = _nth_sunday(year, 11, 1)
+        is_dst = dst_start <= now_utc < dst_end
+        offset = timedelta(hours=-4) if is_dst else timedelta(hours=-5)
+        now_et = now_utc.astimezone(timezone(offset))
+
+    if now_et.weekday() >= 5:  # 토(5)/일(6) - 주말은 항상 폐장
+        return False
+    market_open = now_et.replace(hour=9, minute=30, second=0, microsecond=0)
+    market_close = now_et.replace(hour=16, minute=0, second=0, microsecond=0)
+    return market_open <= now_et <= market_close
+
 def init_global_session():
     session = requests.Session()
     session.headers.update({
@@ -254,6 +285,9 @@ def fetch_stock_technical_data(ticker: str):
     latest = df.iloc[-1]
     prev = df.iloc[-2] if len(df) >= 2 else latest
     last_date = df.index[-1].strftime("%Y-%m-%d")
+    # [신규, 2026-09] 보유자 대상 "밴드 이탈(확정 종가 기준) 판정" 기능에서, 장중 실행 시 아직
+    # 미완성일 수 있는 최신 봉(latest) 대신 확정된 전일 종가를 쓸 수 있도록 별도 노출.
+    prev_date = df.index[-2].strftime("%Y-%m-%d") if len(df) >= 2 else last_date
     
     high_52w_calc = round(float(df['High'].max()), 2)
     low_52w_calc = round(float(df['Low'].min()), 2)
@@ -350,7 +384,9 @@ def fetch_stock_technical_data(ticker: str):
         "vwap_1y": round(float(latest['Cumulative_VWAP']), 2) if pd.notnull(latest['Cumulative_VWAP']) else "N/A",
         "vwap_20d": round(float(latest['Rolling_VWAP_20']), 2) if pd.notnull(latest['Rolling_VWAP_20']) else "N/A",
         "poc_price_6m": volume_profile.get("poc_price", "N/A"),
-        "value_area_range_6m": volume_profile.get("value_area_range", "N/A")
+        "value_area_range_6m": volume_profile.get("value_area_range", "N/A"),
+        "prev_close": round(float(prev['Close']), 2) if pd.notnull(prev['Close']) else "N/A",
+        "prev_close_date": prev_date
     }
     return data, last_date, fibonacci_levels, high_52w_calc, low_52w_calc, df, volume_profile
     
@@ -1337,8 +1373,49 @@ def calculate_targets_and_risk_reward(curr_price, fib, tech):
     # [패치7 연동] 손절가(stop_p)를 호출부(추가 매수 여부 2단계 게이트)에서도 쓸 수 있도록 함께 반환
     return targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p, entry_grade_text
 
+# [신규, 2026-09] 보유자 대상 "밴드 이탈(확정 종가 기준) → 손절 고려" 전용 판정 (사용자 요청:
+# "기보유자 기준 전일 종가 기준으로 밴드를 이탈했으니 손절을 고려하는 로직은 없다" 논의 → 승인).
+# 확정 기준 가격(basis_price - 장중이면 확정 전일 종가 prev_close, 마감 후면 최신 종가)을
+# 이미 계산된 stop_price(=분할 매수 밴드 하단, atr_stop_2_0x)와 비교만 할 뿐, 지표/밴드 수치
+# 자체는 전혀 재계산/조정하지 않는다 - 기존 스탠딩 제약("강제로 조정하는건 지표분석 결과를
+# 훼손하는 행위")과 상충하지 않음. Section 7 전용 forced 필드([[F18]])로 주입되어 LLM이
+# 문구를 완화/누락/왜곡할 수 없다.
+def evaluate_band_breach_for_holder(is_holding, basis_price, stop_price, basis_label, basis_date):
+    if not is_holding:
+        return "해당없음 (미보유 - 신규 진입 검토 대상이라 보유 포지션 밴드 이탈 판정 비적용)"
+    if not isinstance(basis_price, (int, float)) or not isinstance(stop_price, (int, float)):
+        return "판정불가 (가격 또는 밴드 하단 데이터 부족)"
+    if basis_price <= stop_price:
+        return (f"🚨 이탈함 - {basis_label} ${basis_price}({basis_date} 기준)가 분할 매수 밴드 하단(${stop_price}) 이하로 마감. "
+                f"보유 포지션에 대해 추가 매수 검토보다 전량 손절(리스크 관리)을 최우선으로 고려할 것.")
+    else:
+        return (f"이탈 안 함 - {basis_label} ${basis_price}({basis_date} 기준)는 분할 매수 밴드 하단(${stop_price}) 위에서 마감. "
+                f"현재까지는 밴드 이탈에 따른 손절 트리거가 발동하지 않은 상태.")
+
 # [패치 2] 사용자 대응 전략 프롬프트
-def build_strategy_instruction(is_holding, user_avg_price, user_shares, curr_price, my_return_str, t1_price, t2_price, t1_label, t2_label):
+# [개선, 2026-09] "ATR 기준선(-$X / -$Y) 이탈 시 리스크 관리" 처럼 1.5배/2.0배 두 ATR 선을
+# 뭉뚱그려 인용하는 문제 수정. 이 앱의 손절가(stop_p)는 항상 atr_stop_2_0x이며(계산가/게이트
+# 로직에서 실제로 쓰이는 값도 이것), [6. 정밀 매매 시나리오]의 [분할 매수 밴드] 하단도 이 선
+# 위쪽/동일선상에서 서술되도록 유도되어 있음 - 즉 "밴드를 이탈했다"와 "2.0배 선을 이탈했다"는
+# 사실상 같은 사건. 반면 1.5배 선은 밴드 '내부'에 위치하는 경우가 많아, 이를 밴드 이탈과 같은
+# 급의 트리거로 서술하면 "밴드 안에서 분할 매수하라면서 그 안의 한 지점을 이탈이라 부르는"
+# 자기모순이 생김. ⚠️ 이 함수는 지표/밴드 '수치'를 전혀 건드리지 않으며, LLM이 이미 계산된
+# 두 ATR 값을 어떤 '말'로 구분해서 서술할지에 대한 지시문만 추가한다 (사용자 승인: "응 명시해줘").
+def build_strategy_instruction(is_holding, user_avg_price, user_shares, curr_price, my_return_str, t1_price, t2_price, t1_label, t2_label, atr_1_5=None, atr_2_0=None, band_breach_text=None):
+    atr_distinction_note = ""
+    if isinstance(atr_1_5, (int, float)) and isinstance(atr_2_0, (int, float)):
+        atr_distinction_note = f"""
+⚠️[ATR 기준선 표현 규칙 - 절대 준수] 위 [6. 정밀 매매 시나리오]의 손절(Stop-loss) 기준선에는 1.5배 손절선(-${atr_1_5})과 2.0배 손절선(-${atr_2_0}) 두 값이 함께 제시되어 있으나, 성격이 다르므로 반드시 구분해서 서술하고 "ATR 기준선(-$A / -$B) 이탈 시"처럼 두 값을 묶어 인용하지 말 것:
+- 2.0배 손절선(-${atr_2_0})은 [분할 매수 밴드]의 하단과 사실상 동일한 선이다. 종가 기준 이 가격 아래로 이탈하면 '밴드 이탈(밴드 자체가 무너진 것)'로 간주하여 리스크 관리(전량 손절 등)를 권고할 것 - 이때 반드시 "ATR 기준선 이탈"이 아니라 "분할 매수 밴드 하단(${atr_2_0}) 이탈"이라고 표현할 것.
+- 1.5배 손절선(-${atr_1_5})은 밴드 내부에 위치한, 더 타이트한 개별 포지션 손절 옵션일 뿐이다. 이미 보유 중인 개별 포지션에 대해 좀 더 보수적으로 대응하고 싶은 사용자가 선택적으로 참고할 수 있는 라인이라고만 서술하고, 이 선을 밴드 이탈이나 시나리오 전체의 종료 신호와 동일시하지 말 것."""
+
+    # [신규, 2026-09] 바로 위 [7. 최종 투자의견]에 강제 주입되는 [[F18]] "밴드 이탈 판정(보유자
+    # 전용)"과 이 자유 서술 전략이 서로 모순되지 않도록 하는 정합성 지시문. F18가 이미 "이탈함"
+    # 으로 확정했는데 이 문단이 "아직 밴드 안에 있다"는 식으로 서술하면 리포트 내부 모순이 생김.
+    band_breach_note = ""
+    if is_holding and isinstance(band_breach_text, str) and band_breach_text.startswith("🚨 이탈함"):
+        band_breach_note = "\n⚠️[밴드 이탈 판정 반영 필수] 바로 위 [[F18]] 밴드 이탈 판정 결과, 확정 종가 기준으로 이미 분할 매수 밴드 하단을 이탈한 상태입니다. 이 사실을 부정하거나 회피하지 말고, 반드시 이를 최우선 근거로 전량 손절(리스크 관리)을 명확히 권고할 것."
+
     if is_holding and user_avg_price > 0:
         def pnl_label(target_price):
             if not isinstance(target_price, (int, float)): return "손익 판단 불가(가격 없음)"
@@ -1355,9 +1432,9 @@ def build_strategy_instruction(is_holding, user_avg_price, user_shares, curr_pri
 2차 목표가({t2_label}, ${t2_price})는 평단가 대비 {t2_pnl_label}입니다.
 목표가가 평단가보다 낮은 경우 절대 '익절'이라는 단어를 쓰지 말고 반드시 '손실 축소 매도' 또는 '비중 축소'라고 표현할 것.
 목표가가 평단가보다 높은 경우에만 '익절'이라는 표현을 사용할 것.
-손절선 이탈 시 전량 손절 계획을 명시할 것.]"""
+손절선 이탈 시 전량 손절 계획을 명시할 것.{atr_distinction_note}{band_breach_note}]"""
     else:
-        return """* **사용자 대응 전략**: [현재 사용자가 주식을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것. 보유자 관련 문구는 일절 작성하지 말 것. 상단 [신규 진입 적격성 평가] 및 [분할 매수 밴드]와 100% 일치하는 진입 가격대와 진입 비중(예: 1차 30% 분할 진입 등)을 명확히 제시할 것.]"""
+        return f"""* **사용자 대응 전략**: [현재 사용자가 주식을 보유하지 않은 '미보유 상태'입니다. 반드시 '미보유자 신규 진입 관점'의 전략만 단독 작성할 것. 보유자 관련 문구는 일절 작성하지 말 것. 상단 [신규 진입 적격성 평가] 및 [분할 매수 밴드]와 100% 일치하는 진입 가격대와 진입 비중(예: 1차 30% 분할 진입 등)을 명확히 제시할 것.{atr_distinction_note}]"""
 
 # [패치 3] 백테스트-기술적 신호 정합성 체크 (기간 동적 연동)
 def build_backtest_consistency_note(backtest_results, bb_squeeze_status, bt_years):
@@ -1661,7 +1738,7 @@ def apply_verdict_qualifier(report_text, verdict_qualifier_text, logger=None):
     return new_text
 
 def enforce_precalculated_fields(report_text, ctx, logger=None):
-    """9개 '그대로 복사' 필드 강제 치환 + 24번 부기 + 현재가 오기재 스윕을 한 번에 적용."""
+    """10개 '그대로 복사' 필드 강제 치환 + 24번 부기 + 현재가 오기재 스윕을 한 번에 적용."""
     field_map = [
         ("스코어카드 관점", ctx["precalc_scorecard"], "[[F15]]"),
         ("예상 손익비 (Risk/Reward)", ctx["rr_text"], "[[F16]]"),
@@ -1672,6 +1749,7 @@ def enforce_precalculated_fields(report_text, ctx, logger=None):
         ("추가 매수 여부", ctx["add_buy_text"], "[[F21]]"),
         ("신규 진입 등급", ctx["entry_grade_text"], "[[F22]]"),
         ("매매 접근 방식 주의사항", ctx["trading_caution_text"], "[[F23]]"),
+        ("밴드 이탈 판정 (보유자 전용)", ctx["band_breach_text"], "[[F18]]"),
     ]
     for label, value, token in field_map:
         report_text = force_copy_field(report_text, label, value, token=token, logger=logger)
@@ -2084,15 +2162,38 @@ if analyze_btn:
             my_return_str = f"{pnl_pct:+.2f}%"
         user_position_text = f"사용자 보유 현황: 평단가 ${user_avg_price:.2f}, 보유수량 {user_shares:.1f}주, 평가수익률 {my_return_str}" if is_holding and user_avg_price > 0 else "사용자 미보유 종목 (신규 진입 검토 관점)"
 
+        # 개선안 적용: ATR 배수 라벨 혼동 방지를 위한 고정 텍스트 생성
+        # [순서 변경, 2026-09] 아래 build_strategy_instruction()이 "밴드 이탈 vs 개별 포지션
+        # 손절 옵션" 구분 문구에 실제 ATR 달러 값을 함께 인용할 수 있도록, 이 계산을 해당 호출
+        # 이전으로 옮김 (기존에는 이 아래에서 계산되어 strategy_instruction_text에 전달 불가했음).
+        atr_1_5 = tech_data.get('atr_stop_1_5x', 'N/A')
+        atr_2_0 = tech_data.get('atr_stop_2_0x', 'N/A')
+        atr_labels_text = f"1.5배 손절선(-${atr_1_5}), 2.0배 손절선(-${atr_2_0})"
+
+        # [신규, 2026-09] 보유자 대상 "밴드 이탈(확정 종가 기준) → 손절 고려" 판정용 기준 가격 선정.
+        # 장중(정규장 개장 중)에 돌리면 최신 봉(curr_p)이 아직 미완성 종가일 수 있으므로, 그 경우엔
+        # 확정된 전일 종가(prev_close)를 기준으로 삼는다 - 장 마감 후에는 최신 봉이 곧 확정 종가이므로
+        # curr_p를 그대로 사용. (사용자 승인: "장중/마감 여부에 따라 동적으로 선택")
+        market_currently_open = is_us_market_open_now()
+        if market_currently_open:
+            breach_basis_price = tech_data.get('prev_close', curr_p)
+            breach_basis_date = tech_data.get('prev_close_date', stock_date)
+            breach_basis_label = "전일 확정 종가"
+        else:
+            breach_basis_price = curr_p
+            breach_basis_date = stock_date
+            breach_basis_label = "최신 확정 종가"
+        band_breach_text = evaluate_band_breach_for_holder(is_holding, breach_basis_price, stop_p, breach_basis_label, breach_basis_date)
+
         # 패치 2 적용: 전략 지시문 생성
         strategy_instruction_text = build_strategy_instruction(
             is_holding, user_avg_price, user_shares, curr_p, my_return_str,
-            t1_price, t2_price, t1_label, t2_label
+            t1_price, t2_price, t1_label, t2_label, atr_1_5, atr_2_0, band_breach_text
         )
 
         # 패치 4 적용: 백테스트 비교 및 검증 점수 (동적 기간 반환 포함)
         best_name, backtest_score, backtest_verdict, bt_years, trading_caution_text, verdict_qualifier_text = evaluate_strategy_backtest(backtest_results)
-        
+
         # 패치 7 적용: 추가 매수 여부 2단계 게이트 (1단계 적격성 하드게이트 -> 2단계 실효성/손익비 평가, 보유수량의 약 25% 소액 분할 할당)
         simulated_add_shares = round(user_shares * 0.25, 1) if user_shares > 0 else 1.0
         add_buy_check = evaluate_additional_buy_v2(
@@ -2108,11 +2209,6 @@ if analyze_btn:
 
         # 패치 3 적용: 스퀴즈 백테스트 정합성 경고 (동적 기간 변수 주입)
         consistency_note = build_backtest_consistency_note(backtest_results, tech_data.get('bb_squeeze_status'), bt_years)
-
-        # 개선안 적용: ATR 배수 라벨 혼동 방지를 위한 고정 텍스트 생성
-        atr_1_5 = tech_data.get('atr_stop_1_5x', 'N/A')
-        atr_2_0 = tech_data.get('atr_stop_2_0x', 'N/A')
-        atr_labels_text = f"1.5배 손절선(-${atr_1_5}), 2.0배 손절선(-${atr_2_0})"
 
         full_rag_payload = {
             "meta": {"ticker": ticker_input, "data_source": info_source_flag, "model_used": selected_model_label, "analysis_requested_at": get_current_kst_time_str(), "stock_data_date": stock_date},
@@ -2135,7 +2231,15 @@ if analyze_btn:
             "precalculated_risk_reward": rr_text,
             "precalculated_targets": targets_text,
             "precalculated_entry_grade": entry_grade_text,
-            "additional_buy_check": add_buy_check
+            "additional_buy_check": add_buy_check,
+            "band_breach_check_holder_only": {
+                "market_open_at_analysis_time": market_currently_open,
+                "basis_label": breach_basis_label,
+                "basis_price": breach_basis_price,
+                "basis_date": breach_basis_date,
+                "band_lower_edge_stop_p": stop_p,
+                "verdict_text": band_breach_text
+            }
         }
 
         full_json_str = json.dumps(full_rag_payload, indent=2, ensure_ascii=False)
@@ -2254,6 +2358,7 @@ if analyze_btn:
 7. [최종 투자의견 규칙 (엄격 준수)]
 - 관망이 유리하면 최종 투자의견을 절대 '매수'로 적지 말고 '관망' 또는 '홀딩'으로 명시.
 - 매수/관망/홀딩 중 하나만 명확히 단독으로 출력할 것 (뒤에 괄호나 부기 문구를 붙이지 말 것 - 필요한 부기는 시스템이 사후에 자동으로 추가함).
+- **[밴드 이탈 판정(보유자 전용)]**: ⚠️ 아래 [출력 포맷]의 해당 자리에 플레이스홀더 `[[F18]]`만 출력할 것 - 이는 확정 종가 기준으로 보유 포지션이 분할 매수 밴드 하단을 이미 이탈했는지 여부를 사전 판정한 결과이며, 바로 아래 [사용자 대응 전략]은 이 판정 결과와 모순되지 않게 서술할 것.
 
 ---
 
@@ -2295,6 +2400,7 @@ if analyze_btn:
 
 [7. 최종 투자의견]
 * **최종 투자의견**: [매수/관망/홀딩 중 택1, 단독으로만 출력]
+* **밴드 이탈 판정 (보유자 전용)**: [[F18]]
 {strategy_guide}
 """
             prompt = PromptTemplate(
@@ -2358,7 +2464,7 @@ if analyze_btn:
                         "backtest_verdict": backtest_verdict, "atr_labels_text": atr_labels_text,
                         "add_buy_text": add_buy_text, "entry_grade_text": entry_grade_text,
                         "trading_caution_text": trading_caution_text, "verdict_qualifier_text": verdict_qualifier_text,
-                        "curr_p": curr_p,
+                        "curr_p": curr_p, "band_breach_text": band_breach_text,
                     }
                     response_content = enforce_precalculated_fields(response_content, _enforce_ctx, logger=logger)
                 except Exception as e:
