@@ -645,19 +645,34 @@ def fetch_nearest_options_data(ticker: str, retries: int = 2):
                     time.sleep(0.5 * (attempt + 1))
                     continue
                 return None
-            call_max_oi_row = calls.loc[calls['openInterest'].idxmax()] if calls['openInterest'].notnull().any() and calls['openInterest'].max() > 0 else calls.iloc[0]
+            # [OI 폴백 수정, 2026-09] 기존엔 OI가 전 종목 0/null이라 "최다 OI"를 계산할 수 없을 때
+            # calls.iloc[0]/puts.iloc[0](체인의 가장 낮은 행사가)로 조용히 대체했는데, 이 값은
+            # 실제 OI와 무관한 임의의 행사가라 "상방 저항벽/하방 지지벽"이라는 라벨과 함께 보여주면
+            # 마치 의미 있는 수급 신호인 것처럼 오인될 수 있음(TSLA 0DTE에서 발견 - 행사가 $100
+            # 콜/$50 풋처럼 현재가와 동떨어진 값이 나옴). OI 데이터가 실제로 없는 경우엔 폴백 대신
+            # None을 반환해 아래에서 "N/A"로 명시한다. Vol 기준(거래량)은 이번 사례에서 정상 작동을
+            # 확인했고 범위 밖이라 기존 로직 유지.
+            has_call_oi = calls['openInterest'].notnull().any() and calls['openInterest'].max() > 0
+            has_put_oi = puts['openInterest'].notnull().any() and puts['openInterest'].max() > 0
+            call_max_oi_row = calls.loc[calls['openInterest'].idxmax()] if has_call_oi else None
             call_max_vol_row = calls.loc[calls['volume'].idxmax()] if calls['volume'].notnull().any() and calls['volume'].max() > 0 else calls.iloc[0]
-            put_max_oi_row = puts.loc[puts['openInterest'].idxmax()] if puts['openInterest'].notnull().any() and puts['openInterest'].max() > 0 else puts.iloc[0]
+            put_max_oi_row = puts.loc[puts['openInterest'].idxmax()] if has_put_oi else None
             put_max_vol_row = puts.loc[puts['volume'].idxmax()] if puts['volume'].notnull().any() and puts['volume'].max() > 0 else puts.iloc[0]
             tot_call_vol = calls['volume'].sum() if calls['volume'].notnull().any() else 0
             tot_put_vol = puts['volume'].sum() if puts['volume'].notnull().any() else 0
             pc_ratio = round(tot_put_vol / tot_call_vol, 2) if tot_call_vol > 0 else "N/A"
+
+            def _oi_entry(row):
+                if row is None:
+                    return {"strike": "N/A", "oi": "N/A", "price": "N/A"}
+                return {"strike": row.get("strike", "N/A"), "oi": int(row.get("openInterest", 0)) if pd.notnull(row.get("openInterest")) else 0, "price": round(float(row.get("lastPrice", 0)), 2)}
+
             return {
                 "expiration_date": nearest_exp,
                 "pc_volume_ratio": pc_ratio,
-                "call_max_oi": {"strike": call_max_oi_row.get("strike", "N/A"), "oi": int(call_max_oi_row.get("openInterest", 0)) if pd.notnull(call_max_oi_row.get("openInterest")) else 0, "price": round(float(call_max_oi_row.get("lastPrice", 0)), 2)},
+                "call_max_oi": _oi_entry(call_max_oi_row),
                 "call_max_vol": {"strike": call_max_vol_row.get("strike", "N/A"), "volume": int(call_max_vol_row.get("volume", 0)) if pd.notnull(call_max_vol_row.get("volume")) else 0, "price": round(float(call_max_vol_row.get("lastPrice", 0)), 2)},
-                "put_max_oi": {"strike": put_max_oi_row.get("strike", "N/A"), "oi": int(put_max_oi_row.get("openInterest", 0)) if pd.notnull(put_max_oi_row.get("openInterest")) else 0, "price": round(float(put_max_oi_row.get("lastPrice", 0)), 2)},
+                "put_max_oi": _oi_entry(put_max_oi_row),
                 "put_max_vol": {"strike": put_max_vol_row.get("strike", "N/A"), "volume": int(put_max_vol_row.get("volume", 0)) if pd.notnull(put_max_vol_row.get("volume")) else 0, "price": round(float(put_max_vol_row.get("lastPrice", 0)), 2)}
             }
         except Exception:
@@ -1085,7 +1100,7 @@ def summarize_user_strategy(raw_text: str) -> str:
     return text
 
 def parse_full_trading_scenario(text):
-    action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, averaging_down, user_strategy_raw, quality_badge = "홀딩", "분석 리포트 참조", "분석 리포트 참조", "분석 리포트 참조", "", "분석 리포트 참조", "분석 리포트 참조", "분석 리포트 참조", "", "", "", ""
+    action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, add_buy_note, user_strategy_raw, quality_badge = "홀딩", "분석 리포트 참조", "분석 리포트 참조", "분석 리포트 참조", "", "분석 리포트 참조", "분석 리포트 참조", "분석 리포트 참조", "", "", "", ""
     if "최상위 핵심 우량주" in text or "👑" in text: quality_badge = "👑 "
     elif "적격 우량주" in text or "🥇" in text: quality_badge = "🥇 "
     elif "조건부 종목" in text or "⚠️" in text: quality_badge = "⚠️ "
@@ -1116,10 +1131,13 @@ def parse_full_trading_scenario(text):
         elif ("손절" in line_clean or "Stop-loss" in line_clean) and stop_loss == "분석 리포트 참조" and ":" in line_clean: stop_loss = ":".join(line_clean.split(":")[1:]).strip()
         elif ("불타기 조건" in line_clean or "불타기" in line_clean) and not pyramiding and ":" in line_clean: pyramiding = ":".join(line_clean.split(":")[1:]).strip()
         # [버그수정] "비중 확대"만으로도 매칭되던 조건 제거 - 이 표현은 매크로/자산배분 코멘트 등
-        # 다른 문장에도 흔히 등장해서, 실제 "물타기(비중 확대) 조건:" 줄에 도달하기 전에 엉뚱한
-        # 줄을 먼저 캡처해버리는 오탐이 발생했음(not averaging_down 가드로 한번 잡히면 고정됨).
-        # 레이블은 항상 "물타기"를 포함하므로 이 단어 하나로 매칭해도 충분함.
-        elif "물타기" in line_clean and not averaging_down and ":" in line_clean: averaging_down = ":".join(line_clean.split(":")[1:]).strip()
+        # 다른 문장에도 흔히 등장해서, 실제 "추가 매수 여부:" 줄에 도달하기 전에 엉뚱한
+        # 줄을 먼저 캡처해버리는 오탐이 발생했음(not add_buy_note 가드로 한번 잡히면 고정됨).
+        # [물타기→추가 매수 여부 리네이밍, 2026-09] 레이블 문구를 "물타기"에서 "추가 매수"로
+        # 바꾸면서 매칭 키워드도 함께 교체 - 레이블은 항상 "추가 매수"를 포함하므로 이 단어만
+        # 매칭해도 충분함(과거 "물타기" 표기로 저장된 히스토리는 render 단계에서 구버전 키로
+        # 별도 폴백 처리하며, 이 정규식은 앞으로 새로 생성되는 리포트만 대상으로 함).
+        elif "추가 매수" in line_clean and not add_buy_note and ":" in line_clean: add_buy_note = ":".join(line_clean.split(":")[1:]).strip()
 
     match_opinion_sec = re.search(r"\[최종\s*투자의견\](.*?)(?=\Z|\[|\n\n#)", text, re.DOTALL)
     opinion_block = match_opinion_sec.group(1) if match_opinion_sec else text
@@ -1136,7 +1154,7 @@ def parse_full_trading_scenario(text):
             elif line_clean: strategy_lines.append(line_clean)
 
     if strategy_lines: user_strategy_raw = " ".join(strategy_lines)
-    return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, averaging_down, summarize_user_strategy(user_strategy_raw), quality_badge
+    return action, entry_grade, entry_rr, target_1, target_2, sell_target, buy_band, stop_loss, pyramiding, add_buy_note, summarize_user_strategy(user_strategy_raw), quality_badge
 
 TIER_1_FIRMS = ["goldman", "morgan stanley", "jpmorgan", "jp morgan", "citi", "citigroup", "bank of america", "bofa", "merrill", "ubs", "barclays", "deutsche bank", "hsbc", "bernstein", "credit suisse", "bnp paribas"]
 TIER_2_FIRMS = ["wells fargo", "rbc", "mizuho", "jefferies", "piper sandler", "wedbush", "baird", "oppenheimer", "bmo", "stifel", "td cowen", "cowen", "wolfe", "keybanc", "raymond james", "canaccord", "evercore", "truist", "guggenheim", "btig", "da davidson", "needham", "mmpm", "loop capital", "roth mkm", "bernstein"]
@@ -1220,7 +1238,11 @@ with st.sidebar:
                 st.markdown(f"- **📥 분할매수 밴드:** `{data.get('buy_band', '분석 리포트 참조')}`")
                 st.markdown(f"- **🛑 손절선:** `{data.get('stop_loss', '분석 리포트 참조')}`")
                 if data.get('pyramiding'): st.markdown(f"- **🔥 불타기 조건:** `{data['pyramiding']}`")
-                if data.get('averaging_down'): st.markdown(f"- **💧 물타기(비중 확대) 조건:** `{data['averaging_down']}`")
+                # [물타기→추가 매수 여부 리네이밍, 2026-09] 저장 키를 'additional_buy'로 바꿨지만,
+                # 이미 저장돼 있던 과거 히스토리 항목은 여전히 구키 'averaging_down'으로 남아있으므로
+                # 신키 우선 조회 + 구키 폴백으로 과거 데이터 내용은 손대지 않고 라벨만 새 용어로 통일.
+                add_buy_display = data.get('additional_buy') or data.get('averaging_down')
+                if add_buy_display: st.markdown(f"- **💧 추가 매수 여부:** `{add_buy_display}`")
                 strat_text = data.get('user_strategy', '')
                 st.markdown(f"- **💡 대응 전략:** `{strat_text if strat_text and strat_text != '분석 리포트 참조' else '분석 리포트 참조'}`")
                 st.caption(f"분석 일시(KST): {data.get('time', 'N/A')}")
@@ -1312,7 +1334,7 @@ def calculate_targets_and_risk_reward(curr_price, fib, tech):
     targets_text = f"1차 목표가: {t1_label} (${t1_price}) | 2차 목표가: {t2_label} (${t2_price})"
     rr_text = f"(1차 목표가 {t1_label} ${t1_price} 기준) 기대수익 {up_pct:+.2f}% : 예상손실 {down_pct:+.2f}% (손익비 {ratio:.2f} : 1)"
     entry_grade_text = grade_entry_by_rr(ratio)
-    # [패치7 연동] 손절가(stop_p)를 호출부(물타기 2단계 게이트)에서도 쓸 수 있도록 함께 반환
+    # [패치7 연동] 손절가(stop_p)를 호출부(추가 매수 여부 2단계 게이트)에서도 쓸 수 있도록 함께 반환
     return targets_text, rr_text, t1_price, t2_price, t1_label, t2_label, stop_p, entry_grade_text
 
 # [패치 2] 사용자 대응 전략 프롬프트
@@ -1647,7 +1669,7 @@ def enforce_precalculated_fields(report_text, ctx, logger=None):
         ("2차 목표가", f'{ctx["t2_label"]} (${ctx["t2_price"]})', "[[F17T2]]"),
         ("벤치마크 대비 평가", ctx["backtest_verdict"], "[[F19]]"),
         ("손절(Stop-loss) 기준선", ctx["atr_labels_text"], "[[F20]]"),
-        ("물타기(비중 확대) 조건", ctx["avg_down_text"], "[[F21]]"),
+        ("추가 매수 여부", ctx["add_buy_text"], "[[F21]]"),
         ("신규 진입 등급", ctx["entry_grade_text"], "[[F22]]"),
         ("매매 접근 방식 주의사항", ctx["trading_caution_text"], "[[F23]]"),
     ]
@@ -1657,7 +1679,10 @@ def enforce_precalculated_fields(report_text, ctx, logger=None):
     report_text = fix_current_price_mentions(report_text, ctx["curr_p"])
     return report_text
 
-# [패치 7] 물타기(Averaging Down) 2단계 게이트 (1단계 적격성 심사 하드게이트 -> 2단계 실효성/손익비 평가)
+# [패치 7] 추가 매수 여부(구: 물타기/Averaging Down) 2단계 게이트 (1단계 적격성 심사 하드게이트 -> 2단계 실효성/손익비 평가)
+# [물타기→추가 매수 여부 리네이밍, 2026-09] item 36에서 논의한 취지가 "물타기 여부 판정"이
+# 아니라 "추가 투자 유효성 판정"으로 기능의 정체성 자체를 바꾸는 것이었는데, 그동안 게이트
+# 판정 기준(로직)만 바꾸고 사용자 노출 라벨/함수명은 "물타기"로 남아있던 불일치를 정리.
 # 1단계는 "하나라도 걸리면 즉시 차단"하는 하드 게이트로, 통과한 종목에 한해서만 2단계(절대 금액 기준 손익비)를 계산한다.
 def stage1_outlook_gate(curr_price, tech, s_moat, moat_detail, ret6_pct, backtest_results, short_intel, stop_price=None):
     reasons_block = []
@@ -1666,7 +1691,7 @@ def stage1_outlook_gate(curr_price, tech, s_moat, moat_detail, ret6_pct, backtes
     #     stage2에서 (curr_price - stop_price)로 손실액을 계산하는데, 이미 손절선 아래인 경우
     #     이 값이 음수가 되어 "-$-500" 같은 이중 음수 표기가 나오는 것을 막기 위한 목적도 겸함.
     if isinstance(stop_price, (int, float)) and isinstance(curr_price, (int, float)) and curr_price <= stop_price:
-        reasons_block.append(f"손절선 이미 이탈 (현재가 ${curr_price} ≤ 손절선 ${stop_price}) - 물타기 대신 리스크 관리(전량 손절) 우선")
+        reasons_block.append(f"손절선 이미 이탈 (현재가 ${curr_price} ≤ 손절선 ${stop_price}) - 추가 매수 대신 리스크 관리(전량 손절) 우선")
 
     # (a) 기술적 하락 추세 훼손
     # [이평선 기준 수정, 2026-09] 60일/120일선(한국 시장 관습) 대신 미국 시장 표준인
@@ -1740,7 +1765,7 @@ def stage1_outlook_gate(curr_price, tech, s_moat, moat_detail, ret6_pct, backtes
 
     passed = len(reasons_block) == 0
     return {
-        "1단계_통과여부": "✅ 통과 - 비중 확대 검토 대상" if passed else "🚫 차단 - 물타기 즉시 배제",
+        "1단계_통과여부": "✅ 통과 - 비중 확대 검토 대상" if passed else "🚫 차단 - 추가 매수 즉시 배제",
         "차단_사유": reasons_block if reasons_block else ["없음"],
     }
 
@@ -1783,15 +1808,15 @@ def stage2_profitability_test(curr_price, user_avg_price, user_shares, add_share
     }
 
 
-# 통합 함수 (patch6의 evaluate_averaging_down 대체)
-def evaluate_averaging_down_v2(curr_price, user_avg_price, user_shares, add_shares,
+# 통합 함수 (patch6의 evaluate_averaging_down 대체, 2026-09 리네이밍: evaluate_averaging_down_v2 → evaluate_additional_buy_v2)
+def evaluate_additional_buy_v2(curr_price, user_avg_price, user_shares, add_shares,
                                  tech, s_moat, moat_detail, ret6_pct, backtest_results,
                                  short_intel, stop_price, target1_price):
     stage1 = stage1_outlook_gate(curr_price, tech, s_moat, moat_detail, ret6_pct, backtest_results, short_intel, stop_price)
 
     if stage1["1단계_통과여부"].startswith("🚫"):
         return {
-            "최종_판정": "🚫 물타기 부적합 (1단계 적격성 심사 탈락)",
+            "최종_판정": "🚫 추가 매수 부적합 (1단계 적격성 심사 탈락)",
             "1단계_결과": stage1,
             "2단계_결과": "1단계 탈락으로 평가 생략",
         }
@@ -1807,20 +1832,20 @@ def evaluate_averaging_down_v2(curr_price, user_avg_price, user_shares, add_shar
     }
 
 
-# Section 6 "물타기(비중 확대) 조건" 프롬프트 출력용 텍스트 포맷터
-def format_averaging_down_text(avg_down_check, is_holding):
+# Section 6 "추가 매수 여부" 프롬프트 출력용 텍스트 포맷터 (2026-09 리네이밍: format_averaging_down_text → format_additional_buy_text)
+def format_additional_buy_text(add_buy_check, is_holding):
     if not is_holding:
-        return "해당없음 (미보유 - 신규 진입 검토 대상이라 물타기/비중확대 판정 비적용)"
+        return "해당없음 (미보유 - 신규 진입 검토 대상이라 추가 매수 판정 비적용)"
 
-    final_verdict = avg_down_check.get("최종_판정", "판정불가")
+    final_verdict = add_buy_check.get("최종_판정", "판정불가")
 
     if final_verdict.startswith("🚫"):
-        stage1 = avg_down_check.get("1단계_결과", {}) or {}
+        stage1 = add_buy_check.get("1단계_결과", {}) or {}
         block_reasons = stage1.get("차단_사유", [])
         reasons_text = " / ".join(block_reasons) if block_reasons else "데이터 근거 부족"
-        return f"{final_verdict} | 차단 사유: {reasons_text} | 물타기(추가매수로 평단 낮추기) 의견 제시는 부적절한 상황입니다. 손절선 이탈 시에는 물타기보다 전량 손절이 우선되는 상황입니다."
+        return f"{final_verdict} | 차단 사유: {reasons_text} | 추가 매수(평단 낮추기) 의견 제시는 부적절한 상황입니다. 손절선 이탈 시에는 추가 매수보다 전량 손절이 우선되는 상황입니다."
 
-    stage2 = avg_down_check.get("2단계_결과", {}) or {}
+    stage2 = add_buy_check.get("2단계_결과", {}) or {}
     if not isinstance(stage2, dict):
         return f"{final_verdict} | 상세 평가 생략 ({stage2})"
 
@@ -1829,7 +1854,7 @@ def format_averaging_down_text(avg_down_check, is_holding):
     return (
         f"{final_verdict} | 1단계 적격성 심사 통과. 현재가가 분할 매수 밴드 안일 경우에 한해 "
         f"'평단가를 낮추기 위한 소액 분할 재매수' 의견을 아래 실효성 근거(퍼센트 대신 반드시 달러 금액 명시)와 함께 제시 가능: "
-        f"{detail_text}. 단, 손절선 이탈 시에는 물타기보다 전량 손절이 우선되는 상황입니다."
+        f"{detail_text}. 단, 손절선 이탈 시에는 추가 매수보다 전량 손절이 우선되는 상황입니다."
     )
 
 # 스코어카드 연산 (기존 함수 유지)
@@ -2068,9 +2093,9 @@ if analyze_btn:
         # 패치 4 적용: 백테스트 비교 및 검증 점수 (동적 기간 반환 포함)
         best_name, backtest_score, backtest_verdict, bt_years, trading_caution_text, verdict_qualifier_text = evaluate_strategy_backtest(backtest_results)
         
-        # 패치 7 적용: 물타기 2단계 게이트 (1단계 적격성 하드게이트 -> 2단계 실효성/손익비 평가, 보유수량의 약 25% 소액 분할 할당)
+        # 패치 7 적용: 추가 매수 여부 2단계 게이트 (1단계 적격성 하드게이트 -> 2단계 실효성/손익비 평가, 보유수량의 약 25% 소액 분할 할당)
         simulated_add_shares = round(user_shares * 0.25, 1) if user_shares > 0 else 1.0
-        avg_down_check = evaluate_averaging_down_v2(
+        add_buy_check = evaluate_additional_buy_v2(
             curr_price=curr_p, user_avg_price=user_avg_price, user_shares=user_shares,
             add_shares=simulated_add_shares, tech=tech_data,
             s_moat=precalc_s_moat, moat_detail=precalc_moat_detail, ret6_pct=precalc_ret6_pct,
@@ -2078,8 +2103,8 @@ if analyze_btn:
             short_intel=fund_data.get('hedge_and_short_intel', {}).get('short_intel', {}),
             stop_price=stop_p, target1_price=t1_price
         )
-        # 물타기 판정 결과는 Section 6 전용 데이터 항목(21번)으로 분리하여 프롬프트에 주입 (아래 avg_down_text)
-        avg_down_text = format_averaging_down_text(avg_down_check, is_holding)
+        # 추가 매수 여부 판정 결과는 Section 6 전용 데이터 항목(21번)으로 분리하여 프롬프트에 주입 (아래 add_buy_text)
+        add_buy_text = format_additional_buy_text(add_buy_check, is_holding)
 
         # 패치 3 적용: 스퀴즈 백테스트 정합성 경고 (동적 기간 변수 주입)
         consistency_note = build_backtest_consistency_note(backtest_results, tech_data.get('bb_squeeze_status'), bt_years)
@@ -2110,7 +2135,7 @@ if analyze_btn:
             "precalculated_risk_reward": rr_text,
             "precalculated_targets": targets_text,
             "precalculated_entry_grade": entry_grade_text,
-            "averaging_down_check": avg_down_check
+            "additional_buy_check": add_buy_check
         }
 
         full_json_str = json.dumps(full_rag_payload, indent=2, ensure_ascii=False)
@@ -2182,8 +2207,8 @@ if analyze_btn:
 20. ATR 손절선 고정 라벨 (절대 임의 수정 금지):
 {atr_labels_json}
 
-21. 파이썬 알고리즘 사전 연산 물타기(비중확대) 판정 (절대 임의 수정 금지):
-{avg_down_json}
+21. 파이썬 알고리즘 사전 연산 추가 매수 여부 판정 (절대 임의 수정 금지):
+{add_buy_json}
 
 22. 파이썬 알고리즘 사전 연산 신규 진입 등급 (예상 손익비 기반, 절대 임의 수정 금지):
 {entry_grade_json}
@@ -2224,7 +2249,7 @@ if analyze_btn:
 - **[매매 스타일 일치 규칙 (필수)]**: 반드시 [19. 백테스트 전략 비교]에서 판정된 전략 스타일에 맞춰 분할 매수 밴드/목표가/불타기 조건의 논리를 서술할 것.
 - **[매수 밴드 및 진입 가격 상/하단 논리 일치 규칙]**: 하단 [사용자 대응 전략] 가격과 상단 [분할 매수 밴드] 가격 100% 일치시킬 것.
 - **[가격 표기]**: 밴드는 오름차순(낮은 가격 ~ 높은 가격)으로 표기.
-- **[플레이스홀더 대상]**: 매매 접근 방식 주의사항(`[[F23]]`), 1차 목표가(`[[F17T1]]`), 2차 목표가(`[[F17T2]]`), 손절(Stop-loss) 기준선(`[[F20]]`), 물타기(비중 확대) 조건(`[[F21]]`)은 아래 [출력 포맷]의 해당 자리에 각 플레이스홀더만 출력할 것 - 분할 매수 밴드/매도가 밴드/불타기 조건 서술은 자유롭게 작성.
+- **[플레이스홀더 대상]**: 매매 접근 방식 주의사항(`[[F23]]`), 1차 목표가(`[[F17T1]]`), 2차 목표가(`[[F17T2]]`), 손절(Stop-loss) 기준선(`[[F20]]`), 추가 매수 여부(`[[F21]]`)은 아래 [출력 포맷]의 해당 자리에 각 플레이스홀더만 출력할 것 - 분할 매수 밴드/매도가 밴드/불타기 조건 서술은 자유롭게 작성.
 
 7. [최종 투자의견 규칙 (엄격 준수)]
 - 관망이 유리하면 최종 투자의견을 절대 '매수'로 적지 말고 '관망' 또는 '홀딩'으로 명시.
@@ -2266,14 +2291,14 @@ if analyze_btn:
 * **매도가 밴드**: [내용 (오름차순)]
 * **손절(Stop-loss) 기준선**: [[F20]]
 * **불타기 조건**: [스퀴즈 상방 돌파 등 (19번 전략 스타일에 맞춰 서술)]
-* **물타기(비중 확대) 조건**: [[F21]]
+* **추가 매수 여부**: [[F21]]
 
 [7. 최종 투자의견]
 * **최종 투자의견**: [매수/관망/홀딩 중 택1, 단독으로만 출력]
 {strategy_guide}
 """
             prompt = PromptTemplate(
-                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "avg_down_json", "entry_grade_json", "trading_caution_json"],
+                input_variables=["ticker", "stock_date", "tech_json", "poc_json", "backtest_json", "fib_json", "options_json", "hedge_short_json", "earnings_json", "macro_json", "macro_news_json", "sector_json", "fund_json", "user_position", "strategy_guide", "news_json", "analyst_json", "score_json", "rr_json", "targets_json", "consistency_note", "backtest_verdict", "add_buy_json", "entry_grade_json", "trading_caution_json"],
                 template=template
             )
             # [개선] SDK 자체 재시도/타임아웃을 명시적으로 짧게 제한해서, 아래 앱 자체 재시도 루프(0/5/10초 간격)가
@@ -2302,7 +2327,7 @@ if analyze_btn:
                 "score_json": precalc_scorecard, "rr_json": rr_text,
                 "targets_json": targets_text, "consistency_note": consistency_note,
                 "backtest_verdict": backtest_verdict, "atr_labels_json": atr_labels_text,
-                "avg_down_json": avg_down_text, "entry_grade_json": entry_grade_text,
+                "add_buy_json": add_buy_text, "entry_grade_json": entry_grade_text,
                 "trading_caution_json": trading_caution_text
             }
             
@@ -2331,7 +2356,7 @@ if analyze_btn:
                         "precalc_scorecard": precalc_scorecard, "rr_text": rr_text,
                         "t1_label": t1_label, "t1_price": t1_price, "t2_label": t2_label, "t2_price": t2_price,
                         "backtest_verdict": backtest_verdict, "atr_labels_text": atr_labels_text,
-                        "avg_down_text": avg_down_text, "entry_grade_text": entry_grade_text,
+                        "add_buy_text": add_buy_text, "entry_grade_text": entry_grade_text,
                         "trading_caution_text": trading_caution_text, "verdict_qualifier_text": verdict_qualifier_text,
                         "curr_p": curr_p,
                     }
@@ -2340,9 +2365,13 @@ if analyze_btn:
                     logger.warning(f"[강제치환 계층 오류] {ticker_input}: {e} - 원본 리포트 그대로 사용")
 
         if response_content and not response_content.startswith("⚠️"):
-            act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, avg_dn, u_strat_summary, q_badge = parse_full_trading_scenario(response_content)
+            act, ent_grade, ent_rr, t1, t2, sell_b, buy_b, sl_b, pyr, add_buy_note, u_strat_summary, q_badge = parse_full_trading_scenario(response_content)
+            # [물타기→추가 매수 여부 리네이밍, 2026-09] 저장 키를 'averaging_down'에서 'additional_buy'로
+            # 교체. 이미 저장된 과거 히스토리 항목의 내용(값)은 그대로 두고(재작성/마이그레이션 없음),
+            # 앞으로 새로 저장되는 항목부터 새 키를 쓴다 - 조회 쪽(render_history_card)은 신키 우선 +
+            # 구키 폴백으로 두 세대의 데이터를 모두 정상 표시한다.
             st.session_state.history[ticker_input] = {
-                "action": act, "entry_grade": ent_grade, "entry_rr": ent_rr, "quality_badge": q_badge, "price": curr_p, "my_avg": user_avg_price if is_holding else 0, "my_return": my_return_str if is_holding else "미보유", "target_1": t1, "target_2": t2, "take_profit": t1, "sell_target": sell_b, "buy_band": buy_b, "stop_loss": sl_b, "pyramiding": pyr, "averaging_down": avg_dn, "user_strategy": u_strat_summary, "time": get_current_kst_time_str()
+                "action": act, "entry_grade": ent_grade, "entry_rr": ent_rr, "quality_badge": q_badge, "price": curr_p, "my_avg": user_avg_price if is_holding else 0, "my_return": my_return_str if is_holding else "미보유", "target_1": t1, "target_2": t2, "take_profit": t1, "sell_target": sell_b, "buy_band": buy_b, "stop_loss": sl_b, "pyramiding": pyr, "additional_buy": add_buy_note, "user_strategy": u_strat_summary, "time": get_current_kst_time_str()
             }
             save_history(st.session_state.history)
 
@@ -2522,14 +2551,20 @@ if st.session_state.last_analysis_result:
             st.markdown(f"##### 🎯 **가장 빠른 만기 옵션 체인 스마트머니 포지션** `만기일: {exp_date}` `P/C Ratio: {pc_rat}`")
             op_c1, op_c2, op_c3, op_c4 = st.columns(4)
             c_oi = options_data['call_max_oi']
-            diff_c_oi = round(((c_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_oi['strike'], (int, float)) else None
-            op_c1.metric("콜옵션 Max OI (상방 저항벽)", f"${c_oi['strike']}", f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,} / ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}")
+            if isinstance(c_oi['strike'], (int, float)):
+                diff_c_oi = round(((c_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p else None
+                op_c1.metric("콜옵션 Max OI (상방 저항벽)", f"${c_oi['strike']}", f"{diff_c_oi:+.1f}% (OI: {c_oi['oi']:,} / ${c_oi['price']})" if diff_c_oi is not None else f"OI: {c_oi['oi']:,}")
+            else:
+                op_c1.metric("콜옵션 Max OI (상방 저항벽)", "N/A", "OI 데이터 없음 (당일 미결제약정 미형성)")
             c_vol = options_data['call_max_vol']
             diff_c_vol = round(((c_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(c_vol['strike'], (int, float)) else None
             op_c2.metric("콜옵션 Max Vol (당일 상방 수급)", f"${c_vol['strike']}", f"{diff_c_vol:+.1f}% (Vol: {c_vol['volume']:,} / ${c_vol['price']})" if diff_c_vol is not None else f"Vol: {c_vol['volume']:,}")
             p_oi = options_data['put_max_oi']
-            diff_p_oi = round(((p_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_oi['strike'], (int, float)) else None
-            op_c3.metric("풋옵션 Max OI (하방 지지벽)", f"${p_oi['strike']}", f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,} / ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}")
+            if isinstance(p_oi['strike'], (int, float)):
+                diff_p_oi = round(((p_oi['strike'] - curr_p) / curr_p) * 100, 1) if curr_p else None
+                op_c3.metric("풋옵션 Max OI (하방 지지벽)", f"${p_oi['strike']}", f"{diff_p_oi:+.1f}% (OI: {p_oi['oi']:,} / ${p_oi['price']})" if diff_p_oi is not None else f"OI: {p_oi['oi']:,}")
+            else:
+                op_c3.metric("풋옵션 Max OI (하방 지지벽)", "N/A", "OI 데이터 없음 (당일 미결제약정 미형성)")
             p_vol = options_data['put_max_vol']
             diff_p_vol = round(((p_vol['strike'] - curr_p) / curr_p) * 100, 1) if curr_p and isinstance(p_vol['strike'], (int, float)) else None
             op_c4.metric("풋옵션 Max Vol (당일 하방 헤지)", f"${p_vol['strike']}", f"{diff_p_vol:+.1f}% (Vol: {p_vol['volume']:,} / ${p_vol['price']})" if diff_p_vol is not None else f"Vol: {p_vol['volume']:,}")
