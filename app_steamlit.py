@@ -24,6 +24,7 @@ import numpy as np
 import pandas_datareader.data as web
 import ta
 import yfinance as yf
+import plotly.graph_objects as go  # [신규, 2026-09] 섹터 로테이션(RRG) 산점도 렌더링용 - 이 앱 최초의 차트 시각화
 from dotenv import load_dotenv
 
 from langchain_core.prompts import PromptTemplate
@@ -34,6 +35,307 @@ load_dotenv()
 
 # 한국 표준시(KST) 정의 (UTC+9)
 KST = timezone(timedelta(hours=9))
+
+# [신규, 2026-09] CAPM 기반 동적 요구수익률/할인율 계산에 쓰이는 상수.
+# ERP(주식위험프리미엄)는 NYU Stern Aswath Damodaran의 "implied ERP"(S&P500 현재가·배당+자사주매입
+# 수익률·이익성장률 컨센서스로 시장이 요구하는 내재수익률을 역산하는 방식 - 임의의 역사적 평균이
+# 아니라 실무/학계에서 사실상 표준으로 통용됨) 최신 공표치 근사. 그의 개인 NYU 페이지에 월 단위로
+# 엑셀 파일로만 게시되고 공식 API가 없어(바이너리 포맷이라 프로그램적 실시간 파싱도 불안정) 여기서는
+# 문서화된 상수로 관리 - 아래 출처에서 주기적(예: 분기 1회)으로 최신값 확인 후 수동 갱신 권장.
+# 참고 이력: 2025년말/2026-01 갱신 4.23%(당시 10Y 4.18%) -> 2026-03 중순 갱신 4.51%(당시 10Y 4.28%).
+# 출처: https://pages.stern.nyu.edu/~adamodar/New_Home_Page/datafile/histimpl.html
+US_EQUITY_RISK_PREMIUM_PCT = 4.5
+# 베타 데이터가 없는 종목(신규상장 등)에 적용하는 "시장 평균 리스크 가정" 폴백.
+DEFAULT_BETA_FALLBACK = 1.0
+
+def calculate_cost_of_equity_pct(risk_free_rate_pct, beta):
+    """CAPM: Ke(자기자본비용, %) = Rf(무위험금리, %) + β × ERP(%).
+    risk_free_rate_pct/반환값 모두 '%' 단위 숫자(예: 4.18) - 소수(0.0418) 아님에 주의."""
+    if not isinstance(risk_free_rate_pct, (int, float)): return None
+    b = beta if isinstance(beta, (int, float)) and beta > 0 else DEFAULT_BETA_FALLBACK
+    return round(risk_free_rate_pct + b * US_EQUITY_RISK_PREMIUM_PCT, 2)
+
+# [신규, 2026-09] 업종별 차등 moat 임계값(ROIC/R&D)에 쓰이는 NYU Stern Aswath Damodaran
+# 업종별 벤치마크 데이터(2026-01-05 업데이트 기준, 94개 업종).
+# roic_benchmark_pct = mgnroc.xls "Return on Capital"(%) - 앱 자체 ROIC(NOPAT/투하자본) 산식과 동일 개념.
+# rnd_benchmark_pct = R&D.xls "Current R&D as % of Revenue"(%).
+# 출처: https://pages.stern.nyu.edu/~adamodar/New_Home_Page/data.html (엑셀 파일 - API 없음, 수동 갱신)
+# 방식(사용자 승인, "A안"): 업종 평균값을 그대로 통과선으로 사용(가중치 배수 없음) - 평균 초과분의
+# "우수함"은 다른 지표(밸류에이션 스코어 등)에서 별도로 반영된다는 판단.
+DAMODARAN_INDUSTRY_BENCHMARKS = {
+    "Advertising": {"roic_benchmark_pct": 37.32, "rnd_benchmark_pct": 3.07},
+    "Aerospace/Defense": {"roic_benchmark_pct": 21.29, "rnd_benchmark_pct": 4.02},
+    "Air Transport": {"roic_benchmark_pct": 8.09, "rnd_benchmark_pct": 0.38},
+    "Apparel": {"roic_benchmark_pct": 15.78, "rnd_benchmark_pct": 0.01},
+    "Auto & Truck": {"roic_benchmark_pct": 2.62, "rnd_benchmark_pct": 5.3},
+    "Auto Parts": {"roic_benchmark_pct": 12.17, "rnd_benchmark_pct": 4.95},
+    "Bank (Money Center)": {"roic_benchmark_pct": 0.01, "rnd_benchmark_pct": 0.0},
+    "Banks (Regional)": {"roic_benchmark_pct": -0.03, "rnd_benchmark_pct": 0.0},
+    "Beverage (Alcoholic)": {"roic_benchmark_pct": 15.74, "rnd_benchmark_pct": 0.0},
+    "Beverage (Soft)": {"roic_benchmark_pct": 29.68, "rnd_benchmark_pct": 0.49},
+    "Broadcasting": {"roic_benchmark_pct": 14.57, "rnd_benchmark_pct": 0.01},
+    "Brokerage & Investment Banking": {"roic_benchmark_pct": -0.02, "rnd_benchmark_pct": 0.27},
+    "Building Materials": {"roic_benchmark_pct": 21.72, "rnd_benchmark_pct": 1.26},
+    "Business & Consumer Services": {"roic_benchmark_pct": 31.06, "rnd_benchmark_pct": 1.18},
+    "Cable TV": {"roic_benchmark_pct": 12.1, "rnd_benchmark_pct": 0.13},
+    "Chemical (Basic)": {"roic_benchmark_pct": 3.89, "rnd_benchmark_pct": 1.0},
+    "Chemical (Diversified)": {"roic_benchmark_pct": 4.35, "rnd_benchmark_pct": 1.9},
+    "Chemical (Specialty)": {"roic_benchmark_pct": 11.89, "rnd_benchmark_pct": 2.61},
+    "Coal & Related Energy": {"roic_benchmark_pct": -4.81, "rnd_benchmark_pct": 0.26},
+    "Computer Services": {"roic_benchmark_pct": 36.37, "rnd_benchmark_pct": 2.53},
+    "Computers/Peripherals": {"roic_benchmark_pct": 78.17, "rnd_benchmark_pct": 7.08},
+    "Construction Supplies": {"roic_benchmark_pct": 18.48, "rnd_benchmark_pct": 2.43},
+    "Diversified": {"roic_benchmark_pct": 15.01, "rnd_benchmark_pct": 0.66},
+    "Drugs (Biotechnology)": {"roic_benchmark_pct": 7.26, "rnd_benchmark_pct": 42.89},
+    "Drugs (Pharmaceutical)": {"roic_benchmark_pct": 29.3, "rnd_benchmark_pct": 20.94},
+    "Education": {"roic_benchmark_pct": 18.94, "rnd_benchmark_pct": 3.98},
+    "Electrical Equipment": {"roic_benchmark_pct": 19.24, "rnd_benchmark_pct": 3.95},
+    "Electronics (Consumer & Office)": {"roic_benchmark_pct": -34.87, "rnd_benchmark_pct": 17.9},
+    "Electronics (General)": {"roic_benchmark_pct": 23.27, "rnd_benchmark_pct": 4.23},
+    "Engineering/Construction": {"roic_benchmark_pct": 25.45, "rnd_benchmark_pct": 0.04},
+    "Entertainment": {"roic_benchmark_pct": 14.27, "rnd_benchmark_pct": 3.68},
+    "Environmental & Waste Services": {"roic_benchmark_pct": 32.7, "rnd_benchmark_pct": 0.43},
+    "Farming/Agriculture": {"roic_benchmark_pct": 7.77, "rnd_benchmark_pct": 1.52},
+    "Financial Svcs. (Non-bank & Insurance)": {"roic_benchmark_pct": 1.17, "rnd_benchmark_pct": 2.26},
+    "Food Processing": {"roic_benchmark_pct": 16.44, "rnd_benchmark_pct": 0.6},
+    "Food Wholesalers": {"roic_benchmark_pct": 17.84, "rnd_benchmark_pct": 0.0},
+    "Furn/Home Furnishings": {"roic_benchmark_pct": 11.79, "rnd_benchmark_pct": 1.9},
+    "Green & Renewable Energy": {"roic_benchmark_pct": 3.64, "rnd_benchmark_pct": 0.1},
+    "Healthcare Products": {"roic_benchmark_pct": 22.27, "rnd_benchmark_pct": 7.2},
+    "Healthcare Support Services": {"roic_benchmark_pct": 31.86, "rnd_benchmark_pct": 0.07},
+    "Heathcare Information and Technology": {"roic_benchmark_pct": 17.26, "rnd_benchmark_pct": 6.89},
+    "Homebuilding": {"roic_benchmark_pct": 14.91, "rnd_benchmark_pct": 0.0},
+    "Hospitals/Healthcare Facilities": {"roic_benchmark_pct": 22.23, "rnd_benchmark_pct": 0.05},
+    "Hotel/Gaming": {"roic_benchmark_pct": 15.84, "rnd_benchmark_pct": 2.84},
+    "Household Products": {"roic_benchmark_pct": 38.95, "rnd_benchmark_pct": 1.99},
+    "Information Services": {"roic_benchmark_pct": 25.65, "rnd_benchmark_pct": 2.08},
+    "Insurance (General)": {"roic_benchmark_pct": 45.11, "rnd_benchmark_pct": 0.19},
+    "Insurance (Life)": {"roic_benchmark_pct": 10.77, "rnd_benchmark_pct": 0.0},
+    "Insurance (Prop/Cas.)": {"roic_benchmark_pct": 18.49, "rnd_benchmark_pct": 0.0},
+    "Investments & Asset Management": {"roic_benchmark_pct": 14.36, "rnd_benchmark_pct": 0.47},
+    "Machinery": {"roic_benchmark_pct": 27.27, "rnd_benchmark_pct": 2.03},
+    "Metals & Mining": {"roic_benchmark_pct": 27.22, "rnd_benchmark_pct": 0.18},
+    "Office Equipment & Services": {"roic_benchmark_pct": 20.86, "rnd_benchmark_pct": 2.12},
+    "Oil/Gas (Integrated)": {"roic_benchmark_pct": 8.51, "rnd_benchmark_pct": 0.25},
+    "Oil/Gas (Production and Exploration)": {"roic_benchmark_pct": 13.79, "rnd_benchmark_pct": 0.22},
+    "Oil/Gas Distribution": {"roic_benchmark_pct": 12.35, "rnd_benchmark_pct": 0.01},
+    "Oilfield Svcs/Equip.": {"roic_benchmark_pct": 12.26, "rnd_benchmark_pct": 0.32},
+    "Packaging & Container": {"roic_benchmark_pct": 15.17, "rnd_benchmark_pct": 0.42},
+    "Paper/Forest Products": {"roic_benchmark_pct": 10.5, "rnd_benchmark_pct": 0.21},
+    "Power": {"roic_benchmark_pct": 6.93, "rnd_benchmark_pct": 0.12},
+    "Precious Metals": {"roic_benchmark_pct": 25.71, "rnd_benchmark_pct": 0.47},
+    "Publishing & Newspapers": {"roic_benchmark_pct": 19.31, "rnd_benchmark_pct": 1.51},
+    "R.E.I.T.": {"roic_benchmark_pct": 3.2, "rnd_benchmark_pct": 0.01},
+    "Real Estate (Development)": {"roic_benchmark_pct": 7.04, "rnd_benchmark_pct": 0.0},
+    "Real Estate (General/Diversified)": {"roic_benchmark_pct": 5.19, "rnd_benchmark_pct": 0.0},
+    "Real Estate (Operations & Services)": {"roic_benchmark_pct": 6.56, "rnd_benchmark_pct": 1.43},
+    "Recreation": {"roic_benchmark_pct": 8.87, "rnd_benchmark_pct": 2.85},
+    "Reinsurance": {"roic_benchmark_pct": 10.14, "rnd_benchmark_pct": 0.0},
+    "Restaurant/Dining": {"roic_benchmark_pct": 18.94, "rnd_benchmark_pct": 0.74},
+    "Retail (Automotive)": {"roic_benchmark_pct": 12.2, "rnd_benchmark_pct": 0.01},
+    "Retail (Building Supply)": {"roic_benchmark_pct": 35.47, "rnd_benchmark_pct": 0.14},
+    "Retail (Distributors)": {"roic_benchmark_pct": 16.13, "rnd_benchmark_pct": 0.02},
+    "Retail (General)": {"roic_benchmark_pct": 20.6, "rnd_benchmark_pct": 5.23},
+    "Retail (Grocery and Food)": {"roic_benchmark_pct": 6.98, "rnd_benchmark_pct": 0.23},
+    "Retail (REITs)": {"roic_benchmark_pct": 5.16, "rnd_benchmark_pct": 0.02},
+    "Retail (Special Lines)": {"roic_benchmark_pct": 21.7, "rnd_benchmark_pct": 0.08},
+    "Rubber& Tires": {"roic_benchmark_pct": 3.48, "rnd_benchmark_pct": 2.33},
+    "Semiconductor": {"roic_benchmark_pct": 41.83, "rnd_benchmark_pct": 15.36},
+    "Semiconductor Equip": {"roic_benchmark_pct": 44.88, "rnd_benchmark_pct": 10.72},
+    "Shipbuilding & Marine": {"roic_benchmark_pct": 11.99, "rnd_benchmark_pct": 0.0},
+    "Shoe": {"roic_benchmark_pct": 21.15, "rnd_benchmark_pct": 0.14},
+    "Software (Entertainment)": {"roic_benchmark_pct": 46.02, "rnd_benchmark_pct": 18.61},
+    "Software (Internet)": {"roic_benchmark_pct": 6.2, "rnd_benchmark_pct": 19.76},
+    "Software (System & Application)": {"roic_benchmark_pct": 50.17, "rnd_benchmark_pct": 15.98},
+    "Steel": {"roic_benchmark_pct": 6.72, "rnd_benchmark_pct": 0.0},
+    "Telecom (Wireless)": {"roic_benchmark_pct": 10.38, "rnd_benchmark_pct": 0.07},
+    "Telecom. Equipment": {"roic_benchmark_pct": 52.73, "rnd_benchmark_pct": 14.36},
+    "Telecom. Services": {"roic_benchmark_pct": 12.13, "rnd_benchmark_pct": 0.46},
+    "Tobacco": {"roic_benchmark_pct": 68.11, "rnd_benchmark_pct": 1.48},
+    "Transportation": {"roic_benchmark_pct": 13.93, "rnd_benchmark_pct": 1.25},
+    "Transportation (Railroads)": {"roic_benchmark_pct": 14.24, "rnd_benchmark_pct": 0.0},
+    "Trucking": {"roic_benchmark_pct": 9.36, "rnd_benchmark_pct": 0.14},
+    "Utility (General)": {"roic_benchmark_pct": 5.99, "rnd_benchmark_pct": 0.0},
+    "Utility (Water)": {"roic_benchmark_pct": 7.25, "rnd_benchmark_pct": 0.02},
+}
+# 매출 대비 R&D 비중이 업종 구조상 사실상 0에 가까운 업종(은행/보험/리츠 등)까지 Total Market
+# ex-금융 폴백값(4.14%)을 R&D 통과선으로 강제 적용하면 부당하게 불리해지므로, 업종 자체
+# 벤치마크가 낮은 경우("구조적으로 유의미하지 않음")는 R&D 기준 자체를 채점에서 제외한다.
+# 컷오프는 사용자와 명시적으로 확정하지 않은 값이라 여기 문서화: 1.0% 미만이면 "해당없음" 처리.
+RND_APPLICABILITY_CUTOFF_PCT = 1.0
+# 종목의 yfinance industry가 위 벤치마크 딕셔너리 키와 이름이 다르므로(GICS 계열 명칭),
+# 대응하는 Damodaran 업종명으로 최대한 매칭하는 테이블. 확신이 안 서거나 커버되지 않는
+# yfinance 업종은 여기 넣지 않고, 조회 시 DAMODARAN_TOTAL_MARKET_EX_FIN(Total Market
+# ex-금융: ROIC 17.69%, R&D 4.14%)으로 폴백한다(사용자 승인 사항).
+YFINANCE_INDUSTRY_TO_DAMODARAN = {
+    "Software—Application": "Software (System & Application)",
+    "Software—Infrastructure": "Software (System & Application)",
+    "Information Technology Services": "Computer Services",
+    "Computer Hardware": "Computers/Peripherals",
+    "Consumer Electronics": "Electronics (Consumer & Office)",
+    "Electronic Components": "Electronics (General)",
+    "Electronic Gaming & Multimedia": "Software (Entertainment)",
+    "Internet Content & Information": "Software (Internet)",
+    "Internet Retail": "Retail (Special Lines)",
+    "Semiconductors": "Semiconductor",
+    "Semiconductor Equipment & Materials": "Semiconductor Equip",
+    "Communication Equipment": "Telecom. Equipment",
+    "Scientific & Technical Instruments": "Electronics (General)",
+    "Solar": "Green & Renewable Energy",
+    "Electronics & Computer Distribution": "Computers/Peripherals",
+    "Biotechnology": "Drugs (Biotechnology)",
+    "Drug Manufacturers—General": "Drugs (Pharmaceutical)",
+    "Drug Manufacturers—Specialty & Generic": "Drugs (Pharmaceutical)",
+    "Medical Devices": "Healthcare Products",
+    "Medical Instruments & Supplies": "Healthcare Products",
+    "Diagnostics & Research": "Healthcare Products",
+    "Medical Care Facilities": "Hospitals/Healthcare Facilities",
+    "Health Information Services": "Heathcare Information and Technology",
+    "Medical Distribution": "Healthcare Support Services",
+    "Pharmaceutical Retailers": "Healthcare Support Services",
+    "Health Care Plans": "Healthcare Support Services",
+    "Banks—Diversified": "Bank (Money Center)",
+    "Banks—Regional": "Banks (Regional)",
+    "Banks—Global": "Bank (Money Center)",
+    "Insurance—Life": "Insurance (Life)",
+    "Insurance—Property & Casualty": "Insurance (Prop/Cas.)",
+    "Insurance—Diversified": "Insurance (General)",
+    "Insurance—Specialty": "Insurance (General)",
+    "Insurance—Reinsurance": "Reinsurance",
+    "Insurance Brokers": "Insurance (General)",
+    "Asset Management": "Investments & Asset Management",
+    "Capital Markets": "Brokerage & Investment Banking",
+    "Financial Data & Stock Exchanges": "Information Services",
+    "Financial Conglomerates": "Financial Svcs. (Non-bank & Insurance)",
+    "Credit Services": "Financial Svcs. (Non-bank & Insurance)",
+    "Mortgage Finance": "Real Estate (General/Diversified)",
+    "REIT—Residential": "R.E.I.T.",
+    "REIT—Retail": "Retail (REITs)",
+    "REIT—Office": "R.E.I.T.",
+    "REIT—Industrial": "R.E.I.T.",
+    "REIT—Diversified": "R.E.I.T.",
+    "REIT—Healthcare Facilities": "R.E.I.T.",
+    "REIT—Hotel & Motel": "R.E.I.T.",
+    "REIT—Mortgage": "R.E.I.T.",
+    "REIT—Specialty": "R.E.I.T.",
+    "Real Estate—Development": "Real Estate (Development)",
+    "Real Estate—Diversified": "Real Estate (General/Diversified)",
+    "Real Estate Services": "Real Estate (Operations & Services)",
+    "Specialty Retail": "Retail (Special Lines)",
+    "Home Improvement Retail": "Retail (Building Supply)",
+    "Department Stores": "Retail (General)",
+    "Discount Stores": "Retail (General)",
+    "Grocery Stores": "Retail (Grocery and Food)",
+    "Food Distribution": "Food Wholesalers",
+    "Apparel Retail": "Retail (Special Lines)",
+    "Apparel Manufacturing": "Apparel",
+    "Footwear & Accessories": "Shoe",
+    "Auto & Truck Dealerships": "Retail (Automotive)",
+    "Household & Personal Products": "Household Products",
+    "Packaged Foods": "Food Processing",
+    "Beverages—Non-Alcoholic": "Beverage (Soft)",
+    "Beverages—Brewers": "Beverage (Alcoholic)",
+    "Beverages—Wineries & Distilleries": "Beverage (Alcoholic)",
+    "Confectioners": "Food Processing",
+    "Farm Products": "Farming/Agriculture",
+    "Tobacco": "Tobacco",
+    "Restaurants": "Restaurant/Dining",
+    "Leisure": "Recreation",
+    "Resorts & Casinos": "Hotel/Gaming",
+    "Lodging": "Hotel/Gaming",
+    "Gambling": "Hotel/Gaming",
+    "Furnishings, Fixtures & Appliances": "Furn/Home Furnishings",
+    "Personal Services": "Business & Consumer Services",
+    "Education & Training Services": "Education",
+    "Luxury Goods": "Retail (Special Lines)",
+    "Aerospace & Defense": "Aerospace/Defense",
+    "Airlines": "Air Transport",
+    "Airports & Air Services": "Air Transport",
+    "Railroads": "Transportation (Railroads)",
+    "Trucking": "Trucking",
+    "Marine Shipping": "Shipbuilding & Marine",
+    "Integrated Freight & Logistics": "Transportation",
+    "Specialty Industrial Machinery": "Machinery",
+    "Farm & Heavy Construction Machinery": "Machinery",
+    "Industrial Distribution": "Business & Consumer Services",
+    "Building Products & Equipment": "Building Materials",
+    "Engineering & Construction": "Engineering/Construction",
+    "Infrastructure Operations": "Engineering/Construction",
+    "Electrical Equipment & Parts": "Electrical Equipment",
+    "Waste Management": "Environmental & Waste Services",
+    "Pollution & Treatment Controls": "Environmental & Waste Services",
+    "Security & Protection Services": "Business & Consumer Services",
+    "Staffing & Employment Services": "Business & Consumer Services",
+    "Consulting Services": "Business & Consumer Services",
+    "Rental & Leasing Services": "Business & Consumer Services",
+    "Metal Fabrication": "Metals & Mining",
+    "Tools & Accessories": "Machinery",
+    "Auto Parts": "Auto Parts",
+    "Auto Manufacturers": "Auto & Truck",
+    "Recreational Vehicles": "Auto & Truck",
+    "Conglomerates": "Diversified",
+    "Business Equipment & Supplies": "Office Equipment & Services",
+    "Specialty Business Services": "Business & Consumer Services",
+    "Chemicals": "Chemical (Basic)",
+    "Specialty Chemicals": "Chemical (Specialty)",
+    "Agricultural Inputs": "Chemical (Basic)",
+    "Building Materials": "Building Materials",
+    "Steel": "Steel",
+    "Aluminum": "Metals & Mining",
+    "Copper": "Metals & Mining",
+    "Other Industrial Metals & Mining": "Metals & Mining",
+    "Gold": "Precious Metals",
+    "Silver": "Precious Metals",
+    "Coking Coal": "Coal & Related Energy",
+    "Thermal Coal": "Coal & Related Energy",
+    "Paper & Paper Products": "Paper/Forest Products",
+    "Lumber & Wood Production": "Paper/Forest Products",
+    "Packaging & Containers": "Packaging & Container",
+    "Oil & Gas E&P": "Oil/Gas (Production and Exploration)",
+    "Oil & Gas Integrated": "Oil/Gas (Integrated)",
+    "Oil & Gas Midstream": "Oil/Gas Distribution",
+    "Oil & Gas Refining & Marketing": "Oil/Gas Distribution",
+    "Oil & Gas Equipment & Services": "Oilfield Svcs/Equip.",
+    "Oil & Gas Drilling": "Oilfield Svcs/Equip.",
+    "Uranium": "Coal & Related Energy",
+    "Utilities—Regulated Electric": "Utility (General)",
+    "Utilities—Regulated Gas": "Utility (General)",
+    "Utilities—Regulated Water": "Utility (Water)",
+    "Utilities—Diversified": "Utility (General)",
+    "Utilities—Renewable": "Green & Renewable Energy",
+    "Utilities—Independent Power Producers": "Power",
+    "Telecom Services": "Telecom. Services",
+    "Broadcasting": "Broadcasting",
+    "Entertainment": "Entertainment",
+    "Publishing": "Publishing & Newspapers",
+    "Advertising Agencies": "Advertising",
+}
+DAMODARAN_TOTAL_MARKET_EX_FIN = {"roic_benchmark_pct": 17.69, "rnd_benchmark_pct": 4.14}
+
+def get_industry_benchmarks(yf_industry):
+    """yfinance info['industry'] 문자열을 받아 Damodaran 업종별 ROIC/R&D 벤치마크를 반환.
+    매핑에 없거나 입력이 비어있으면 Total Market(ex-금융) 평균으로 폴백(사용자 승인 사항).
+    반환: {"industry_used": str, "roic_benchmark_pct": float, "rnd_benchmark_pct": float,
+           "rnd_applicable": bool, "matched": bool}
+    rnd_applicable=False면 해당 종목 업종은 R&D 비중이 구조적으로 유의미하지 않다고 보고
+    moat 채점에서 R&D 기준 자체를 제외해야 함(가중치는 남은 기준들로 재분배)."""
+    damodaran_name = YFINANCE_INDUSTRY_TO_DAMODARAN.get(yf_industry) if isinstance(yf_industry, str) else None
+    if damodaran_name and damodaran_name in DAMODARAN_INDUSTRY_BENCHMARKS:
+        bench = DAMODARAN_INDUSTRY_BENCHMARKS[damodaran_name]
+        display_name = damodaran_name
+        matched = True
+    else:
+        bench = DAMODARAN_TOTAL_MARKET_EX_FIN
+        display_name = "Total Market (ex-금융, 업종 미매칭 폴백)"
+        matched = False
+    rnd_val = bench["rnd_benchmark_pct"]
+    return {
+        "industry_used": display_name,
+        "roic_benchmark_pct": bench["roic_benchmark_pct"],
+        "rnd_benchmark_pct": rnd_val,
+        "rnd_applicable": rnd_val >= RND_APPLICABILITY_CUTOFF_PCT,
+        "matched": matched,
+    }
 
 def get_current_kst_time_str():
     return datetime.now(KST).strftime("%Y-%m-%d %H:%M")
@@ -718,30 +1020,60 @@ def fetch_nearest_options_data(ticker: str, retries: int = 2):
             return None
     return None
 
+def _fetch_fred_yield_series(series_id, fred_api_key):
+    """FRED 국채금리 시리즈 1개를 조회해 {source, value(문자열 표기), value_num(숫자), date}로 반환.
+    실패/결측 시 전부 N/A로 안전 폴백 (기존 us_10y_yield 단일 조회 로직과 동일한 방식)."""
+    fallback = {"source": "FRED API", "value": "N/A", "value_num": None, "date": "N/A"}
+    if not fred_api_key: return fallback
+    try:
+        url = "https://api.stlouisfed.org/fred/series/observations"
+        params = {"series_id": series_id, "api_key": fred_api_key, "file_type": "json", "sort_order": "desc", "limit": 5}
+        response = GLOBAL_SESSION.get(url, params=params, timeout=15)
+        response.raise_for_status()
+        data = response.json().get("observations", [])
+        for obs in data:
+            if obs["value"] != ".":
+                val = round(float(obs["value"]), 2)
+                return {"source": "FRED API", "value": f"{val}%", "value_num": val, "date": obs["date"]}
+        return fallback
+    except Exception:
+        return fallback
+
 @st.cache_data(ttl=300)
 def fetch_macro_indicators():
     macro_data = {}
     try:
-        fred_api_key = os.getenv("FRED_API_KEY") 
+        fred_api_key = os.getenv("FRED_API_KEY")
         if not fred_api_key:
             try: fred_api_key = st.secrets["FRED_API_KEY"]
             except: pass
-        if fred_api_key:
-            url = "https://api.stlouisfed.org/fred/series/observations"
-            params = {"series_id": "DGS10", "api_key": fred_api_key, "file_type": "json", "sort_order": "desc", "limit": 5}
-            response = GLOBAL_SESSION.get(url, params=params, timeout=15)
-            response.raise_for_status()
-            data = response.json().get("observations", [])
-            valid_data_found = False
-            for obs in data:
-                if obs["value"] != ".":
-                    macro_data["us_10y_yield"] = {"source": "FRED API", "value": f"{round(float(obs['value']), 2)}%", "date": obs["date"]}
-                    valid_data_found = True
-                    break
-            if not valid_data_found: macro_data["us_10y_yield"] = {"source": "FRED API", "value": "N/A", "date": "N/A"}
-        else: macro_data["us_10y_yield"] = {"source": "FRED API", "value": "N/A", "date": "N/A"}
-    except Exception: macro_data["us_10y_yield"] = {"source": "FRED API", "value": "N/A", "date": "N/A"}
-    
+
+        # [신규, 2026-09] 사용자 요청(국채 수익률 곡선 분석)에 따라 10년물 단일 조회에서
+        # 3개월/1년/2년/5년/10년물 5개 만기 조회로 확장. us_10y_yield 키/스키마는 기존과
+        # 100% 동일하게 유지(하위 호환) - 기존에 이 키를 참조하는 UI/캡션 코드가 그대로 동작함.
+        yield_series_map = {"DGS3MO": "us_3m_yield", "DGS1": "us_1y_yield", "DGS2": "us_2y_yield", "DGS5": "us_5y_yield", "DGS10": "us_10y_yield"}
+        for series_id, key_name in yield_series_map.items():
+            macro_data[key_name] = _fetch_fred_yield_series(series_id, fred_api_key)
+
+        # [신규, 2026-09] 장단기 스프레드(10Y-2Y, 10Y-3M) 및 정상/역전 여부를 코드에서 미리 계산해
+        # 함께 제공 - 경기 국면(침체 선행지표) 판단에 개별 만기 수준보다 스프레드가 더 핵심적인 신호.
+        def _spread(long_key, short_key):
+            lv, sv = macro_data.get(long_key, {}).get("value_num"), macro_data.get(short_key, {}).get("value_num")
+            if not isinstance(lv, (int, float)) or not isinstance(sv, (int, float)):
+                return {"spread_pct": "N/A", "status": "판정불가 (데이터 부족)"}
+            spread = round(lv - sv, 2)
+            status = "🔴 역전 (장단기금리 역전 - 경기침체 선행 신호로 통상 해석됨)" if spread < 0 else "🟢 정상 (우상향 곡선)"
+            return {"spread_pct": spread, "status": status}
+        macro_data["us_treasury_yield_curve"] = {
+            "maturities": {"3m": macro_data.get("us_3m_yield"), "1y": macro_data.get("us_1y_yield"), "2y": macro_data.get("us_2y_yield"), "5y": macro_data.get("us_5y_yield"), "10y": macro_data.get("us_10y_yield")},
+            "10y_minus_2y_spread": _spread("us_10y_yield", "us_2y_yield"),
+            "10y_minus_3m_spread": _spread("us_10y_yield", "us_3m_yield"),
+        }
+    except Exception:
+        for key_name in ["us_3m_yield", "us_1y_yield", "us_2y_yield", "us_5y_yield", "us_10y_yield"]:
+            macro_data.setdefault(key_name, {"source": "FRED API", "value": "N/A", "value_num": None, "date": "N/A"})
+        macro_data.setdefault("us_treasury_yield_curve", {"maturities": {}, "10y_minus_2y_spread": {"spread_pct": "N/A", "status": "판정불가"}, "10y_minus_3m_spread": {"spread_pct": "N/A", "status": "판정불가"}})
+
     asset_map = {"^VIX": ("vix", "CBOE Volatility Index"), "DX-Y.NYB": ("dollar_index", "ICE US Dollar Index"), "CL=F": ("wti_oil", "NYMEX WTI Crude Oil"), "GC=F": ("gold", "COMEX Gold Futures"), "BTC-USD": ("bitcoin", "Binance/Coinbase Crypto Market")}
     try:
         tickers = list(asset_map.keys())
@@ -884,9 +1216,23 @@ def fetch_earnings_calendar(stock, info, high_52_calc, low_52_calc):
 def _get_psr_multiple(g): return 8.0 if g and g >= 30 else (5.0 if g and g >= 15 else (3.0 if g and g >= 5 else (1.5 if g else 3.0)))
 
 @st.cache_data(ttl=300, show_spinner=False)
-def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc):
+def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_calc, low_52_calc, risk_free_rate_pct=None):
     stock = yf.Ticker(ticker)
     info, info_source = get_stock_info_with_retry(stock, retries=2)
+
+    # [신규, 2026-09] CAPM 기반 자기자본비용(Ke) 산출 - value_models.roe_pbr의 고정 요구수익률
+    # 10%와 growth_models.dcf_growth의 고정 WACC 9%를 모두 이 값 기반으로 대체(사용자 승인:
+    # "1번 2번 모두 하자" + ERP 공식 확인 후 "그대로 진행해줘"). risk_free_rate_pct(FRED 10Y
+    # 국채금리)가 없으면 None이 되어, 아래 각 사용처에서 기존 고정값(10%/9%)으로 안전 폴백한다.
+    beta_raw = info.get("beta", None) if isinstance(info, dict) else None
+    cost_of_equity_pct = calculate_cost_of_equity_pct(risk_free_rate_pct, beta_raw)
+    required_return_pct_for_pbr = cost_of_equity_pct if isinstance(cost_of_equity_pct, (int, float)) else 10.0
+
+    # [신규, 2026-09] 업종별 차등 moat 임계값(ROIC/R&D비중)에 쓰이는 Damodaran 업종 벤치마크 조회.
+    # yfinance info['industry']를 최대한 매칭하고, 매칭 실패/데이터 없음 시 Total Market(ex-금융)로
+    # 폴백(사용자 승인 사항) - calculate_pre_scores의 moat 스코어링에서 소비.
+    yf_industry = info.get("industry", None) if isinstance(info, dict) else None
+    industry_benchmarks = get_industry_benchmarks(yf_industry)
 
     # (item 30-2 fade out, 2026-09-03) stock.fast_info 백업 폴백 제거.
     # 기존엔 marketCap 결측 시(ETF/ADR/신규상장 등 stock.info 자체는 정상 응답한 경우 포함)
@@ -994,14 +1340,6 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
             return value
         except Exception: return "산출불가 (해당없음)"
 
-    value_models = {}
-    try: value_models["graham"] = _value_model_sanity(round(math.sqrt(22.5 * float(eps) * float(bps)), 2), "graham") if eps and bps and eps > 0 and bps > 0 else "산출불가 (해당없음)"
-    except Exception: value_models["graham"] = "산출불가 (해당없음)"
-    try: value_models["peter_lynch"] = _value_model_sanity(round(float(eps) * min(float(roe_raw) * 100, 25.0), 2), "peter_lynch") if eps and eps > 0 and roe_raw and roe_raw > 0 else "산출불가 (해당없음)"
-    except Exception: value_models["peter_lynch"] = "산출불가 (해당없음)"
-    try: value_models["roe_pbr"] = _value_model_sanity(round(float(bps) * (float(roe_raw) / 0.10), 2), "roe_pbr") if bps and bps > 0 and roe_raw and roe_raw > 0 else "산출불가 (해당없음)"
-    except Exception: value_models["roe_pbr"] = "산출불가 (해당없음)"
-
     def _sanity_capped(value, label):
         try:
             if not isinstance(value, (int, float)): return "산출불가 (해당없음)"
@@ -1009,6 +1347,27 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
             if abs(value - curr_price) / curr_price > 0.6: return f"산출불가 (모델 괴리율 과다: {abs(value - curr_price) / curr_price * 100:.0f}%)"
             return f"{value} (참고용·추정성장률 가정치)" if used_growth_fallback else value
         except Exception: return "산출불가 (해당없음)"
+
+    value_models = {}
+    try: value_models["graham"] = _value_model_sanity(round(math.sqrt(22.5 * float(eps) * float(bps)), 2), "graham") if eps and bps and eps > 0 and bps > 0 else "산출불가 (해당없음)"
+    except Exception: value_models["graham"] = "산출불가 (해당없음)"
+    # [수정, 2026-09] 기존엔 ROE를 대입해 "피터 린치"라는 이름과 실제 산식이 불일치했음(사용자 지적으로
+    # 검증 - GuruFocus/StableBread 등 실제 린치 공식은 전부 EPS×성장률 계열이며 ROE를 쓰는 버전은
+    # 존재하지 않음). growth_models와 동일한 est_growth(실측 EPS 성장률/매출 기반 보수적 추정치)로
+    # 교체. 25% 초과 캡·5% 미만 미산출 둘 다 GuruFocus 정의 그대로 - 5% 미만은 "참고할만한 결과가
+    # 아니다"라는 사용자 판단에 따라 임의 완화 없이 산출불가 처리(사용자 승인 완료, 2026-09).
+    try:
+        if not (eps and eps > 0):
+            value_models["peter_lynch"] = "산출불가 (해당없음)"
+        elif est_growth is None:
+            value_models["peter_lynch"] = "산출불가 (신뢰 가능한 성장률 데이터 없음)"
+        elif est_growth < 5.0:
+            value_models["peter_lynch"] = "산출불가 (성장률 5% 미만 - 린치 공식 적용대상 아님)"
+        else:
+            value_models["peter_lynch"] = _sanity_capped(round(float(eps) * min(est_growth, 25.0), 2), "peter_lynch")
+    except Exception: value_models["peter_lynch"] = "산출불가 (해당없음)"
+    try: value_models["roe_pbr"] = _value_model_sanity(round(float(bps) * (float(roe_raw) / (required_return_pct_for_pbr / 100.0)), 2), "roe_pbr") if bps and bps > 0 and roe_raw and roe_raw > 0 else "산출불가 (해당없음)"
+    except Exception: value_models["roe_pbr"] = "산출불가 (해당없음)"
 
     def _get_fair_peg_multiple(g): return 1.8 if g and g >= 30 else (1.3 if g and g >= 15 else (1.0 if g else None))
     # _get_psr_multiple()는 이제 모듈 레벨 함수(위쪽)로 승격되어 있어 여기서 다시 정의하지 않음.
@@ -1027,44 +1386,214 @@ def fetch_fundamentals_and_valuation(ticker: str, curr_price: float, high_52_cal
     try: growth_models["psr_target"] = _sanity_capped(round(float(revenue_per_share) * psr_multiple, 2), "psr_target") if revenue_per_share and revenue_per_share > 0 else "산출불가 (해당없음)"
     except Exception: growth_models["psr_target"] = "산출불가 (해당없음)"
 
-    def _calc_real_fcf_dcf(stock_obj, growth_rate, shares_out):
+    def _estimate_cost_of_debt_pct(stock_obj, total_debt, rf_pct):
+        """실효 이자율(이자비용/총부채)을 우선 시도하고, 데이터가 없거나 상식 밖 범위(1~15%)면
+        '무위험금리 + 신용스프레드 가정치(1.5%p, 투자등급 평균 근사)'로 폴백. 무위험금리마저
+        없으면 최종적으로 평시 평균 회사채 금리 근사치(5.5%)로 폴백."""
+        try:
+            inc = stock_obj.financials
+            if not inc.empty and isinstance(total_debt, (int, float)) and total_debt > 0:
+                for label in ["Interest Expense", "Interest Expense Non Operating"]:
+                    if label in inc.index:
+                        ie = inc.loc[label].iloc[0]
+                        if pd.notnull(ie) and ie != 0:
+                            implied = (abs(float(ie)) / total_debt) * 100
+                            if 1.0 <= implied <= 15.0:
+                                return round(implied, 2)
+                        break
+        except Exception:
+            pass
+        return round(rf_pct + 1.5, 2) if isinstance(rf_pct, (int, float)) else 5.5
+
+    def _calc_real_fcf_dcf(stock_obj, growth_rate, shares_out, ke_pct=None, mkt_cap=None, rf_pct=None):
+        # [신규, 2026-09] WACC 9% 고정값 대신, CAPM 자기자본비용(Ke)과 부채비중을 반영한 정식
+        # WACC = (E/V)×Ke + (D/V)×Kd×(1-세율)로 동적 산출. Ke/시가총액 데이터가 없으면(FRED 실패,
+        # 베타 없음, marketCap 없음 등) 기존 고정 9%로 안전 폴백 - 항상 이전과 동일하거나 더 정교한
+        # 결과만 나오도록 함. FCF 데이터 유무와 무관하게 항상 먼저 계산 - UI에 실제 적용된 WACC를
+        # 그대로 노출하기 위해 (result, wacc_pct) 튜플로 반환한다(사용자 요청: WACC 자체도 화면에
+        # 표시할 만큼 의미 있는 수치).
+        wacc = 0.09
+        try:
+            if isinstance(ke_pct, (int, float)) and isinstance(mkt_cap, (int, float)) and mkt_cap > 0:
+                bs = stock_obj.balance_sheet
+                total_debt_val = float(bs.loc["Total Debt"].iloc[0]) if not bs.empty and "Total Debt" in bs.index and pd.notnull(bs.loc["Total Debt"].iloc[0]) else 0.0
+                total_capital = mkt_cap + total_debt_val
+                weight_equity, weight_debt = mkt_cap / total_capital, total_debt_val / total_capital
+                kd_pct = _estimate_cost_of_debt_pct(stock_obj, total_debt_val, rf_pct)
+                tax_rate_assumed = 0.21
+                computed_wacc = (weight_equity * (ke_pct / 100.0)) + (weight_debt * (kd_pct / 100.0) * (1 - tax_rate_assumed))
+                wacc = max(0.04, min(computed_wacc, 0.20))  # 극단치 방지(터미널밸류 division 안전 범위 포함)
+        except Exception:
+            wacc = 0.09
+        wacc_pct = round(wacc * 100, 2)
+
+        # [신규, 2026-09, 41-1] 단일연도 FCF의 CAPEX 사이클 왜곡(신공장 등 일시적 대규모 설비투자로
+        # 특정 연도만 튀는 문제) 완화. OCF(영업현금흐름)는 최신연도 값을 그대로 쓰고(성장기업의 최근
+        # 실적 반영을 보존하기 위해 - 여러 해를 평균내면 성장기업은 오히려 저평가됨), CAPEX만 최근
+        # 최대 3개년 평균으로 정규화(기존 3y_fcf_status의 3년 윈도를 재사용 - 새 임의 상수 도입 안 함).
+        # FCF = OCF + CAPEX(CAPEX는 이미 음수로 저장됨)라는 관계는 AAPL 4개년 실측치로 소수점까지
+        # 검증 완료. CAPEX 항목명이 종목별로 "Capital Expenditure" 또는 "Capital Expenditure Reported"
+        # 로 갈리는 것도 AAPL/MU 비교로 실측 확인 - 존재/비NaN인 것을 순서대로 시도. OCF나 CAPEX 중
+        # 하나라도 못 구하면 기존 방식(Free Cash Flow 단일연도)으로 안전 폴백 - 항상 이전과 동일하거나
+        # 더 정교한 결과만 나오도록 하는 기존 원칙 유지(사용자 승인 완료).
+        def _get_normalized_fcf(cf_df):
+            try:
+                if "Operating Cash Flow" not in cf_df.index: return None
+                ocf_series = cf_df.loc["Operating Cash Flow"].dropna()
+                if ocf_series.empty: return None
+                latest_ocf = float(ocf_series.iloc[0])
+                capex_series = None
+                for label in ["Capital Expenditure", "Capital Expenditure Reported"]:
+                    if label in cf_df.index:
+                        s = cf_df.loc[label].dropna()
+                        if not s.empty:
+                            capex_series = s
+                            break
+                if capex_series is None: return None
+                capex_avg = float(capex_series.iloc[:3].mean())
+                return round(latest_ocf + capex_avg, 2)
+            except Exception:
+                return None
+
         try:
             cf = stock_obj.cashflow
-            if cf.empty or "Free Cash Flow" not in cf.index: return "산출불가 (FCF 데이터 없음)"
+            if cf.empty or "Free Cash Flow" not in cf.index: return "산출불가 (FCF 데이터 없음)", wacc_pct, "해당없음"
             fcf_series = cf.loc["Free Cash Flow"].dropna()
-            if fcf_series.empty: return "산출불가 (FCF 데이터 없음)"
-            if not shares_out or shares_out <= 0: return "산출불가 (발행주식수 데이터 없음)"
-            latest_fcf = float(fcf_series.iloc[0])
-            if latest_fcf <= 0: return "산출불가 (최근 FCF 마이너스 - 성장할인모델 부적합)"
-            if growth_rate is None: return "산출불가 (신뢰 가능한 성장률 데이터 없음)"
-            wacc, g_long, g_start, pv_sum, cur_fcf = 0.09, 0.025, growth_rate / 100, 0.0, latest_fcf
+            if fcf_series.empty: return "산출불가 (FCF 데이터 없음)", wacc_pct, "해당없음"
+            if not shares_out or shares_out <= 0: return "산출불가 (발행주식수 데이터 없음)", wacc_pct, "해당없음"
+
+            normalized_fcf = _get_normalized_fcf(cf)
+            if isinstance(normalized_fcf, (int, float)):
+                base_fcf, fcf_base_method = normalized_fcf, "정규화(최신 OCF - CAPEX 최근 3개년 평균)"
+            else:
+                base_fcf, fcf_base_method = float(fcf_series.iloc[0]), "단일연도 FCF (OCF/CAPEX 데이터 부족 - 폴백)"
+            if base_fcf <= 0: return "산출불가 (최근 FCF 마이너스 - 성장할인모델 부적합)", wacc_pct, fcf_base_method
+            if growth_rate is None: return "산출불가 (신뢰 가능한 성장률 데이터 없음)", wacc_pct, fcf_base_method
+
+            g_long, g_start, pv_sum, cur_fcf = 0.025, growth_rate / 100, 0.0, base_fcf
             for y in range(1, 6):
                 cur_fcf *= (1 + (g_start - (g_start - g_long) * (y - 1) / 4))
                 pv_sum += cur_fcf / ((1 + wacc) ** y)
-            return round((pv_sum + ((cur_fcf * (1 + g_long)) / (wacc - g_long)) / ((1 + wacc) ** 5)) / shares_out, 2)
-        except Exception: return "산출불가 (해당없음)"
+            return round((pv_sum + ((cur_fcf * (1 + g_long)) / (wacc - g_long)) / ((1 + wacc) ** 5)) / shares_out, 2), wacc_pct, fcf_base_method
+        except Exception: return "산출불가 (해당없음)", wacc_pct, "해당없음"
 
-    raw_dcf = _calc_real_fcf_dcf(stock, est_growth, shares_outstanding)
+    raw_dcf, dcf_wacc_pct, dcf_fcf_base_method = _calc_real_fcf_dcf(stock, est_growth, shares_outstanding, cost_of_equity_pct, market_cap, risk_free_rate_pct)
     growth_models["dcf_growth"] = _sanity_capped(raw_dcf, "dcf_growth") if isinstance(raw_dcf, (int, float)) else raw_dcf
-    growth_models["_assumptions_used"] = {"growth_rate_used": f"{est_growth:.1f}%" if est_growth is not None else "N/A", "growth_rate_source": growth_source or "해당없음", "peg_multiple_used": peg_multiple, "psr_multiple_used": psr_multiple}
+    growth_models["_assumptions_used"] = {"growth_rate_used": f"{est_growth:.1f}%" if est_growth is not None else "N/A", "growth_rate_source": growth_source or "해당없음", "peg_multiple_used": peg_multiple, "psr_multiple_used": psr_multiple, "dcf_fcf_base_method": dcf_fcf_base_method}
 
-    return {"info_source": info_source, "market_cap_fmt": format_market_cap(market_cap), "trailing_pe": round(trailing_pe, 2) if isinstance(trailing_pe, (int, float)) else trailing_pe, "forward_pe": round(forward_pe, 2) if isinstance(forward_pe, (int, float)) else forward_pe, "pbr": round(pbr, 2) if isinstance(pbr, (int, float)) else pbr, "ps_ratio": round(ps_ratio, 2) if isinstance(ps_ratio, (int, float)) else ps_ratio, "roe": f"{roe_pct}%" if roe_pct != "N/A" else "N/A", "target_mean_price": target_mean_price, "quality_factors": quality_factors, "long_term_quality": long_term_quality, "growth_factors": growth_factors, "ownership_and_shorts": ownership_and_shorts, "hedge_and_short_intel": hedge_and_short_intel, "earnings_calendar": earnings_cal, "value_models": value_models, "growth_models": growth_models}
+    # [신규, 2026-09] CAPM 산출 근거 투명 공개 - 다운로드 JSON에도 그대로 노출되어 검증 가능.
+    capm_assumptions = {
+        "risk_free_rate_pct_used": risk_free_rate_pct if isinstance(risk_free_rate_pct, (int, float)) else "N/A (FRED 10Y 데이터 없음 - roe_pbr 10%/DCF WACC 9% 고정값 폴백 적용)",
+        "beta_used": beta_raw if isinstance(beta_raw, (int, float)) else f"{DEFAULT_BETA_FALLBACK} (베타 데이터 없음 - 시장평균 리스크 가정)",
+        "erp_used_pct": US_EQUITY_RISK_PREMIUM_PCT,
+        "cost_of_equity_pct": cost_of_equity_pct if isinstance(cost_of_equity_pct, (int, float)) else "N/A (10% 고정값 폴백 적용)",
+        "dcf_wacc_pct": dcf_wacc_pct
+    }
+
+    return {"info_source": info_source, "market_cap_fmt": format_market_cap(market_cap), "trailing_pe": round(trailing_pe, 2) if isinstance(trailing_pe, (int, float)) else trailing_pe, "forward_pe": round(forward_pe, 2) if isinstance(forward_pe, (int, float)) else forward_pe, "pbr": round(pbr, 2) if isinstance(pbr, (int, float)) else pbr, "ps_ratio": round(ps_ratio, 2) if isinstance(ps_ratio, (int, float)) else ps_ratio, "roe": f"{roe_pct}%" if roe_pct != "N/A" else "N/A", "target_mean_price": target_mean_price, "quality_factors": quality_factors, "long_term_quality": long_term_quality, "growth_factors": growth_factors, "ownership_and_shorts": ownership_and_shorts, "hedge_and_short_intel": hedge_and_short_intel, "earnings_calendar": earnings_cal, "value_models": value_models, "growth_models": growth_models, "capm_assumptions": capm_assumptions, "cost_of_equity_pct": cost_of_equity_pct, "dcf_wacc_pct": dcf_wacc_pct, "industry_benchmarks": industry_benchmarks}
+
+SECTOR_ETFS = {"XLK": "IT/기술 (Technology)", "XLC": "커뮤니케이션 (Communication Services)", "XLY": "임의소비재 (Consumer Discretionary)", "XLP": "필수소비재 (Consumer Staples)", "XLF": "금융 (Financials)", "XLV": "헬스케어 (Health Care)", "XLI": "산업재 (Industrials)", "XLE": "에너지 (Energy)", "XLB": "소재 (Materials)", "XLU": "유틸리티 (Utilities)", "XLRE": "부동산 (Real Estate)"}
+RRG_BENCHMARK_SYMBOL = "SPY"
+RRG_MA_WINDOW, RRG_MOMENTUM_LOOKBACK, RRG_TAIL_LEN = 14, 52, 8
 
 @st.cache_data(ttl=300)
-def fetch_sector_performance():
-    sector_etfs = {"XLK": "IT/기술 (Technology)", "XLC": "커뮤니케이션 (Communication Services)", "XLY": "임의소비재 (Consumer Discretionary)", "XLP": "필수소비재 (Consumer Staples)", "XLF": "금융 (Financials)", "XLV": "헬스케어 (Health Care)", "XLI": "산업재 (Industrials)", "XLE": "에너지 (Energy)", "XLB": "소재 (Materials)", "XLU": "유틸리티 (Utilities)", "XLRE": "부동산 (Real Estate)"}
-    summary = {}
+def fetch_sector_rotation():
+    """[교체, 2026-09, 41-신규] 기존 fetch_sector_performance()(11개 섹터 ETF의 단순 등락률
+    스냅샷)를 RRG(Relative Rotation Graph) 방식 섹터 로테이션 분석으로 대체(사용자 승인 완료).
+    ⚠️ 중요: "JdK RS-Ratio/RS-Momentum"의 정확한 산출식은 원 제작사(relativerotationgraphs.com,
+    "Relative Rotation Graphs®"는 상표 등록됨)가 공개한 적이 없음 - 아래는 여러 독립 오픈소스
+    구현(RRG-Lite 등)이 공통으로 쓰는 근사 공식이며, 공식 RRG®와 수치가 동일함을 보장하지 않음
+    (사용자 확인 후 진행).
+    벤치마크: SPY(S&P500, 시가총액가중) 고정. 주봉(weekly) 기준 - RS = 섹터종가/SPY종가×100,
+    RS-Ratio = RS를 14주 이동평균/표준편차로 Z-score 정규화(100 기준선), RS-Momentum = RS-Ratio의
+    52주 변화율을 다시 동일한 14주 Z-score로 정규화(100 기준선). 두 지표 모두 100 위/아래로
+    4사분면(Leading/Weakening/Lagging/Improving) 분류.
+    반환 구조: {"benchmark": "SPY", "sectors": {etf: {sector_name, rs_ratio, rs_momentum, quadrant,
+    return_1m, status}}, "history": {etf: {sector_name, tail_rs_ratio:[...], tail_rs_momentum:[...]}},
+    "data_status": "OK"/에러 메시지}
+    """
+    result = {"benchmark": RRG_BENCHMARK_SYMBOL, "sectors": {}, "history": {}, "data_status": "OK"}
     try:
-        df = yf.download(list(sector_etfs.keys()), period="1mo", progress=False)['Close']
-        for etf, name in sector_etfs.items():
+        tickers = list(SECTOR_ETFS.keys()) + [RRG_BENCHMARK_SYMBOL]
+        df = yf.download(tickers, period="2y", interval="1wk", progress=False)['Close']
+        if RRG_BENCHMARK_SYMBOL not in df.columns or df[RRG_BENCHMARK_SYMBOL].dropna().empty:
+            raise ValueError("벤치마크(SPY) 데이터 없음")
+        spy = df[RRG_BENCHMARK_SYMBOL]
+        for etf, name in SECTOR_ETFS.items():
             try:
-                hist = df[etf].dropna()
-                if len(hist) >= 2: summary[etf] = {"sector_name": name, "return_5d": f"{((hist.iloc[-1] - hist.iloc[-5]) / hist.iloc[-5] * 100) if len(hist) >= 5 else ((hist.iloc[-1] - hist.iloc[0]) / hist.iloc[0] * 100):+.2f}%", "return_1m": f"{((hist.iloc[-1] - hist.iloc[0]) / hist.iloc[0] * 100):+.2f}%", "latest_close": round(float(hist.iloc[-1]), 2)}
-                else: summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
-            except Exception: summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
+                if etf not in df.columns: raise ValueError("종목 데이터 없음")
+                aligned = pd.concat([df[etf], spy], axis=1, keys=["sec", "bench"]).dropna()
+                min_needed = RRG_MOMENTUM_LOOKBACK + RRG_MA_WINDOW + RRG_TAIL_LEN
+                if len(aligned) < min_needed:
+                    result["sectors"][etf] = {"sector_name": name, "status": f"산출불가 (데이터 기간 부족 - 최소 {min_needed}주 필요)"}
+                    continue
+
+                rs = aligned["sec"] / aligned["bench"] * 100
+                rs_ma, rs_std = rs.rolling(RRG_MA_WINDOW).mean(), rs.rolling(RRG_MA_WINDOW).std()
+                rs_ratio = 100 + (rs - rs_ma) / rs_std
+                mom_raw = (rs_ratio / rs_ratio.shift(RRG_MOMENTUM_LOOKBACK) - 1) * 100
+                mom_ma, mom_std = mom_raw.rolling(RRG_MA_WINDOW).mean(), mom_raw.rolling(RRG_MA_WINDOW).std()
+                rs_momentum = 100 + (mom_raw - mom_ma) / mom_std
+
+                combined = pd.concat([rs_ratio.rename("rs_ratio"), rs_momentum.rename("rs_momentum")], axis=1).dropna()
+                if combined.empty:
+                    result["sectors"][etf] = {"sector_name": name, "status": "산출불가 (정규화 구간 부족)"}
+                    continue
+
+                tail = combined.tail(RRG_TAIL_LEN)
+                lr, lm = float(tail["rs_ratio"].iloc[-1]), float(tail["rs_momentum"].iloc[-1])
+                if lr >= 100 and lm >= 100: quadrant = "Leading (주도)"
+                elif lr >= 100 and lm < 100: quadrant = "Weakening (약화)"
+                elif lr < 100 and lm < 100: quadrant = "Lagging (지연)"
+                else: quadrant = "Improving (개선)"
+
+                sec_close = aligned["sec"]
+                return_1m = f"{((sec_close.iloc[-1] - sec_close.iloc[-5]) / sec_close.iloc[-5] * 100):+.2f}%" if len(sec_close) >= 5 else "N/A"
+
+                result["sectors"][etf] = {"sector_name": name, "rs_ratio": round(lr, 2), "rs_momentum": round(lm, 2), "quadrant": quadrant, "return_1m": return_1m, "status": "OK"}
+                result["history"][etf] = {"sector_name": name, "tail_rs_ratio": [round(v, 2) for v in tail["rs_ratio"].tolist()], "tail_rs_momentum": [round(v, 2) for v in tail["rs_momentum"].tolist()]}
+            except Exception:
+                result["sectors"][etf] = {"sector_name": name, "status": "산출불가 (해당없음)"}
     except Exception:
-        for etf, name in sector_etfs.items(): summary[etf] = {"sector_name": name, "return_5d": "N/A", "return_1m": "N/A", "latest_close": "N/A"}
-    return summary
+        result["data_status"] = "산출불가 (섹터 로테이션 데이터 조회 실패)"
+        for etf, name in SECTOR_ETFS.items():
+            result["sectors"][etf] = {"sector_name": name, "status": "산출불가 (해당없음)"}
+    return result
+
+def build_rrg_chart(rotation_data):
+    """섹터 로테이션(RRG) 산점도 - 사분면 배경/기준선(100) + 최근 RRG_TAIL_LEN주 궤적(꼬리) 시각화.
+    이 앱 최초의 차트 렌더링 기능(plotly, 사용자 승인 완료, 2026-09)."""
+    quadrant_colors = {"Leading (주도)": "#2ecc71", "Weakening (약화)": "#f1c40f", "Lagging (지연)": "#e74c3c", "Improving (개선)": "#3498db"}
+    fig = go.Figure()
+    xs_all, ys_all = [], []
+    for etf, hist in (rotation_data.get("history") or {}).items():
+        xs, ys = hist.get("tail_rs_ratio") or [], hist.get("tail_rs_momentum") or []
+        if not xs or not ys or len(xs) != len(ys): continue
+        xs_all.extend(xs); ys_all.extend(ys)
+        sec_info = (rotation_data.get("sectors") or {}).get(etf, {})
+        color = quadrant_colors.get(sec_info.get("quadrant"), "#888888")
+        marker_sizes = [6] * (len(xs) - 1) + [12]
+        fig.add_trace(go.Scatter(
+            x=xs, y=ys, mode="lines+markers",
+            name=f"{etf} ({sec_info.get('sector_name', '')})",
+            line=dict(color=color, width=2), marker=dict(color=color, size=marker_sizes, line=dict(width=1, color="white")),
+            hovertemplate=f"<b>{etf}</b><br>RS-Ratio: %{{x:.2f}}<br>RS-Momentum: %{{y:.2f}}<extra></extra>"
+        ))
+    if xs_all and ys_all:
+        pad_x = max(1.0, (max(xs_all) - min(xs_all)) * 0.15)
+        pad_y = max(1.0, (max(ys_all) - min(ys_all)) * 0.15)
+        x_range = [min(xs_all) - pad_x, max(xs_all) + pad_x]
+        y_range = [min(ys_all) - pad_y, max(ys_all) + pad_y]
+    else:
+        x_range, y_range = [95, 105], [95, 105]
+    fig.add_shape(type="line", x0=100, x1=100, y0=y_range[0], y1=y_range[1], line=dict(color="gray", dash="dash", width=1))
+    fig.add_shape(type="line", x0=x_range[0], x1=x_range[1], y0=100, y1=100, line=dict(color="gray", dash="dash", width=1))
+    fig.update_layout(
+        xaxis_title="RS-Ratio (추세, 100=SPY 동일)", yaxis_title="RS-Momentum (모멘텀, 100=추세 불변)",
+        xaxis_range=x_range, yaxis_range=y_range, height=560, margin=dict(l=10, r=10, t=30, b=10),
+        legend=dict(orientation="h", yanchor="bottom", y=-0.35)
+    )
+    return fig
 
 @st.cache_data(ttl=300)
 def fetch_news(ticker: str, limit: int = 5):
@@ -1798,13 +2327,18 @@ def stage1_outlook_gate(curr_price, tech, s_moat, moat_detail, ret6_pct, backtes
     # 답하는 것이고, (2) 전통 가치평가 모델은 이 앱 스스로도 전통 제조업/청산가치 기준으로
     # 명시한 도구라 성장주에는 부적합함이 확인되어 폐기. 물타기든 분할매수든 "추가 투자
     # 유효성"을 가르는 핵심은 "이 사업의 본질적 경쟁력(해자)이 여전히 살아있는가"이므로
-    # s_moat(item 18의 4대 구조적 지표 - ROIC/매출총이익률/R&D비중/3년FCF흑자, 균등가중) 자체를
-    # 직접 기준으로 삼는다. 4개 중 과반(2개) 이상 미달 시 차단 - value_models 과반 판정에
-    # 쓰던 것과 동일한 "과반" 기준을 재사용해 임의성을 줄임.
+    # s_moat(item 18의 구조적 지표 - ROIC/매출총이익률/R&D비중/3년FCF흑자, 균등가중) 자체를
+    # 직접 기준으로 삼는다. 과반 이상 미달 시 차단 - value_models 과반 판정에 쓰던 것과 동일한
+    # "과반" 기준을 재사용해 임의성을 줄임.
+    # [신규, 2026-09] 업종별 R&D 비중이 구조적으로 미미한 종목(은행/리츠 등)은 R&D비중 지표가
+    # "해당없음"으로 채점 제외되고 가중치가 나머지 3개 지표로 재분배되므로, 활성 지표 수(N)는
+    # 종목의 업종에 따라 3 또는 4로 달라질 수 있다.
     if isinstance(s_moat, (int, float)) and s_moat < 5.0:
         failed_pillars = []
         for name, detail in (moat_detail or {}).items():
             val, ok, bar = detail
+            if ok is None:
+                continue  # [신규, 2026-09] 업종 특성상 "해당없음" 처리된 지표(예: R&D비중)는 미달로 보지 않고 제외
             if ok:
                 continue
             if bar is not None:
@@ -1814,7 +2348,7 @@ def stage1_outlook_gate(curr_price, tech, s_moat, moat_detail, ret6_pct, backtes
                 failed_pillars.append(f"{name} 미충족")
         pillar_text = ", ".join(failed_pillars) if failed_pillars else "상세 근거 없음"
         reasons_block.append(
-            f"해자(핵심 경쟁력) 훼손 - 4대 구조지표 과반 미달 (해자점수 {s_moat:.1f} < 5.0): {pillar_text}"
+            f"해자(핵심 경쟁력) 훼손 - 구조지표 과반 미달 (해자점수 {s_moat:.1f} < 5.0): {pillar_text}"
         )
 
     # (c) 백테스트 및 수급 이탈
@@ -1974,18 +2508,41 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
     gross_margin_val = parse_num(fund.get('quality_factors', {}).get('gross_margin', 0))
     rnd_pct_val = parse_num(fund.get('quality_factors', {}).get('rnd_to_revenue', 0))
     fcf_3y_ok = fund.get('long_term_quality', {}).get('3y_fcf_status', 'N/A') == "3년 연속 흑자 (+)"
-    if roic >= 15.0: s_moat += 2.5
-    if gross_margin_val >= 50.0: s_moat += 2.5
-    if rnd_pct_val >= 5.0: s_moat += 2.5
-    if fcf_3y_ok: s_moat += 2.5
+    # [업종별 차등 임계값, 2026-09] ROIC/R&D비중 문턱을 범용 고정값(15%/5%) 대신 Damodaran
+    # 업종 평균(fetch_fundamentals_and_valuation에서 미리 조회해 fund['industry_benchmarks']로
+    # 전달됨)을 그대로 통과선으로 사용(사용자 승인 "A안" - 배수 가중 없음, 평균 초과분의
+    # 우수함은 밸류에이션 등 다른 지표에서 별도 반영된다는 판단). 데이터가 아예 없으면(구버전
+    # fund dict 등) 기존 범용 고정값으로 안전 폴백.
+    # R&D비중은 업종 구조상 사실상 0에 가까운 업종(은행/보험/리츠 등)까지 강제 적용하면
+    # 부당하게 불리해지므로, 그런 업종은 rnd_applicable=False로 채점 자체에서 제외하고
+    # 가중치를 나머지 지표로 재분배한다(사용자 승인 사항).
+    industry_bench = fund.get('industry_benchmarks')
+    has_industry_data = isinstance(industry_bench, dict) and isinstance(industry_bench.get('roic_benchmark_pct'), (int, float))
+    if has_industry_data:
+        roic_threshold = industry_bench['roic_benchmark_pct']
+        rnd_threshold = industry_bench.get('rnd_benchmark_pct', 5.0)
+        rnd_applicable = bool(industry_bench.get('rnd_applicable', True))
+        industry_label = industry_bench.get('industry_used', 'N/A')
+        threshold_suffix = f"({industry_label} 업종 평균)"
+    else:
+        roic_threshold, rnd_threshold, rnd_applicable = 15.0, 5.0, True
+        threshold_suffix = "(범용 고정값 폴백 - 업종 벤치마크 데이터 없음)"
+    roic_ok = roic >= roic_threshold
+    gm_ok = gross_margin_val >= 50.0
+    rnd_ok = (rnd_pct_val >= rnd_threshold) if rnd_applicable else None
+    active_flags = [roic_ok, gm_ok, fcf_3y_ok] + ([rnd_ok] if rnd_applicable else [])
+    weight_each = 10.0 / len(active_flags)
+    s_moat = sum(weight_each for flag in active_flags if flag)
     s_moat = min(10.0, max(1.5, s_moat))
     # [물타기 게이트 재설계, 2026-09] "추가 투자 유효성" 판정이 total_score/value_models 대신
     # 해자(s_moat)를 직접 참조하기로 함에 따라, stage1_outlook_gate가 "어떤 지표가 미달인지"를
-    # 재계산 없이 그대로 인용할 수 있도록 4대 지표의 원값/충족여부/기준치를 패키징해 반환.
+    # 재계산 없이 그대로 인용할 수 있도록 구조적 지표의 원값/충족여부/기준치를 패키징해 반환.
+    # R&D비중이 rnd_applicable=False인 종목은 ok=None으로 표시 - stage1_outlook_gate는 이를
+    # "미달"이 아니라 "해당없음"으로 건너뛰도록 처리됨(ok is None 분기).
     moat_detail = {
-        "ROIC": (roic, roic >= 15.0, "15%"),
-        "매출총이익률": (gross_margin_val, gross_margin_val >= 50.0, "50%"),
-        "R&D비중": (rnd_pct_val, rnd_pct_val >= 5.0, "5%"),
+        "ROIC": (roic, roic_ok, f"{roic_threshold:.2f}% {threshold_suffix}"),
+        "매출총이익률": (gross_margin_val, gm_ok, "50%"),
+        "R&D비중": (rnd_pct_val, rnd_ok, (f"{rnd_threshold:.2f}% {threshold_suffix}" if rnd_applicable else "해당없음 (업종 특성상 R&D 비중 구조적 미미 - 채점 제외)")),
         "3년FCF흑자": (fcf_3y_ok, fcf_3y_ok, None),
     }
     pe, fpe, ps, pbr = fund.get('trailing_pe'), fund.get('forward_pe'), fund.get('ps_ratio'), fund.get('pbr')
@@ -2014,15 +2571,21 @@ def calculate_pre_scores(fund, tech, bt, curr_price, price_df=None):
         elif ratio <= 1.8: return 3.5
         return 1.5
     # [밸류에이션 개선안 2안] PBR도 절대 문턱(3/6/10/15배) 대신 "ROE 대비 적정 PBR"
-    # (value_models['roe_pbr']와 동일 기준: 적정 PBR ≈ ROE% ÷ 10%) 대비 몇 배인지로 채점.
-    # 예: ROE 100%대 초고수익 기업은 적정 PBR이 10배라, PBR 23배는 "절대 기준 초과"가 아니라
-    # "ROE 대비 적정가의 2.3배"로 평가됨 — 고ROE라서 장부가 프리미엄이 정당한 종목을 구분.
+    # (value_models['roe_pbr']와 동일 기준: 적정 PBR ≈ ROE% ÷ 요구수익률) 대비 몇 배인지로 채점.
+    # 예: ROE 100%대 초고수익 기업은 적정 PBR이 10배(요구수익률 10% 가정 시)라, PBR 23배는
+    # "절대 기준 초과"가 아니라 "ROE 대비 적정가의 2.3배"로 평가됨 — 고ROE라서 장부가 프리미엄이
+    # 정당한 종목을 구분.
+    # [신규, 2026-09] 고정 10% 대신 fetch_fundamentals_and_valuation에서 CAPM으로 계산해 넘겨준
+    # cost_of_equity_pct(Ke = Rf(10Y 국채금리) + β×ERP)를 요구수익률로 사용 - value_models.roe_pbr
+    # 의 적정가 산식과 동일한 기준으로 통일(이중 하드코딩 방지). 값이 없으면(FRED 실패 등) 기존
+    # 고정 10%로 안전 폴백.
     roe_for_val = parse_num(fund.get('roe', 0))
+    required_return_pct = fund.get('cost_of_equity_pct') if isinstance(fund.get('cost_of_equity_pct'), (int, float)) else 10.0
     def score_pbr_roe_adjusted(val, roe_pct):
         if not isinstance(val, (int, float)) or val < 0: return 1.5
         if not isinstance(roe_pct, (int, float)) or roe_pct <= 0:
             return score_v(val, 3, 6, 10, 15)  # ROE 데이터 없거나 마이너스면 기존 절대 문턱으로 폴백
-        fair_pbr = roe_pct / 10.0
+        fair_pbr = roe_pct / required_return_pct
         ratio = val / fair_pbr
         if ratio <= 0.7: return 9.5
         elif ratio <= 1.0: return 7.5
@@ -2125,7 +2688,7 @@ if analyze_btn:
             future_backtest = executor.submit(fetch_backtest_data, ticker_input, "5y")
             future_options = executor.submit(fetch_nearest_options_data, ticker_input, 2)
             future_macro = executor.submit(fetch_macro_indicators)
-            future_sector = executor.submit(fetch_sector_performance)
+            future_sector = executor.submit(fetch_sector_rotation)
             future_news = executor.submit(fetch_news, ticker_input, 5)
             future_macro_news = executor.submit(fetch_macro_news, 4)
             future_analyst = executor.submit(fetch_recent_upgrades_downgrades, ticker_input, 2)
@@ -2143,7 +2706,12 @@ if analyze_btn:
         backtest_results = run_strategy_backtest_v2(bt_df if bt_df is not None else raw_df)
         
         curr_p = tech_data.get('current_price', 0)
-        fund_data = fetch_fundamentals_and_valuation(ticker_input, curr_p, high_52_calc, low_52_calc)
+        # [신규, 2026-09] CAPM 요구수익률(Ke) 산출용 무위험금리 - FRED 10Y 국채금리(value_num,
+        # 숫자형)를 macro_data에서 추출해 fetch_fundamentals_and_valuation으로 전달.
+        # FRED 조회 실패 시 None -> 함수 내부에서 기존 고정값(10%/9%)으로 안전 폴백됨.
+        _rf_num = macro_data.get("us_10y_yield", {}).get("value_num")
+        risk_free_rate_pct = _rf_num if isinstance(_rf_num, (int, float)) else None
+        fund_data = fetch_fundamentals_and_valuation(ticker_input, curr_p, high_52_calc, low_52_calc, risk_free_rate_pct)
         
         info_source_flag = fund_data.get('info_source', 'stock.info')
         ownership = fund_data.get('ownership_and_shorts', {})
@@ -2222,7 +2790,7 @@ if analyze_btn:
             "earnings_calendar_and_52w": earnings_info,
             "macro_6_assets": macro_data,
             "global_macro_news": macro_news_data,
-            "sector_performance_11_sectors": sector_data,
+            "sector_rotation_rrg_11_sectors": sector_data,
             "fundamentals_and_6_valuations": fund_data,
             "user_portfolio_status": user_position_text,
             "stock_recent_news": news_data,
@@ -2278,7 +2846,7 @@ if analyze_btn:
 9. 글로벌 거시/시장 주요 뉴스:
 {macro_news_json}
 
-10. S&P 500 11개 전 섹터 실시간 등락률 및 모멘텀:
+10. S&P 500 11개 전 섹터 로테이션(RRG) 분석 - SPY 대비 RS-Ratio(추세)/RS-Momentum(모멘텀)/사분면(Leading/Weakening/Lagging/Improving), 100 기준선 (⚠️ 공식 RRG®의 정확한 산출식은 비공개이며 아래는 오픈소스 통용 근사치임 - 리포트에도 "근사치" 취지를 반영할 것):
 {sector_json}
 
 11. 펀더멘털 및 6대 밸류에이션 (장기 퀄리티 지표 및 R&D 비중 포함):
@@ -2332,8 +2900,8 @@ if analyze_btn:
 - **[자산배분 코멘트]**: 정량 배분표 대신 주입된 매크로 지표 기반의 정성적 방향성만 제시할 것.
 
 2. 11개 전 섹터 전망 및 자금 순환매 심층 분석
-- **11개 섹터 전수 리스트 작성**: 11개 모두 글머리 기호(*)로 작성.
-- **자금 순환매 결론 분리 (필수)**: 리스트 후 빈 줄을 삽입하고 순환매 결론 작성.
+- **11개 섹터 전수 리스트 작성**: 11개 모두 글머리 기호(*)로, 각 섹터의 사분면(quadrant)과 RS-Ratio/RS-Momentum 수치를 근거로 서술할 것 (status가 "산출불가"인 섹터는 데이터 부족을 그대로 밝힐 것).
+- **자금 순환매 결론 분리 (필수)**: 리스트 후 빈 줄을 삽입하고, 어떤 섹터가 Improving→Leading으로 자금이 유입되고 있고 어떤 섹터가 Weakening→Lagging으로 이탈 중인지 사분면 흐름 중심으로 순환매 결론 작성.
 
 3. 밸류에이션, 스마트머니 및 공매도 세력 분석
 - **[장기 복리 체력]**: 3개년 FCF·ROIC·주주환원 분석.
@@ -2590,9 +3158,15 @@ if st.session_state.last_analysis_result:
         s_c3.metric("14일 ATR (일일 변동폭)", f"${tech_data.get('atr_14', 'N/A')}", f"2.0x 손절: ${tech_data.get('atr_stop_2_0x', 'N/A')}")
         s_c4.metric("MACD (Signal)", f"{tech_data.get('macd', 'N/A')} ({tech_data.get('macd_signal', 'N/A')})", f"Hist: {tech_data.get('macd_hist', 'N/A'):+}" if isinstance(tech_data.get('macd_hist'), (int, float)) else None)
 
-    if sector_data:
-        with st.expander("🧭 **S&P 500 11개 전 섹터 실시간 등락 및 순환매 현황 (11 Sectors Rotation) [클릭하여 펼치기]**", expanded=False):
-            s_rows = [{"티커": etf, "섹터명": s_info.get("sector_name", ""), "5일 등락률": s_info.get("return_5d", "N/A"), "1개월 등락률": s_info.get("return_1m", "N/A"), "현재가 ($)": f"${s_info.get('latest_close', 'N/A')}"} for etf, s_info in sector_data.items()]
+    if sector_data and sector_data.get("sectors"):
+        with st.expander("🧭 **S&P 500 11개 전 섹터 로테이션 분석 (RRG - Relative Rotation Graph) [클릭하여 펼치기]**", expanded=False):
+            st.caption(f"벤치마크: {sector_data.get('benchmark', 'SPY')}(S&P500, 시가총액가중) · 주봉 기준 14주 정규화 / 52주 모멘텀 (JdK 방식 참고 근사치 - 공식 RRG®와 수치가 다를 수 있음)")
+            rrg_fig = build_rrg_chart(sector_data)
+            if rrg_fig.data:
+                st.plotly_chart(rrg_fig, use_container_width=True)
+            else:
+                st.info("RRG 차트를 그릴 수 있는 섹터 데이터가 부족합니다.")
+            s_rows = [{"티커": etf, "섹터명": s_info.get("sector_name", ""), "사분면": s_info.get("quadrant", s_info.get("status", "N/A")), "RS-Ratio": s_info.get("rs_ratio", "N/A"), "RS-Momentum": s_info.get("rs_momentum", "N/A"), "1개월 등락률": s_info.get("return_1m", "N/A")} for etf, s_info in sector_data["sectors"].items()]
             st.dataframe(pd.DataFrame(s_rows), use_container_width=True, hide_index=True)
 
     with st.container(border=True):
@@ -2708,6 +3282,21 @@ if st.session_state.last_analysis_result:
         r_val = v_models.get('roe_pbr', 'N/A')
         diff_r = round(((r_val - curr_p) / curr_p) * 100, 1) if isinstance(r_val, (int, float)) and curr_p else None
         v3.metric("ROE-PBR 자본가치", f"${r_val}" if isinstance(r_val, (int, float)) else str(r_val), f"{diff_r:+.1f}%" if diff_r is not None else None)
+
+    # [신규, 2026-09] 위 두 밸류에이션 모델(Growth Models의 DCF, Value Models의 ROE-PBR)에 실제
+    # 적용된 할인율을 투명하게 노출 - 사용자 의견: "WACC 값도 자체로 사용자에게 의미있는 수치".
+    # ROE-PBR은 자기자본비용(Ke) 하나만, DCF는 여기에 부채비중/타인자본비용까지 반영한 WACC를
+    # 쓰므로(서로 다른 숫자) 두 값을 구분해서 한 줄에 함께 보여준다.
+    _ke_disp, _wacc_disp = fund_data.get('cost_of_equity_pct'), fund_data.get('dcf_wacc_pct')
+    _capm_disp = fund_data.get('capm_assumptions', {})
+    if isinstance(_ke_disp, (int, float)):
+        _rf_disp, _beta_disp, _erp_disp = _capm_disp.get('risk_free_rate_pct_used'), _capm_disp.get('beta_used'), _capm_disp.get('erp_used_pct')
+        # beta_used는 실측 베타면 숫자, 결측 폴백이면 "1.0 (베타 데이터 없음 - ...)" 형태 문자열이라
+        # 수식에 그대로 넣으면 문장이 뒤섞여 보임 - 폴백인 경우 짧은 "(폴백)" 표기로 축약.
+        _beta_str = f"{_beta_disp:.2f}" if isinstance(_beta_disp, (int, float)) else f"{DEFAULT_BETA_FALLBACK:.2f}(폴백)"
+        st.caption(f"💡 적용 할인율: 자기자본비용(Ke) {_ke_disp}% (무위험금리 {_rf_disp}% + β {_beta_str}×ERP {_erp_disp}%) | DCF 가중평균자본비용(WACC) {_wacc_disp}%")
+    else:
+        st.caption(f"💡 적용 할인율: 자기자본비용(Ke)/WACC 산출 실패 - 무위험금리(FRED 10Y) 데이터 없음, 고정값(ROE-PBR 요구수익률 10% / DCF WACC {_wacc_disp}%) 폴백 적용")
 
     st.caption(f"🕒 데이터 수집 기준일자: 주가/재무제표 ({res['stock_date']}) | FRED 국채금리 ({macro_data.get('us_10y_yield', {}).get('date', 'N/A')})")
 
