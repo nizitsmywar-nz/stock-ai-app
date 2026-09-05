@@ -1560,24 +1560,30 @@ def fetch_sector_rotation():
             result["sectors"][etf] = {"sector_name": name, "status": "산출불가 (해당없음)"}
     return result
 
+# [수정, 2026-09] 섹터별 구분용 고정 색상표. 처음엔 "현재 사분면" 기준으로 색을 입혔는데, 같은
+# 사분면에 여러 섹터가 몰리면(실사용 검증 시 11개 중 6개가 동시에 Lagging) 그 섹터들이 전부 같은
+# 색으로 겹쳐 보여 식별이 안 되는 문제가 발견됨(사용자 스크린샷으로 확인). 사분면은 위치(배경 음영+
+# 코너 라벨)로 이미 표현되므로, 색상은 "섹터 자체를 구분"하는 원래 목적에만 쓰도록 분리 - 11개
+# 섹터에 각각 고유하고 서로 잘 구별되는 색을 고정 배정.
+RRG_SECTOR_COLORS = ["#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd", "#8c564b", "#e377c2", "#bcbd22", "#17becf", "#f39c12", "#e91e63"]
+
 def build_rrg_chart(rotation_data):
-    """섹터 로테이션(RRG) 산점도 - 사분면 배경/기준선(100) + 최근 RRG_TAIL_LEN주 궤적(꼬리) 시각화.
-    이 앱 최초의 차트 렌더링 기능(plotly, 사용자 승인 완료, 2026-09)."""
-    quadrant_colors = {"Leading (주도)": "#2ecc71", "Weakening (약화)": "#f1c40f", "Lagging (지연)": "#e74c3c", "Improving (개선)": "#3498db"}
+    """섹터 로테이션(RRG) 산점도 - 사분면 배경 음영/라벨 + 기준선(100) + 최근 RRG_TAIL_LEN주 궤적(꼬리)
+    시각화. 이 앱 최초의 차트 렌더링 기능(plotly, 사용자 승인 완료, 2026-09)."""
     fig = go.Figure()
     xs_all, ys_all = [], []
-    for etf, hist in (rotation_data.get("history") or {}).items():
+    for idx, (etf, hist) in enumerate((rotation_data.get("history") or {}).items()):
         xs, ys = hist.get("tail_rs_ratio") or [], hist.get("tail_rs_momentum") or []
         if not xs or not ys or len(xs) != len(ys): continue
         xs_all.extend(xs); ys_all.extend(ys)
         sec_info = (rotation_data.get("sectors") or {}).get(etf, {})
-        color = quadrant_colors.get(sec_info.get("quadrant"), "#888888")
+        color = RRG_SECTOR_COLORS[idx % len(RRG_SECTOR_COLORS)]
         marker_sizes = [6] * (len(xs) - 1) + [12]
         fig.add_trace(go.Scatter(
             x=xs, y=ys, mode="lines+markers",
             name=f"{etf} ({sec_info.get('sector_name', '')})",
             line=dict(color=color, width=2), marker=dict(color=color, size=marker_sizes, line=dict(width=1, color="white")),
-            hovertemplate=f"<b>{etf}</b><br>RS-Ratio: %{{x:.2f}}<br>RS-Momentum: %{{y:.2f}}<extra></extra>"
+            hovertemplate=f"<b>{etf}</b> [{sec_info.get('quadrant', 'N/A')}]<br>RS-Ratio: %{{x:.2f}}<br>RS-Momentum: %{{y:.2f}}<extra></extra>"
         ))
     if xs_all and ys_all:
         pad_x = max(1.0, (max(xs_all) - min(xs_all)) * 0.15)
@@ -1586,6 +1592,22 @@ def build_rrg_chart(rotation_data):
         y_range = [min(ys_all) - pad_y, max(ys_all) + pad_y]
     else:
         x_range, y_range = [95, 105], [95, 105]
+
+    # 사분면 배경 음영(옅은 투명도) + 코너 라벨 - 색상은 이제 섹터 구분 전용이라, 어느 영역이
+    # 어느 사분면인지는 배경/라벨로 대신 안내.
+    quadrant_fills = [
+        (100, x_range[1], 100, y_range[1], "rgba(46, 204, 113, 0.08)", "Leading (주도)", "top right"),
+        (x_range[0], 100, 100, y_range[1], "rgba(52, 152, 219, 0.08)", "Improving (개선)", "top left"),
+        (x_range[0], 100, y_range[0], 100, "rgba(231, 76, 60, 0.08)", "Lagging (지연)", "bottom left"),
+        (100, x_range[1], y_range[0], 100, "rgba(241, 196, 15, 0.10)", "Weakening (약화)", "bottom right"),
+    ]
+    for x0, x1, y0, y1, fill_color, label, pos in quadrant_fills:
+        fig.add_shape(type="rect", x0=x0, x1=x1, y0=y0, y1=y1, fillcolor=fill_color, line=dict(width=0), layer="below")
+        ax = x1 - (x1 - x0) * 0.03 if "right" in pos else x0 + (x1 - x0) * 0.03
+        ay = y1 - (y1 - y0) * 0.05 if "top" in pos else y0 + (y1 - y0) * 0.05
+        fig.add_annotation(x=ax, y=ay, text=label, showarrow=False, font=dict(size=11, color="gray"),
+                            xanchor="right" if "right" in pos else "left", yanchor="top" if "top" in pos else "bottom")
+
     fig.add_shape(type="line", x0=100, x1=100, y0=y_range[0], y1=y_range[1], line=dict(color="gray", dash="dash", width=1))
     fig.add_shape(type="line", x0=x_range[0], x1=x_range[1], y0=100, y1=100, line=dict(color="gray", dash="dash", width=1))
     fig.update_layout(
